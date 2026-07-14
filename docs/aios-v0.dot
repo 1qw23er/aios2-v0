@@ -1,0 +1,35 @@
+digraph AIOS {
+  graph [rankdir=TB, bgcolor="transparent", pad=0.2, nodesep=0.35, ranksep=0.55];
+  node [shape=box, style="rounded,filled", fillcolor="#f5f5f5", color="#555555", fontname="Arial"];
+  edge [color="#666666", fontname="Arial", fontsize=10];
+
+  CEO [label="人类 CEO\n目标 · 审批 · 异常", fillcolor="#fff3cd"];
+  UI [label="控制台 / API"];
+  ORCH [label="Orchestrator\n规则 + 状态机", fillcolor="#dbeafe"];
+  BUS [label="Event Bus\nTransactional Outbox"];
+  DB [label="State Store\nProject · Task · Event · Approval", shape=cylinder];
+  CTX [label="Context Store\n事实 · 决策 · SOP", shape=cylinder];
+  ART [label="Artifact Store\nMarkdown · JSON · 文件", shape=folder];
+  REG [label="Agent Registry\n能力 · 成本 · 权限"];
+
+  APIA [label="API Agent Adapter\nGPT / 可调用模型", fillcolor="#dcfce7"];
+  CLI [label="CLI Agent Adapter\nCodex / OpenClaw", fillcolor="#dcfce7"];
+  EXT [label="External Workstation Adapter\nHermes · WorkBuddy · Marvis · 扣子", fillcolor="#fee2e2"];
+  RELAY [label="最小人工转交\n任务包 ↔ 结果包", fillcolor="#fff3cd"];
+
+  CEO -> UI;
+  UI -> ORCH;
+  ORCH -> DB [dir=both];
+  ORCH -> CTX [dir=both];
+  ORCH -> REG [dir=both];
+  ORCH -> BUS;
+  BUS -> APIA;
+  BUS -> CLI;
+  BUS -> EXT;
+  APIA -> ART;
+  CLI -> ART;
+  EXT -> RELAY;
+  RELAY -> ART;
+  ART -> ORCH;
+  ORCH -> CEO [label="高风险审批"];
+}

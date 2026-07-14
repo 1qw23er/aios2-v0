@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from aios.models import AdapterType, RiskLevel
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    owner: str = "human_ceo"
+    budget_limit: float = Field(default=0.0, ge=0)
+    success_metrics: list[str] = Field(default_factory=list)
+
+
+class TaskCreate(BaseModel):
+    project_id: str
+    title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    assigned_agent_id: str | None = None
+    adapter_type: AdapterType = AdapterType.EXTERNAL
+    input_context_refs: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
+    estimated_cost: float = Field(default=0.0, ge=0)
+
+
+class ApprovalCreate(BaseModel):
+    project_id: str
+    task_id: str | None = None
+    action_type: str = Field(min_length=1)
+    risk_level: RiskLevel
+    rationale: str | None = None
+
+
+class ModelRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BoardRead(BaseModel):
+    project: dict
+    tasks_by_status: dict[str, list[dict]]
+    pending_approvals: list[dict]
