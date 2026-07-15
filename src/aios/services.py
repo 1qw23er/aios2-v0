@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel
 from sqlmodel import Session, SQLModel, select
 
+from aios.audit import append_audit
 from aios.models import (
     Agent,
     Approval,
@@ -102,6 +103,18 @@ def create_project(session: Session, request: ProjectCreate, idempotency_key: st
                 "resource_id": project.id,
             },
         )
+        append_audit(
+            session,
+            actor="system",
+            action="project.created",
+            resource_type="project",
+            resource_id=project.id,
+            project_id=project.id,
+            task_id=None,
+            before={},
+            after={"status": project.status.value},
+            idempotency_key=f"audit:{idempotency_key}",
+        )
         session.commit()
     except Exception:
         session.rollback()
@@ -146,6 +159,18 @@ def create_task(session: Session, request: TaskCreate, idempotency_key: str) -> 
                 "resource_id": task.id,
             },
         )
+        append_audit(
+            session,
+            actor="system",
+            action="task.created",
+            resource_type="task",
+            resource_id=task.id,
+            project_id=task.project_id,
+            task_id=task.id,
+            before={},
+            after={"status": task.status.value},
+            idempotency_key=f"audit:{idempotency_key}",
+        )
         session.commit()
     except Exception:
         session.rollback()
@@ -187,6 +212,18 @@ def create_approval(session: Session, request: ApprovalCreate, idempotency_key: 
                 "fingerprint": fingerprint,
                 "resource_id": approval.id,
             },
+        )
+        append_audit(
+            session,
+            actor="system",
+            action="approval.requested",
+            resource_type="approval",
+            resource_id=approval.id,
+            project_id=approval.project_id,
+            task_id=approval.task_id,
+            before={},
+            after={"status": approval.status.value},
+            idempotency_key=f"audit:{idempotency_key}",
         )
         session.commit()
     except Exception:

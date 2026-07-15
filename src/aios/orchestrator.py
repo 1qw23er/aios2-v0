@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from sqlmodel import Session, select
 
+from aios.audit import append_audit
 from aios.models import Event, EventStatus, Task, TaskStatus, now_utc
 from aios.services import ServiceError, append_event
 
 
 def complete_task(session: Session, task_id: str, idempotency_key: str) -> Event:
-    existing = session.exec(
-        select(Event).where(Event.idempotency_key == idempotency_key)
-    ).first()
+    existing = session.exec(select(Event).where(Event.idempotency_key == idempotency_key)).first()
     if existing is not None:
         if existing.type != "task.completed" or existing.task_id != task_id:
             raise ServiceError(409, "Idempotency key conflicts with another operation")
@@ -29,6 +28,18 @@ def complete_task(session: Session, task_id: str, idempotency_key: str) -> Event
             event_type="task.completed",
             idempotency_key=idempotency_key,
             payload={"before": before.value, "after": TaskStatus.DONE.value},
+        )
+        append_audit(
+            session,
+            actor="orchestrator",
+            action="task.completed",
+            resource_type="task",
+            resource_id=task.id,
+            project_id=task.project_id,
+            task_id=task.id,
+            before={"status": before.value},
+            after={"status": TaskStatus.DONE.value},
+            idempotency_key=f"audit:{idempotency_key}",
         )
         session.commit()
     except Exception:
@@ -90,9 +101,12 @@ class Orchestrator:
                 task.updated_at = now_utc()
                 self.session.add(task)
                 ready_key = f"orchestrator:{source_event.id}:ready:{task.id}"
-                if self.session.exec(
-                    select(Event).where(Event.idempotency_key == ready_key)
-                ).first() is None:
+                if (
+                    self.session.exec(
+                        select(Event).where(Event.idempotency_key == ready_key)
+                    ).first()
+                    is None
+                ):
                     append_event(
                         self.session,
                         project_id=task.project_id,
@@ -101,6 +115,18 @@ class Orchestrator:
                         idempotency_key=ready_key,
                         payload={"source_event_id": source_event.id},
                     )
+                append_audit(
+                    self.session,
+                    actor="orchestrator",
+                    action="task.ready",
+                    resource_type="task",
+                    resource_id=task.id,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                    before={"status": TaskStatus.BACKLOG.value},
+                    after={"status": TaskStatus.READY.value},
+                    idempotency_key=f"audit:{ready_key}",
+                )
                 activated.append(task)
             source_event.status = EventStatus.PROCESSED
             source_event.processed_at = now_utc()

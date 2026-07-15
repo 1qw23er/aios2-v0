@@ -80,3 +80,8 @@ python -m ruff check src tests alembic
 ## Orchestrator
 
 `complete_task` 将任务置为 `done` 并在同一事务写入 `task.completed`。Orchestrator 只处理该类 pending Event；当下游任务的全部 `depends_on` 均为 `done` 时，将其从 `backlog` 原子更新为 `ready` 并写入唯一的 `task.ready` Event。重复消费完成事件不会重复激活任务或产生重复事件。
+## External Workstations 与审计
+
+外部工位导出目录包含 `task_packet.json` 与 `context.md`。回传 envelope 先由 Pydantic 校验，再按任务包声明的 JSON Schema 校验。合法结果以唯一 `result_id` 写入一个 Artifact，并与 `task.completed`、任务状态和 AuditLog 在同一事务提交；重复结果返回原 Artifact，冲突 payload 返回 409。非法结果进入 `rejected`，不写完成事件。
+
+`AuditLog` 是不可变事实记录，覆盖项目、任务、审批创建、任务完成、Orchestrator ready 转换和外部结果导入/拒绝。敏感键会递归替换为 `[REDACTED]`。

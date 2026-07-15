@@ -130,6 +130,8 @@ class Artifact(SQLModel, table=True):
     type: ArtifactType
     uri: str
     checksum: str
+    external_result_id: str | None = Field(default=None, unique=True, index=True)
+    result_checksum: str | None = None
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column("metadata", JSON))
     created_at: datetime = Field(default_factory=now_utc)
 
