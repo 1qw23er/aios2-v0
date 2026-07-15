@@ -72,6 +72,19 @@ class EventStatus(StrEnum):
     PROCESSED = "processed"
 
 
+class AgentStatus(StrEnum):
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    MAINTENANCE = "maintenance"
+
+
+class RoutingMode(StrEnum):
+    FIXED = "fixed"
+    PREFERRED_WITH_FALLBACK = "preferred_with_fallback"
+    BEST_AVAILABLE = "best_available"
+    MANUAL = "manual"
+
+
 class Project(SQLModel, table=True):
     __tablename__ = "project"
 
@@ -99,6 +112,24 @@ class Agent(SQLModel, table=True):
     endpoint: str | None = None
     config_ref: str | None = None
     enabled: bool = True
+    status: AgentStatus = Field(default=AgentStatus.AVAILABLE, index=True)
+
+
+class Capability(SQLModel, table=True):
+    __tablename__ = "capability"
+
+    id: str = Field(default_factory=lambda: new_id("cap"), primary_key=True)
+    name: str = Field(unique=True, index=True)
+    description: str = ""
+
+
+class AgentCapability(SQLModel, table=True):
+    __tablename__ = "agent_capability"
+
+    agent_id: str = Field(foreign_key="agent.id", primary_key=True)
+    capability_id: str = Field(foreign_key="capability.id", primary_key=True)
+    priority: int = Field(default=50, ge=1, le=100)
+    enabled: bool = True
 
 
 class Task(SQLModel, table=True):
@@ -110,6 +141,9 @@ class Task(SQLModel, table=True):
     description: str
     status: TaskStatus = TaskStatus.BACKLOG
     assigned_agent_id: str | None = Field(default=None, foreign_key="agent.id", index=True)
+    preferred_agent_id: str | None = Field(default=None, foreign_key="agent.id", index=True)
+    required_capabilities: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    routing_mode: RoutingMode = Field(default=RoutingMode.FIXED, index=True)
     adapter_type: AdapterType = AdapterType.EXTERNAL
     input_context_refs: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     acceptance_criteria: list[str] = Field(default_factory=list, sa_column=Column(JSON))
@@ -163,4 +197,16 @@ class Event(SQLModel, table=True):
     attempt_count: int = 0
     last_error: str | None = None
     processed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class ExecutionAssignment(SQLModel, table=True):
+    __tablename__ = "execution_assignment"
+
+    id: str = Field(default_factory=lambda: new_id("asn"), primary_key=True)
+    task_id: str = Field(foreign_key="task.id", index=True)
+    selected_agent_id: str = Field(foreign_key="agent.id", index=True)
+    routing_reason: str
+    fallback_used: bool = False
+    idempotency_key: str = Field(unique=True, index=True)
     created_at: datetime = Field(default_factory=now_utc)

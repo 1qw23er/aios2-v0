@@ -5,6 +5,7 @@ from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from sqlmodel import SQLModel
 
+import aios.audit  # noqa: F401
 import aios.models  # noqa: F401
 from alembic import context
 

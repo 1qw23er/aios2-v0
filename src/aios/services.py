@@ -13,6 +13,7 @@ from aios.models import (
     Agent,
     Approval,
     ApprovalStatus,
+    Capability,
     Event,
     Project,
     Task,
@@ -138,6 +139,11 @@ def create_task(session: Session, request: TaskCreate, idempotency_key: str) -> 
         raise ServiceError(404, "Project not found")
     if request.assigned_agent_id and session.get(Agent, request.assigned_agent_id) is None:
         raise ServiceError(404, "Agent not found")
+    if request.preferred_agent_id and session.get(Agent, request.preferred_agent_id) is None:
+        raise ServiceError(404, "Preferred agent not found")
+    for capability_id in request.required_capabilities:
+        if session.get(Capability, capability_id) is None:
+            raise ServiceError(404, "Capability not found")
     for dependency_id in request.depends_on:
         dependency = session.get(Task, dependency_id)
         if dependency is None:

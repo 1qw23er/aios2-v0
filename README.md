@@ -92,3 +92,20 @@ P0 已覆盖 `研究（external）→ 策划（mock API）→ 写作（external�
 ## Alpha 架构评审门槛
 
 进入 P1 前必须先进行 Alpha 架构评审。后续按向后兼容增量依次评估 Context Engine、Knowledge Engine、Capability Registry 与 capability-based routing；现有 fixed-agent 任务和 closed-source external workstation 必须继续工作。Alpha-1 不实现动态信誉、并行多候选、自动质量评分或成本优化。
+## Alpha-1 deterministic capability routing
+
+Alpha-1 adds Capability, AgentCapability, AgentStatus, and immutable
+ExecutionAssignment records without changing the P0 workflow graph. Existing tasks using
+assigned_agent_id continue through fixed routing. New tasks may use
+preferred_with_fallback, best_available, or manual with normalized capability IDs.
+
+Eligible workers are enabled, available, and have an enabled profile for every required
+capability. Selection is deterministic: highest minimum capability priority, then highest
+priority sum, then lexicographically smallest Agent ID. Each selected or blocked decision is
+written to AuditLog with all considered candidates, scores, rejection reasons, selection
+reason, and fallback flag. Assignment, task.assigned Event, Task executor update, and audit
+are committed atomically and replay safely by idempotency key.
+
+External workstations remain ordinary eligible workers and keep the unchanged
+task_packet.json / context.md export-import contract. Alpha-1 intentionally excludes dynamic
+scoring, reputation, parallel candidate execution, cost optimization, and LLM routing.

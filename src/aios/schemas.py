@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from aios.models import AdapterType, RiskLevel
+from aios.models import AdapterType, RiskLevel, RoutingMode
 
 
 class ProjectCreate(BaseModel):
@@ -18,6 +18,9 @@ class TaskCreate(BaseModel):
     title: str = Field(min_length=1)
     description: str = Field(min_length=1)
     assigned_agent_id: str | None = None
+    preferred_agent_id: str | None = None
+    required_capabilities: list[str] = Field(default_factory=list)
+    routing_mode: RoutingMode = RoutingMode.FIXED
     adapter_type: AdapterType = AdapterType.EXTERNAL
     input_context_refs: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
