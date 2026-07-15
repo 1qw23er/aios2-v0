@@ -85,3 +85,10 @@ python -m ruff check src tests alembic
 外部工位导出目录包含 `task_packet.json` 与 `context.md`。回传 envelope 先由 Pydantic 校验，再按任务包声明的 JSON Schema 校验。合法结果以唯一 `result_id` 写入一个 Artifact，并与 `task.completed`、任务状态和 AuditLog 在同一事务提交；重复结果返回原 Artifact，冲突 payload 返回 409。非法结果进入 `rejected`，不写完成事件。
 
 `AuditLog` 是不可变事实记录，覆盖项目、任务、审批创建、任务完成、Orchestrator ready 转换和外部结果导入/拒绝。敏感键会递归替换为 `[REDACTED]`。
+## P0 完整工作流
+
+P0 已覆盖 `研究（external）→ 策划（mock API）→ 写作（external）→ L4 审批`。端到端测试使用真实 SQLite 迁移、任务包、transactional outbox、Orchestrator、Artifact、Approval 和 AuditLog，并在新 Session 中验证持久化。P0 不调用真实模型，也不执行发布、发信、删除、付款或客户承诺。
+
+## Alpha 架构评审门槛
+
+进入 P1 前必须先进行 Alpha 架构评审。后续按向后兼容增量依次评估 Context Engine、Knowledge Engine、Capability Registry 与 capability-based routing；现有 fixed-agent 任务和 closed-source external workstation 必须继续工作。Alpha-1 不实现动态信誉、并行多候选、自动质量评分或成本优化。
