@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Column
+from sqlalchemy import JSON, Column, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -52,6 +52,24 @@ class ArtifactType(StrEnum):
     LINK = "link"
 
 
+class ArtifactReviewStatus(StrEnum):
+    UNVERIFIED = "unverified"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class ReviewedFactStatus(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class DecisionStatus(StrEnum):
+    DRAFT = "draft"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
 class ApprovalStatus(StrEnum):
     PENDING = "pending"
     APPROVED = "approved"
@@ -91,6 +109,7 @@ class Project(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("prj"), primary_key=True)
     name: str
     objective: str
+    description: str = ""
     status: ProjectStatus = ProjectStatus.PROPOSED
     owner: str = "human_ceo"
     budget_limit: float = 0.0
@@ -112,6 +131,7 @@ class Agent(SQLModel, table=True):
     endpoint: str | None = None
     config_ref: str | None = None
     enabled: bool = True
+    limitations: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     status: AgentStatus = Field(default=AgentStatus.AVAILABLE, index=True)
 
 
@@ -164,6 +184,7 @@ class Artifact(SQLModel, table=True):
     type: ArtifactType
     uri: str
     checksum: str
+    review_status: ArtifactReviewStatus = Field(default=ArtifactReviewStatus.UNVERIFIED, index=True)
     external_result_id: str | None = Field(default=None, unique=True, index=True)
     result_checksum: str | None = None
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column("metadata", JSON))
@@ -209,4 +230,70 @@ class ExecutionAssignment(SQLModel, table=True):
     routing_reason: str
     fallback_used: bool = False
     idempotency_key: str = Field(unique=True, index=True)
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class ReviewedFact(SQLModel, table=True):
+    __tablename__ = "reviewed_fact"
+
+    id: str = Field(default_factory=lambda: new_id("fact"), primary_key=True)
+    artifact_id: str = Field(foreign_key="artifact.id", index=True)
+    statement: str
+    status: ReviewedFactStatus = Field(default=ReviewedFactStatus.PENDING, index=True)
+    reviewer: str
+    reviewed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class Decision(SQLModel, table=True):
+    __tablename__ = "decision"
+    __table_args__ = (UniqueConstraint("series_id", "version", name="uq_decision_series_version"),)
+
+    id: str = Field(default_factory=lambda: new_id("dec"), primary_key=True)
+    series_id: str = Field(index=True)
+    project_id: str | None = Field(default=None, foreign_key="project.id", index=True)
+    title: str
+    content: str
+    status: DecisionStatus = Field(default=DecisionStatus.DRAFT, index=True)
+    version: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class Policy(SQLModel, table=True):
+    __tablename__ = "policy"
+    __table_args__ = (UniqueConstraint("series_id", "version", name="uq_policy_series_version"),)
+
+    id: str = Field(default_factory=lambda: new_id("pol"), primary_key=True)
+    series_id: str = Field(index=True)
+    project_id: str | None = Field(default=None, foreign_key="project.id", index=True)
+    name: str
+    content: str
+    enabled: bool = True
+    version: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class TaskContext(SQLModel, table=True):
+    __tablename__ = "task_context"
+    __table_args__ = (
+        UniqueConstraint("task_id", "context_hash", name="uq_task_context_task_hash"),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("ctx"), primary_key=True)
+    task_id: str = Field(foreign_key="task.id", index=True)
+    project_id: str = Field(foreign_key="project.id", index=True)
+    assigned_agent_id: str | None = Field(default=None, foreign_key="agent.id", index=True)
+    objective: str
+    instructions: str
+    acceptance_criteria: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    project_context: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    dependency_outputs: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    approved_facts: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    relevant_decisions: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    applicable_policies: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    agent_profile: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    source_references: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    context_hash: str = Field(index=True)
     created_at: datetime = Field(default_factory=now_utc)

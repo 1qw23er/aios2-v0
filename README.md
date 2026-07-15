@@ -109,3 +109,21 @@ are committed atomically and replay safely by idempotency key.
 External workstations remain ordinary eligible workers and keep the unchanged
 task_packet.json / context.md export-import contract. Alpha-1 intentionally excludes dynamic
 scoring, reputation, parallel candidate execution, cost optimization, and LLM routing.
+
+## Alpha-2 deterministic context engine
+
+ContextService builds versioned TaskContext snapshots from persisted Project, Task,
+completed dependency, approved Artifact evidence, explicitly approved ReviewedFact rows,
+approved Decision lineages, enabled Policy lineages, and the selected Agent profile.
+Canonical JSON and ordered source references make generation deterministic and idempotent.
+
+Approved Artifacts are evidence only; they never become facts automatically. Decision and
+Policy versions use stable series IDs with unique series/version pairs. Normal application
+behavior is append-only and database UPDATE is rejected. A separate internal retention
+operation permits audited administrative deletion with a required actor and rationale.
+
+External workstations keep task_packet.json and context.md compatibility. Context-aware
+exports additionally write task_context.json as the structured source of truth, while
+context.md is rendered deterministically for human readability. Alpha-2 uses no LLM,
+embeddings, vector search, RAG, summarization, knowledge extraction, prompt templating,
+dynamic token optimization, or Context UI.

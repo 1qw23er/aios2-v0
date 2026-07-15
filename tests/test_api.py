@@ -117,3 +117,17 @@ def test_create_task_reports_missing_project(client: TestClient) -> None:
         json={"project_id": "prj_missing", "title": "Plan", "description": "Plan"},
     )
     assert response.status_code == 404
+
+
+def test_create_project_preserves_context_description(client: TestClient) -> None:
+    response = client.post(
+        "/projects",
+        json={
+            "name": "Launch",
+            "objective": "Ship V0",
+            "description": "Project background for deterministic context",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["description"] == "Project background for deterministic context"

@@ -8,6 +8,7 @@ from aios.models import AdapterType, RiskLevel, RoutingMode
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1)
     objective: str = Field(min_length=1)
+    description: str = ""
     owner: str = "human_ceo"
     budget_limit: float = Field(default=0.0, ge=0)
     success_metrics: list[str] = Field(default_factory=list)
