@@ -77,3 +77,6 @@ python -m ruff check src tests alembic
 ## Codex 首轮任务
 
 请先阅读 `docs/`、`CODEX_TASKS.md`，然后按 P0 顺序实现，保持测试先行。
+## Orchestrator
+
+`complete_task` 将任务置为 `done` 并在同一事务写入 `task.completed`。Orchestrator 只处理该类 pending Event；当下游任务的全部 `depends_on` 均为 `done` 时，将其从 `backlog` 原子更新为 `ready` 并写入唯一的 `task.ready` Event。重复消费完成事件不会重复激活任务或产生重复事件。
