@@ -63,6 +63,23 @@ class ReviewedFactStatus(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
 
+class KnowledgeCandidateStatus(StrEnum):
+    DRAFT = "draft"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class KnowledgeReviewDecisionValue(StrEnum):
+    APPROVE = "approve"
+    REJECT = "reject"
+
+
+class KnowledgeFactStatus(StrEnum):
+    APPROVED = "approved"
+    SUPERSEDED = "superseded"
+    INACTIVE = "inactive"
+
+
 
 class DecisionStatus(StrEnum):
     DRAFT = "draft"
@@ -156,7 +173,7 @@ class Task(SQLModel, table=True):
     __tablename__ = "task"
 
     id: str = Field(default_factory=lambda: new_id("tsk"), primary_key=True)
-    project_id: str = Field(foreign_key="project.id", index=True)
+    project_id: str | None = Field(default=None, foreign_key="project.id", index=True)
     title: str
     description: str
     status: TaskStatus = TaskStatus.BACKLOG
@@ -243,6 +260,56 @@ class ReviewedFact(SQLModel, table=True):
     reviewer: str
     reviewed_at: datetime | None = None
     created_at: datetime = Field(default_factory=now_utc)
+
+
+class KnowledgeCandidate(SQLModel, table=True):
+    __tablename__ = "knowledge_candidate"
+
+    id: str = Field(default_factory=lambda: new_id("kcand"), primary_key=True)
+    artifact_id: str = Field(foreign_key="artifact.id", index=True)
+    project_id: str | None = Field(default=None, foreign_key="project.id", index=True)
+    statement: str
+    status: KnowledgeCandidateStatus = Field(default=KnowledgeCandidateStatus.DRAFT, index=True)
+    submitted_by: str
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class KnowledgeReviewDecision(SQLModel, table=True):
+    __tablename__ = "knowledge_review_decision"
+    __table_args__ = (UniqueConstraint("candidate_id", name="uq_knowledge_review_candidate"),)
+
+    id: str = Field(default_factory=lambda: new_id("krev"), primary_key=True)
+    candidate_id: str = Field(foreign_key="knowledge_candidate.id", index=True)
+    decision: KnowledgeReviewDecisionValue
+    reviewer: str
+    rationale: str
+    reviewed_at: datetime = Field(default_factory=now_utc)
+
+
+class KnowledgeFact(SQLModel, table=True):
+    __tablename__ = "knowledge_fact"
+    __table_args__ = (
+        UniqueConstraint("series_id", "version", name="uq_knowledge_fact_series_version"),
+        UniqueConstraint("source_candidate_id", name="uq_knowledge_fact_source_candidate"),
+        UniqueConstraint("review_decision_id", name="uq_knowledge_fact_review_decision"),
+        UniqueConstraint("supersedes_fact_id", name="uq_knowledge_fact_supersedes"),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("kfact"), primary_key=True)
+    series_id: str = Field(index=True)
+    version: int = Field(ge=1)
+    project_id: str | None = Field(default=None, foreign_key="project.id", index=True)
+    statement: str
+    status: KnowledgeFactStatus = Field(default=KnowledgeFactStatus.APPROVED, index=True)
+    source_candidate_id: str = Field(foreign_key="knowledge_candidate.id", index=True)
+    source_artifact_id: str = Field(foreign_key="artifact.id", index=True)
+    review_decision_id: str = Field(foreign_key="knowledge_review_decision.id", index=True)
+    supersedes_fact_id: str | None = Field(
+        default=None, foreign_key="knowledge_fact.id", index=True
+    )
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
 
 
 class Decision(SQLModel, table=True):

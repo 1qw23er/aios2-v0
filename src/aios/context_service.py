@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from aios.audit import append_audit
@@ -18,6 +19,10 @@ from aios.models import (
     Decision,
     DecisionStatus,
     ExecutionAssignment,
+    KnowledgeCandidate,
+    KnowledgeFact,
+    KnowledgeFactStatus,
+    KnowledgeReviewDecision,
     Policy,
     Project,
     ReviewedFact,
@@ -133,6 +138,7 @@ class ContextService:
             )
         outputs, facts = self._dependency_content(task, references)
         decisions = self._decisions(project.id, references)
+        facts.extend(self._knowledge_facts(project.id, references))
         policies = self._policies(project.id, references)
         agent_profile = self._agent_profile(agent, references)
         references.sort(
@@ -293,7 +299,86 @@ class ContextService:
                     )
         return outputs, facts
 
+    def _knowledge_facts(
+        self,
+        project_id: str,
+        references: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        rows = list(
+            self.session.exec(
+                select(KnowledgeFact).where(
+                    KnowledgeFact.status == KnowledgeFactStatus.APPROVED,
+                    or_(
+                        KnowledgeFact.project_id.is_(None),
+                        KnowledgeFact.project_id == project_id,
+                    ),
+                )
+            )
+        )
+        rows.sort(
+            key=lambda row: (
+                0 if row.project_id is None else 1,
+                row.series_id,
+                row.version,
+                row.id,
+            )
+        )
+        result: list[dict[str, Any]] = []
+        for fact in rows:
+            candidate = self.session.get(KnowledgeCandidate, fact.source_candidate_id)
+            review = self.session.get(KnowledgeReviewDecision, fact.review_decision_id)
+            artifact = self.session.get(Artifact, fact.source_artifact_id)
+            if candidate is None or review is None or artifact is None:
+                raise ServiceError(409, "Knowledge fact provenance is missing")
+            scope = "company" if fact.project_id is None else "project"
+            result.append(
+                {
+                    "fact_kind": "knowledge_fact",
+                    "fact_id": fact.id,
+                    "series_id": fact.series_id,
+                    "version": fact.version,
+                    "scope": scope,
+                    "project_id": fact.project_id,
+                    "statement": fact.statement,
+                    "source_candidate_id": candidate.id,
+                    "source_artifact_id": artifact.id,
+                    "review_decision_id": review.id,
+                }
+            )
+            fact_reference: dict[str, Any] = _reference(
+                "knowledge_fact",
+                fact.id,
+                f"{fact.series_id}:{fact.version}",
+                "approved_reusable_knowledge",
+            )
+            fact_reference.update({"scope": scope, "project_id": fact.project_id})
+            references.extend(
+                [
+                    fact_reference,
+                    _reference(
+                        "knowledge_candidate",
+                        candidate.id,
+                        _timestamp(candidate.updated_at),
+                        "knowledge_fact_provenance",
+                    ),
+                    _reference(
+                        "knowledge_review_decision",
+                        review.id,
+                        _timestamp(review.reviewed_at),
+                        "human_approval_provenance",
+                    ),
+                    _reference(
+                        "artifact",
+                        artifact.id,
+                        artifact.checksum,
+                        "knowledge_source_artifact",
+                    ),
+                ]
+            )
+        return result
+
     def _decisions(self, project_id: str, references: list[dict[str, str]]) -> list[dict[str, Any]]:
+
         rows = list(self.session.exec(select(Decision)))
         selected = _latest_versions(
             rows, project_id, lambda row: row.status == DecisionStatus.APPROVED
