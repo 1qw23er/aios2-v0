@@ -7,7 +7,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from sqlmodel import Session, select
 
 from aios.db import get_session, run_migrations
-from aios.models import Approval, Project, Task, new_id
+from aios.models import Approval, Project, Task, TaskStatus, new_id
+from aios.orchestrator import Orchestrator, complete_task
 from aios.schemas import ApprovalCreate, BoardRead, ProjectCreate, TaskCreate
 from aios.services import ServiceError
 from aios.services import create_approval as create_approval_service
@@ -84,6 +85,40 @@ def create_app() -> FastAPI:
             return create_approval_service(session, request, _key(idempotency_key))
         except ServiceError as error:
             raise _translate(error) from error
+
+    @application.post(
+        "/tasks/{task_id}/complete", response_model=Task, status_code=status.HTTP_200_OK
+    )
+    def complete_task_endpoint(
+        task_id: str,
+        session: Session = Depends(get_session),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> Task:
+        try:
+            complete_task(session, task_id, _key(idempotency_key))
+        except ServiceError as error:
+            raise _translate(error) from error
+        task = session.get(Task, task_id)
+        return task
+
+    @application.post("/orchestrator/process", status_code=status.HTTP_200_OK)
+    def process_orchestrator(
+        limit: int = 100,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        before = {
+            row.id
+            for row in session.exec(select(Task).where(Task.status == TaskStatus.READY))
+        }
+        events = Orchestrator(session).process_pending(limit)
+        after = {
+            row.id
+            for row in session.exec(select(Task).where(Task.status == TaskStatus.READY))
+        }
+        return {
+            "processed_events": len(events),
+            "activated_task_ids": sorted(after - before),
+        }
 
     return application
 
