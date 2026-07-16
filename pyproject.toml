@@ -24,7 +24,7 @@ dev = ["pytest>=8.3", "httpx>=0.28", "ruff>=0.9", "mypy>=1.14"]
 packages = ["src/aios"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 
 [tool.ruff]
