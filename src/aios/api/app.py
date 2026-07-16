@@ -3,13 +3,19 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from sqlmodel import Session, select
 
 from aios.db import get_session, run_migrations
-from aios.models import Approval, Project, Task, TaskStatus, new_id
+from aios.models import Approval, Project, Task, new_id
 from aios.orchestrator import Orchestrator, complete_task
-from aios.schemas import ApprovalCreate, BoardRead, ProjectCreate, TaskCreate
+from aios.schemas import (
+    ApprovalCreate,
+    BoardRead,
+    OrchestratorProcessResult,
+    ProjectCreate,
+    TaskCreate,
+)
 from aios.services import ServiceError
 from aios.services import create_approval as create_approval_service
 from aios.services import create_project as create_project_service
@@ -92,33 +98,55 @@ def create_app() -> FastAPI:
     def complete_task_endpoint(
         task_id: str,
         session: Session = Depends(get_session),
-        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        idempotency_key: str = Header(alias="Idempotency-Key"),
     ) -> Task:
+        """Mark a task done.
+
+        The ``Idempotency-Key`` header is required. Repeating the same key for the
+        same task is a no-op (returns the existing completion); omitting the header
+        is rejected with 422. Distinct keys never collapse into one operation --
+        each creates its own ``task.completed`` event.
+        """
         try:
-            complete_task(session, task_id, _key(idempotency_key))
+            complete_task(session, task_id, idempotency_key)
         except ServiceError as error:
             raise _translate(error) from error
         task = session.get(Task, task_id)
         return task
 
-    @application.post("/orchestrator/process", status_code=status.HTTP_200_OK)
+    @application.post(
+        "/orchestrator/process",
+        response_model=OrchestratorProcessResult,
+        status_code=status.HTTP_200_OK,
+    )
     def process_orchestrator(
-        limit: int = 100,
+        limit: int = Query(
+            default=100,
+            ge=1,
+            le=100,
+            description="Maximum number of pending completion events to process in this "
+            "invocation (1..100). Out-of-range or non-integer values are rejected with 422.",
+        ),
         session: Session = Depends(get_session),
-    ) -> dict:
-        before = {
-            row.id
-            for row in session.exec(select(Task).where(Task.status == TaskStatus.READY))
-        }
-        events = Orchestrator(session).process_pending(limit)
-        after = {
-            row.id
-            for row in session.exec(select(Task).where(Task.status == TaskStatus.READY))
-        }
-        return {
-            "processed_events": len(events),
-            "activated_task_ids": sorted(after - before),
-        }
+    ) -> OrchestratorProcessResult:
+        """Drive the orchestrator for pending completion events.
+
+        ``activated_task_ids`` is strict and invocation-scoped. It is taken
+        directly from ``Orchestrator.process_pending(return_detailed=True)``, which
+        returns only the tasks THIS call actually moved to READY inside
+        ``process_event``. It does NOT use a global READY-set diff and does NOT
+        re-derive activations from event-idempotency keys after the fact.
+
+        Consequently, under concurrency: if two requests both claim the same
+        pending source event, the loser's ``process_event`` is a no-op (the event
+        is already PROCESSED) and reports an empty ``activated_task_ids`` -- it
+        cannot leak the winner's activation.
+        """
+        result = Orchestrator(session).process_pending(limit, return_detailed=True)
+        return OrchestratorProcessResult(
+            processed_events=len(result.events),
+            activated_task_ids=sorted(result.activated_task_ids),
+        )
 
     return application
 

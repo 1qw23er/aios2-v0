@@ -45,3 +45,16 @@ class BoardRead(BaseModel):
     project: dict
     tasks_by_status: dict[str, list[dict]]
     pending_approvals: list[dict]
+
+
+class OrchestratorProcessResult(BaseModel):
+    """Response model for ``POST /orchestrator/process``.
+
+    ``activated_task_ids`` is invocation-scoped: it lists only the tasks this
+    specific call activated, never a global READY-set snapshot.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    processed_events: int
+    activated_task_ids: list[str]

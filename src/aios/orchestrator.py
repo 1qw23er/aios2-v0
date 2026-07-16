@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from sqlmodel import Session, select
 
 from aios.audit import append_audit
 from aios.models import Event, EventStatus, Task, TaskStatus, now_utc
 from aios.services import ServiceError, append_event
+
+
+@dataclass
+class ProcessResult:
+    """Detailed result of ``Orchestrator.process_pending``.
+
+    ``activated_task_ids`` contains ONLY the tasks this invocation actually
+    moved to READY (committed inside ``process_event``). It is strict against
+    concurrency: a caller that loses the activation race for a shared source
+    event reports an empty list, because its ``process_event`` call is a no-op
+    (the source event is already PROCESSED).
+    """
+
+    events: list[Event]
+    activated_task_ids: list[str]
 
 
 def complete_task(session: Session, task_id: str, idempotency_key: str) -> Event:
@@ -53,7 +70,9 @@ class Orchestrator:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def process_pending(self, limit: int = 100) -> list[Event]:
+    def process_pending(
+        self, limit: int = 100, return_detailed: bool = False
+    ) -> list[Event] | ProcessResult:
         events = list(
             self.session.exec(
                 select(Event)
@@ -65,8 +84,12 @@ class Orchestrator:
                 .limit(limit)
             )
         )
+        activated_task_ids: list[str] = []
         for event in events:
-            self.process_event(event.id)
+            activated = self.process_event(event.id)
+            activated_task_ids.extend(task.id for task in activated)
+        if return_detailed:
+            return ProcessResult(events=events, activated_task_ids=activated_task_ids)
         return events
 
     def process_event(self, event_id: str) -> list[Task]:
