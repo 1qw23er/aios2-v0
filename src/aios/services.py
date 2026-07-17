@@ -78,7 +78,9 @@ def _replay[Resource: SQLModel](
     return resource
 
 
-def create_project(session: Session, request: ProjectCreate, idempotency_key: str) -> Project:
+def create_project(
+    session: Session, request: ProjectCreate, idempotency_key: str, commit: bool = True
+) -> Project:
     fingerprint = request_fingerprint(request)
     replay = _replay(
         session,
@@ -116,15 +118,21 @@ def create_project(session: Session, request: ProjectCreate, idempotency_key: st
             after={"status": project.status.value},
             idempotency_key=f"audit:{idempotency_key}",
         )
-        session.commit()
+        if commit:
+            session.commit()
+        else:
+            session.flush()
     except Exception:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     session.refresh(project)
     return project
 
 
-def create_task(session: Session, request: TaskCreate, idempotency_key: str) -> Task:
+def create_task(
+    session: Session, request: TaskCreate, idempotency_key: str, commit: bool = True
+) -> Task:
     fingerprint = request_fingerprint(request)
     replay = _replay(
         session,
@@ -177,9 +185,13 @@ def create_task(session: Session, request: TaskCreate, idempotency_key: str) -> 
             after={"status": task.status.value},
             idempotency_key=f"audit:{idempotency_key}",
         )
-        session.commit()
+        if commit:
+            session.commit()
+        else:
+            session.flush()
     except Exception:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     session.refresh(task)
     return task

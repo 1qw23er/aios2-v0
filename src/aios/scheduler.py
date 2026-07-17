@@ -79,6 +79,7 @@ def _record_blocked(
     idempotency_key: str,
     considered: list[dict[str, Any]],
     reason: str,
+    commit: bool = True,
 ) -> None:
     try:
         append_audit(
@@ -100,9 +101,13 @@ def _record_blocked(
             },
             idempotency_key=f"audit:{idempotency_key}",
         )
-        session.commit()
+        if commit:
+            session.commit()
+        else:
+            session.flush()
     except Exception:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
 
 
@@ -110,6 +115,7 @@ def route_task(
     session: Session,
     task_id: str,
     idempotency_key: str,
+    commit: bool = True,
 ) -> ExecutionAssignment | None:
     existing = session.exec(
         select(ExecutionAssignment).where(ExecutionAssignment.idempotency_key == idempotency_key)
@@ -138,7 +144,9 @@ def route_task(
     fallback_used = False
 
     if task.routing_mode == RoutingMode.MANUAL:
-        _record_blocked(session, task, idempotency_key, considered, "manual_assignment_required")
+        _record_blocked(
+            session, task, idempotency_key, considered, "manual_assignment_required", commit=commit
+        )
         return None
 
     if task.routing_mode == RoutingMode.FIXED:
@@ -198,7 +206,7 @@ def route_task(
         else:
             reason = "no_available_capable_agent"
         if selected is None:
-            _record_blocked(session, task, idempotency_key, considered, reason)
+            _record_blocked(session, task, idempotency_key, considered, reason, commit=commit)
             return None
 
     assignment = ExecutionAssignment(
@@ -241,9 +249,13 @@ def route_task(
             },
             idempotency_key=f"audit:{idempotency_key}",
         )
-        session.commit()
+        if commit:
+            session.commit()
+        else:
+            session.flush()
     except Exception:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     session.refresh(assignment)
     return assignment

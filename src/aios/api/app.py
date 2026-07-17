@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from sqlmodel import Session, select
 
+from aios.campaign import CampaignLaunchResult, launch_campaign
 from aios.db import get_session, run_migrations
 from aios.models import Approval, Project, Task, new_id
 from aios.orchestrator import Orchestrator, complete_task
@@ -147,6 +148,38 @@ def create_app() -> FastAPI:
             processed_events=len(result.events),
             activated_task_ids=sorted(result.activated_task_ids),
         )
+
+    @application.post(
+        "/owner/campaigns",
+        response_model=CampaignLaunchResult,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def launch_campaign_endpoint(
+        request: ProjectCreate,
+        session: Session = Depends(get_session),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> CampaignLaunchResult:
+        """Owner entry point: submit a real campaign goal and launch the V1 workflow.
+
+        Reuses ``create_project`` + ``create_task`` + ``depends_on`` to build the
+        Project and the T1-T9 task graph, kicks off T1, and routes it via the
+        existing capability router. The ``Idempotency-Key`` header makes a repeated
+        submission safe (no duplicate Project or Tasks).
+        """
+        try:
+            return launch_campaign(session, request, _key(idempotency_key))
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.get("/owner/campaigns/{project_id}", response_model=BoardRead)
+    def owner_campaign_board(
+        project_id: str, session: Session = Depends(get_session)
+    ) -> dict:
+        """Owner view: the live board for a launched campaign (reuses get_board)."""
+        try:
+            return get_board_service(session, project_id)
+        except ServiceError as error:
+            raise _translate(error) from error
 
     return application
 

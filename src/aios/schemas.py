@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from aios.models import AdapterType, RiskLevel, RoutingMode
@@ -45,6 +47,22 @@ class BoardRead(BaseModel):
     project: dict
     tasks_by_status: dict[str, list[dict]]
     pending_approvals: list[dict]
+
+
+class CampaignLaunchResult(BaseModel):
+    """Response for ``POST /owner/campaigns``.
+
+    A human-readable summary of a launched V1 campaign: the created Project, the
+    T1-T9 task graph (with status + assigned department), and an owner-facing message.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    project_id: str
+    project_status: str
+    task_count: int
+    tasks: list[dict[str, Any]]
+    message: str
 
 
 class OrchestratorProcessResult(BaseModel):
