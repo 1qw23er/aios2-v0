@@ -41,6 +41,7 @@ class AdapterType(StrEnum):
     API = "api"
     CLI = "cli"
     EXTERNAL = "external"
+    MODEL = "model"
 
 
 class ArtifactType(StrEnum):
@@ -184,6 +185,7 @@ class Task(SQLModel, table=True):
     adapter_type: AdapterType = AdapterType.EXTERNAL
     input_context_refs: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     acceptance_criteria: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    output_schema: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     depends_on: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     estimated_cost: float = 0.0
     actual_cost: float = 0.0

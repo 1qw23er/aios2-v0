@@ -27,6 +27,7 @@ class TaskCreate(BaseModel):
     adapter_type: AdapterType = AdapterType.EXTERNAL
     input_context_refs: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
+    output_schema: dict[str, Any] = Field(default_factory=dict)
     depends_on: list[str] = Field(default_factory=list)
     estimated_cost: float = Field(default=0.0, ge=0)
 

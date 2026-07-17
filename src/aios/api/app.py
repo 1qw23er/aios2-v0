@@ -16,6 +16,7 @@ from aios.console import (
     owner_not_found_html,
 )
 from aios.db import get_session, run_migrations
+from aios.execution import LLMExecutionAdapter, execute_task
 from aios.models import Approval, ApprovalStatus, Artifact, Project, Task, new_id
 from aios.orchestrator import Orchestrator, complete_task
 from aios.schemas import (
@@ -157,6 +158,24 @@ def create_app() -> FastAPI:
             raise _translate(error) from error
         task = session.get(Task, task_id)
         return task
+
+    @application.post(
+        "/tasks/{task_id}/execute", response_model=Artifact, status_code=status.HTTP_200_OK
+    )
+    def execute_task_endpoint(
+        task_id: str,
+        session: Session = Depends(get_session),
+        idempotency_key: str = Header(alias="Idempotency-Key"),
+    ) -> Artifact:
+        """Run the assigned department agent on a READY task via the real execution
+        protocol. Reusing one ``ExecutionAdapter`` (model-backed by default); tests
+        inject a deterministic adapter. Idempotent on the ``Idempotency-Key`` header.
+        """
+        adapter = LLMExecutionAdapter()
+        try:
+            return execute_task(session, task_id, idempotency_key, adapter=adapter, actor="agent")
+        except ServiceError as error:
+            raise _translate(error) from error
 
     @application.post("/tasks/{task_id}/revision", response_model=Task)
     def request_revision_endpoint(
@@ -431,6 +450,51 @@ def create_app() -> FastAPI:
             return HTMLResponse(
                 owner_error_html(
                     message="处理修订时系统出现意外错误，请稍后重试。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=500,
+            )
+        return RedirectResponse(url=f"/owner/board/{task.project_id}", status_code=303)
+
+    @application.post(
+        "/owner/tasks/{task_id}/execute", response_class=HTMLResponse, response_model=None
+    )
+    def owner_execute(
+        task_id: str,
+        request: Request,
+        session: Session = Depends(get_session),
+    ) -> HTMLResponse | RedirectResponse:
+        """Owner triggers a department agent to run a READY task from the board.
+
+        Human-controlled (owner clicks), not automatic. Uses the model-backed
+        adapter; if AIOS_AGENT_* is unconfigured it returns a readable 503 page.
+        """
+        last_campaign_id = request.cookies.get("aios_last_campaign")
+        task = session.get(Task, task_id)
+        if task is None:
+            return HTMLResponse(owner_not_found_html(task_id), status_code=404)
+        # #47: confine owner actions to the campaign the owner is currently viewing.
+        if last_campaign_id is not None and task.project_id != last_campaign_id:
+            return HTMLResponse(
+                owner_error_html(
+                    message="该任务不属于当前看板，无法操作。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        try:
+            execute_task(
+                session, task_id, new_id("idem"), adapter=LLMExecutionAdapter(), actor="owner"
+            )
+        except ServiceError as error:
+            return HTMLResponse(
+                owner_error_html(message=error.detail, last_campaign_id=last_campaign_id),
+                status_code=error.status_code,
+            )
+        except Exception:
+            return HTMLResponse(
+                owner_error_html(
+                    message="部门执行时出现意外错误，请稍后重试。",
                     last_campaign_id=last_campaign_id,
                 ),
                 status_code=500,

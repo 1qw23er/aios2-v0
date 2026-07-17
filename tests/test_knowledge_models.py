@@ -134,4 +134,4 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
         }
         assert "knowledge_fact" not in tables
     command.upgrade(config, "head")
-    assert revision() == "20260716_0005"
+    assert revision() == "20260717_0006"

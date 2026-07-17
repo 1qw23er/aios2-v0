@@ -6,7 +6,7 @@ from typing import Any
 from sqlmodel import Session, select
 
 from aios.campaign import V1_TASKS
-from aios.models import Agent, RoutingMode
+from aios.models import Agent, Artifact, RoutingMode
 from aios.services import get_board
 
 STATUS_LABELS: dict[str, str] = {
@@ -51,6 +51,15 @@ def build_board_view(session: Session, project_id: str) -> dict[str, Any]:
         a.get("task_id"): a for a in board.get("pending_approvals", []) if a.get("task_id")
     }
 
+    # Latest artifact summary per task, so the owner can see execution output.
+    artifact_summary_by_task: dict[str, str] = {}
+    for artifact in session.exec(select(Artifact).where(Artifact.task_id.isnot(None))).all():
+        if artifact.task_id and artifact.metadata_json.get("summary"):
+            # Keep the first (earliest) summary per task; iteration is by id order.
+            artifact_summary_by_task.setdefault(
+                artifact.task_id, str(artifact.metadata_json["summary"])
+            )
+
     ordered: list[dict[str, Any]] = []
     for task_def in V1_TASKS:
         board_task = next(
@@ -82,6 +91,12 @@ def build_board_view(session: Session, project_id: str) -> dict[str, Any]:
                 "status": status,
                 "status_label": STATUS_LABELS.get(status, status),
                 "depends_on": list(task_def.get("depends_on", [])),
+                "artifact_summary": artifact_summary_by_task.get(board_task["id"]),
+                "executable": (
+                    status == "ready"
+                    and not is_gate
+                    and bool(assigned_agent_id)
+                ),
             }
         )
 
@@ -188,9 +203,22 @@ def owner_board_html(view: dict[str, Any]) -> str:
             row_class = "task-row task-gate"
         assigned = escape(item["assigned_agent"]) if item["assigned_agent"] else "—"
         deps = "、".join(item["depends_on"]) if item["depends_on"] else "—"
+        extra: list[str] = []
+        if item.get("artifact_summary"):
+            extra.append(
+                f'<div class="artifact-summary">执行产物：{escape(item["artifact_summary"])}</div>'
+            )
+        if item.get("executable"):
+            tid = escape(item["task_id"])
+            extra.append(
+                f'<form method="post" action="/owner/tasks/{tid}/execute" class="run-form">'
+                f'<button type="submit" class="btn-run">运行部门任务</button></form>'
+            )
+        extra_html = "\n".join(extra)
         rows.append(
             f'<tr class="{row_class}">'
-            f'<td><b>{escape(item["key"])}</b><br>{escape(item["title"])}</td>'
+            f'<td><b>{escape(item["key"])}</b><br>{escape(item["title"])}'
+            f"{extra_html}</td>"
             f'<td>{escape(item["department"])}</td>'
             f'<td><span class="badge">{escape(item["status_label"])}</span>{gate_badge}</td>'
             f'<td>{assigned}</td>'
@@ -269,6 +297,12 @@ def owner_board_html(view: dict[str, Any]) -> str:
               padding: 8px 16px; font-size: 14px; cursor: pointer; }}
   .btn-revise {{ background: #2f6fed; color: #fff; border: 0; border-radius: 6px;
               padding: 8px 16px; font-size: 14px; cursor: pointer; }}
+  .artifact-summary {{ margin-top: 8px; padding: 8px 10px; background: #f3f8f4;
+              border: 1px solid #cfe9d6; border-radius: 6px; font-size: 13px;
+              color: #1f6b3a; }}
+  .run-form {{ margin-top: 8px; }}
+  .btn-run {{ background: #6d28d9; color: #fff; border: 0; border-radius: 6px;
+              padding: 6px 14px; font-size: 13px; cursor: pointer; }}
 </style>
 </head>
 <body>

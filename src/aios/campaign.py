@@ -62,26 +62,40 @@ V1_CAPABILITIES: list[dict[str, str]] = [
 ]
 
 V1_DEPARTMENTS: list[dict[str, Any]] = [
-    {"name": "User Research Agent", "role": "user_research", "capabilities": ["user_research"]},
+    {
+        "name": "User Research Agent",
+        "role": "user_research",
+        "adapter_type": AdapterType.MODEL,
+        "capabilities": ["user_research"],
+    },
     {
         "name": "Positioning and Strategy Agent",
         "role": "positioning",
+        "adapter_type": AdapterType.MODEL,
         "capabilities": ["positioning"],
     },
     {
         "name": "Content Strategy Agent",
         "role": "content_strategy",
+        "adapter_type": AdapterType.MODEL,
         "capabilities": ["xhs_adaptation", "packaging"],
     },
     {
         "name": "Content Production Agent",
         "role": "content_production",
+        "adapter_type": AdapterType.MODEL,
         "capabilities": ["wechat_writing", "video_script"],
     },
-    {"name": "Visual and Design Agent", "role": "visual_design", "capabilities": []},
+    {
+        "name": "Visual and Design Agent",
+        "role": "visual_design",
+        "adapter_type": AdapterType.EXTERNAL,
+        "capabilities": [],
+    },
     {
         "name": "Growth and Conversion Agent",
         "role": "growth",
+        "adapter_type": AdapterType.EXTERNAL,
         "capabilities": ["knowledge_capture"],
     },
 ]
@@ -104,6 +118,67 @@ V1_TASKS: list[dict[str, Any]] = [
             "形成不少于 3 条证据化用户洞察",
             "明确首篇内容要解决的用户问题",
         ],
+        "output_schema": {
+            "type": "object",
+            "properties": {
+                "target_audience_problems": {
+                    "type": "array",
+                    "minItems": 3,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "segment": {"type": "string"},
+                            "problem": {"type": "string"},
+                            "evidence": {"type": "string"},
+                        },
+                        "required": ["segment", "problem", "evidence"],
+                    },
+                },
+                "relevant_search_intent": {
+                    "type": "array",
+                    "minItems": 2,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "intent": {"type": "string"},
+                        },
+                        "required": ["query", "intent"],
+                    },
+                },
+                "benchmark_account_research": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "account": {"type": "string"},
+                            "what_works": {"type": "string"},
+                            "takeaway": {"type": "string"},
+                        },
+                        "required": ["account", "what_works", "takeaway"],
+                    },
+                },
+                "evidence_and_provenance": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "claim": {"type": "string"},
+                            "source": {"type": "string"},
+                        },
+                        "required": ["claim", "source"],
+                    },
+                },
+            },
+            "required": [
+                "target_audience_problems",
+                "relevant_search_intent",
+                "benchmark_account_research",
+                "evidence_and_provenance",
+            ],
+        },
     },
     {
         "key": "T2",
@@ -113,15 +188,82 @@ V1_TASKS: list[dict[str, Any]] = [
         "required_capabilities": ["positioning"],
         "depends_on": ["T1"],
         "acceptance_criteria": ["给出清晰定位陈述", "列出 3 个内容支柱"],
+        "output_schema": {
+            "type": "object",
+            "properties": {
+                "personal_ip_positioning": {"type": "string", "minLength": 1},
+                "audience_definition": {
+                    "type": "object",
+                    "properties": {
+                        "primary": {"type": "string"},
+                        "needs": {"type": "string"},
+                    },
+                    "required": ["primary", "needs"],
+                },
+                "differentiation": {"type": "string", "minLength": 1},
+                "content_pillars": {
+                    "type": "array",
+                    "minItems": 3,
+                    "items": {"type": "string"},
+                },
+                "relationship_to_aimi": {"type": "string", "minLength": 1},
+            },
+            "required": [
+                "personal_ip_positioning",
+                "audience_definition",
+                "differentiation",
+                "content_pillars",
+                "relationship_to_aimi",
+            ],
+        },
     },
     {
         "key": "T3",
         "title": "T3 核心微信文章",
-        "description": "基于定位产出一篇微信官方号长文（核心资产）。",
-        "department": "Content Production Agent",
-        "required_capabilities": ["wechat_writing"],
+        "description": "基于定位产出一篇微信官方号长文（核心资产）及多平台改编简报。",
+        "department": "Content Strategy Agent",
+        "required_capabilities": ["xhs_adaptation", "packaging"],
         "depends_on": ["T2"],
         "acceptance_criteria": ["产出一篇可直接发布的微信长文", "紧扣定位与用户问题"],
+        "output_schema": {
+            "type": "object",
+            "properties": {
+                "core_content_angle": {"type": "string", "minLength": 1},
+                "content_objective_classification": {"type": "string", "minLength": 1},
+                "wechat_article_brief": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "hook": {"type": "string"},
+                        "outline": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["title", "hook", "outline"],
+                },
+                "xiaohongshu_adaptation_brief": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "angle": {"type": "string"},
+                    },
+                    "required": ["title", "angle"],
+                },
+                "short_video_brief": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "script_beat": {"type": "string"},
+                    },
+                    "required": ["title", "script_beat"],
+                },
+            },
+            "required": [
+                "core_content_angle",
+                "content_objective_classification",
+                "wechat_article_brief",
+                "xiaohongshu_adaptation_brief",
+                "short_video_brief",
+            ],
+        },
     },
     {
         "key": "T4",
@@ -203,7 +345,12 @@ def _upsert_capability(
 
 
 def _upsert_agent(
-    session: Session, agent_id: str, name: str, role: str, capabilities: list[str]
+    session: Session,
+    agent_id: str,
+    name: str,
+    role: str,
+    capabilities: list[str],
+    adapter_type: AdapterType = AdapterType.EXTERNAL,
 ) -> Agent:
     """Idempotent AND race-safe agent upsert (deterministic id ``agt:<role>``).
 
@@ -216,7 +363,7 @@ def _upsert_agent(
             id=agent_id,
             name=name,
             role=role,
-            adapter_type=AdapterType.EXTERNAL,
+            adapter_type=adapter_type,
             capabilities=capabilities,
             permissions=[],
             cost_policy={},
@@ -274,6 +421,7 @@ def seed_v1_agents(
             dept["name"],
             dept["role"],
             [capability_by_name[name] for name in dept["capabilities"]],
+            dept.get("adapter_type", AdapterType.EXTERNAL),
         )
         agent_by_name[dept["name"]] = existing.id
         for cap_name in dept["capabilities"]:
@@ -340,6 +488,7 @@ def launch_campaign(
                 ],
                 routing_mode=RoutingMode.FIXED if dept else RoutingMode.MANUAL,
                 acceptance_criteria=list(task_def.get("acceptance_criteria", [])),
+                output_schema=dict(task_def.get("output_schema", {})),
                 depends_on=depends_on,
             )
             task = create_task(
