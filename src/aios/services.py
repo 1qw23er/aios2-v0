@@ -19,6 +19,7 @@ from aios.models import (
     Event,
     Project,
     RiskLevel,
+    RoutingMode,
     Task,
     TaskStatus,
     new_id,
@@ -310,6 +311,11 @@ def decide_approval(
         raise ServiceError(404, "Approval not found")
     if approval.status != ApprovalStatus.PENDING:
         raise ServiceError(409, "该审批已被处理，不能重复决策")
+    # #47: owner decisions are confined to MANUAL gated tasks only.
+    if approval.task_id is not None:
+        gated_task = session.get(Task, approval.task_id)
+        if gated_task is not None and gated_task.routing_mode != RoutingMode.MANUAL:
+            raise ServiceError(400, "仅 owner-gate（MANUAL）任务可在此审批/修订")
     approval.status = decision
     approval.decided_at = now_utc()
     approval.rationale = rationale
@@ -399,6 +405,8 @@ def request_revision(session: Session, task_id: str, feedback: str) -> Task:
     task = session.get(Task, task_id)
     if task is None:
         raise ServiceError(404, "Task not found")
+    if task.routing_mode != RoutingMode.MANUAL:
+        raise ServiceError(400, "仅 owner-gate（MANUAL）任务可在此请求修订")
     before = task.status
     task.status = TaskStatus.REVIEW
     task.updated_at = now_utc()

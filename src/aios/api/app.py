@@ -346,6 +346,15 @@ def create_app() -> FastAPI:
         task = session.get(Task, task_id)
         if task is None:
             return HTMLResponse(owner_not_found_html(task_id), status_code=404)
+        # #47: confine owner actions to the campaign the owner is currently viewing.
+        if last_campaign_id is not None and task.project_id != last_campaign_id:
+            return HTMLResponse(
+                owner_error_html(
+                    message="该任务不属于当前看板，无法操作。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
         if decision not in ("approve", "reject"):
             return HTMLResponse(
                 owner_error_html(
@@ -394,6 +403,15 @@ def create_app() -> FastAPI:
         task = session.get(Task, task_id)
         if task is None:
             return HTMLResponse(owner_not_found_html(task_id), status_code=404)
+        # #47: confine owner actions to the campaign the owner is currently viewing.
+        if last_campaign_id is not None and task.project_id != last_campaign_id:
+            return HTMLResponse(
+                owner_error_html(
+                    message="该任务不属于当前看板，无法操作。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
         if not feedback or not feedback.strip():
             return HTMLResponse(
                 owner_error_html(

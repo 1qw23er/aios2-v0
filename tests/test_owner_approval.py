@@ -15,6 +15,7 @@ from aios.models import (
     ArtifactReviewStatus,
     ArtifactType,
     Event,
+    Project,
     RoutingMode,
     TaskStatus,
 )
@@ -190,3 +191,91 @@ def test_console_unknown_task_is_readable_404(client: TestClient) -> None:
     resp = client.post("/owner/tasks/does-not-exist/decide", data={"decision": "approve"})
     assert resp.status_code == 404
     assert "未找到" in resp.text  # readable HTML, no stack trace
+
+
+# --- #47 hardening: trust-boundary enforcement ---
+
+
+def test_decide_rejects_non_manual_task(client: TestClient) -> None:
+    """decide_approval must refuse a NON-MANUAL task (gap #1)."""
+    _launch(client)
+    with Session(get_engine(get_database_url())) as session:
+        non_gate = session.exec(
+            select(TaskModel).where(TaskModel.routing_mode != RoutingMode.MANUAL)
+        ).first()
+        assert non_gate is not None
+        approval = ensure_pending_approval(
+            session,
+            project_id=non_gate.project_id,
+            task_id=non_gate.id,
+            action_type="owner_gate",
+        )
+        with pytest.raises(ServiceError) as exc:
+            decide_approval(session, approval.id, ApprovalStatus.APPROVED)
+        assert exc.value.status_code == 400
+
+
+def test_request_revision_rejects_non_manual_task(client: TestClient) -> None:
+    """request_revision must refuse a NON-MANUAL task (gap #1)."""
+    _launch(client)
+    with Session(get_engine(get_database_url())) as session:
+        non_gate = session.exec(
+            select(TaskModel).where(TaskModel.routing_mode != RoutingMode.MANUAL)
+        ).first()
+        assert non_gate is not None
+        with pytest.raises(ServiceError) as exc:
+            request_revision(session, non_gate.id, "修订意见")
+        assert exc.value.status_code == 400
+
+
+def _seed_other_campaign() -> str:
+    """Create a second campaign B with its own MANUAL gate task; return its task id."""
+    with Session(get_engine(get_database_url())) as session:
+        project = Project(id="prj_harden_B", name="B", objective="second campaign")
+        session.add(project)
+        task = TaskModel(
+            id="task_harden_B_gate",
+            project_id="prj_harden_B",
+            key="TB",
+            title="B gate",
+            description="",
+            routing_mode=RoutingMode.MANUAL,
+            required_capabilities=[],
+            depends_on=[],
+        )
+        session.add(task)
+        session.commit()
+        return task.id
+
+
+def test_owner_decide_blocks_cross_campaign(client: TestClient) -> None:
+    """owner_decide must 400 when the task belongs to another campaign (gap #2)."""
+    _launch(client)  # sets cookie to campaign A
+    task_a_id, project_a_id = _gate_task()
+    task_b_id = _seed_other_campaign()
+    client.cookies.set("aios_last_campaign", project_a_id)
+    # Acting on B's task while viewing A -> rejected.
+    resp = client.post(f"/owner/tasks/{task_b_id}/decide", data={"decision": "approve"})
+    assert resp.status_code == 400
+    assert "当前看板" in resp.text  # readable Chinese, not a stack trace
+    # Acting on A's own gate task still works.
+    resp_ok = client.post(f"/owner/tasks/{task_a_id}/decide", data={"decision": "approve"})
+    assert resp_ok.status_code == 303
+
+
+def test_owner_revision_blocks_cross_campaign(client: TestClient) -> None:
+    """owner_revision must 400 when the task belongs to another campaign (gap #2)."""
+    _launch(client)  # sets cookie to campaign A
+    task_a_id, project_a_id = _gate_task()
+    task_b_id = _seed_other_campaign()
+    client.cookies.set("aios_last_campaign", project_a_id)
+    resp = client.post(
+        f"/owner/tasks/{task_b_id}/revision", data={"feedback": "修订意见"}
+    )
+    assert resp.status_code == 400
+    assert "当前看板" in resp.text
+    resp_ok = client.post(
+        f"/owner/tasks/{task_a_id}/revision", data={"feedback": "修订意见"}
+    )
+    assert resp_ok.status_code == 303
+
