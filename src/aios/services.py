@@ -13,13 +13,22 @@ from aios.models import (
     Agent,
     Approval,
     ApprovalStatus,
+    Artifact,
+    ArtifactReviewStatus,
     Capability,
     Event,
     Project,
+    RiskLevel,
     Task,
     TaskStatus,
+    new_id,
+    now_utc,
 )
-from aios.schemas import ApprovalCreate, ProjectCreate, TaskCreate
+from aios.schemas import (
+    ApprovalCreate,
+    ProjectCreate,
+    TaskCreate,
+)
 
 
 @dataclass
@@ -249,6 +258,211 @@ def create_approval(session: Session, request: ApprovalCreate, idempotency_key: 
         raise
     session.refresh(approval)
     return approval
+
+
+def ensure_pending_approval(
+    session: Session,
+    *,
+    project_id: str,
+    task_id: str | None,
+    action_type: str,
+    risk_level: RiskLevel = RiskLevel.L2,
+) -> Approval:
+    """Return the task's existing PENDING approval, or create one (L2 gate by default).
+
+    Used by the owner console so a gate task (e.g. T6 / T8) can be decided in one
+    click: the approval is created lazily on first decision instead of at launch.
+    """
+    if task_id is not None:
+        existing = session.exec(
+            select(Approval).where(
+                Approval.project_id == project_id,
+                Approval.task_id == task_id,
+                Approval.status == ApprovalStatus.PENDING,
+            )
+        ).first()
+        if existing is not None:
+            return existing
+    request = ApprovalCreate(
+        project_id=project_id,
+        task_id=task_id,
+        action_type=action_type,
+        risk_level=risk_level,
+        rationale=None,
+    )
+    return create_approval(session, request, idempotency_key=new_id("idem"))
+
+
+def decide_approval(
+    session: Session,
+    approval_id: str,
+    decision: ApprovalStatus,
+    rationale: str | None = None,
+) -> Approval:
+    """Owner decision on a pending approval.
+
+    On APPROVED for a gated task, marks the task DONE and unlocks downstream tasks
+    (e.g. T6 done -> T7 / T9 READY) via the orchestrator. Every decision is recorded
+    in the AuditLog (bypassing it is an invalid state per the Issue stop condition).
+    """
+    approval = session.get(Approval, approval_id)
+    if approval is None:
+        raise ServiceError(404, "Approval not found")
+    if approval.status != ApprovalStatus.PENDING:
+        raise ServiceError(409, "该审批已被处理，不能重复决策")
+    approval.status = decision
+    approval.decided_at = now_utc()
+    approval.rationale = rationale
+    try:
+        session.add(approval)
+        append_audit(
+            session,
+            actor="owner",
+            action="approval.decided",
+            resource_type="approval",
+            resource_id=approval.id,
+            project_id=approval.project_id,
+            task_id=approval.task_id,
+            before={"status": ApprovalStatus.PENDING.value},
+            after={"status": decision.value, "rationale": rationale},
+            idempotency_key=f"audit:approval:{approval.id}:{decision.value}",
+        )
+        if approval.task_id is not None:
+            task = session.get(Task, approval.task_id)
+            if task is not None:
+                if decision == ApprovalStatus.APPROVED and task.status != TaskStatus.DONE:
+                    before = task.status
+                    task.status = TaskStatus.DONE
+                    task.updated_at = now_utc()
+                    session.add(task)
+                    append_event(
+                        session,
+                        project_id=task.project_id,
+                        task_id=task.id,
+                        event_type="task.completed",
+                        idempotency_key=new_id("idem"),
+                        payload={
+                            "before": before.value,
+                            "after": TaskStatus.DONE.value,
+                            "via": "owner_approval",
+                        },
+                    )
+                    append_audit(
+                        session,
+                        actor="owner",
+                        action="task.completed",
+                        resource_type="task",
+                        resource_id=task.id,
+                        project_id=task.project_id,
+                        task_id=task.id,
+                        before={"status": before.value},
+                        after={"status": TaskStatus.DONE.value},
+                        idempotency_key=f"audit:task:{task.id}:done",
+                    )
+                    # Unlock downstream tasks (T7 / T9 READY) using the orchestrator.
+                    from aios.orchestrator import Orchestrator
+
+                    Orchestrator(session).process_pending()
+                elif decision == ApprovalStatus.REJECTED and task.status != TaskStatus.REVIEW:
+                    # Owner returns the gate output for rework (Issue AC: returns to REVIEW).
+                    before = task.status
+                    task.status = TaskStatus.REVIEW
+                    task.updated_at = now_utc()
+                    session.add(task)
+                    append_audit(
+                        session,
+                        actor="owner",
+                        action="task.returned",
+                        resource_type="task",
+                        resource_id=task.id,
+                        project_id=task.project_id,
+                        task_id=task.id,
+                        before={"status": before.value},
+                        after={"status": TaskStatus.REVIEW.value},
+                        idempotency_key=f"audit:task:{task.id}:returned",
+                    )
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    session.refresh(approval)
+    return approval
+
+
+def request_revision(session: Session, task_id: str, feedback: str) -> Task:
+    """Re-open a returned task to REVIEW and durably record the feedback.
+
+    The feedback is recorded via Event + AuditLog. Real re-export through
+    ExternalWorkstationAdapter is deferred to the agent-execution stage (V1 real
+    execution is out of scope); the durable record here is what #37 requires.
+    """
+    task = session.get(Task, task_id)
+    if task is None:
+        raise ServiceError(404, "Task not found")
+    before = task.status
+    task.status = TaskStatus.REVIEW
+    task.updated_at = now_utc()
+    try:
+        session.add(task)
+        append_event(
+            session,
+            project_id=task.project_id,
+            task_id=task.id,
+            event_type="task.revision",
+            idempotency_key=new_id("idem"),
+            payload={"feedback": feedback, "before": before.value},
+        )
+        append_audit(
+            session,
+            actor="owner",
+            action="task.revision",
+            resource_type="task",
+            resource_id=task.id,
+            project_id=task.project_id,
+            task_id=task.id,
+            before={"status": before.value},
+            after={"status": TaskStatus.REVIEW.value, "feedback": feedback},
+            idempotency_key=f"audit:task:{task.id}:revision",
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    session.refresh(task)
+    return task
+
+
+def set_artifact_review_status(
+    session: Session,
+    artifact_id: str,
+    review_status: ArtifactReviewStatus,
+) -> Artifact:
+    """Update an artifact's review status (UNVERIFIED / APPROVED / REJECTED) + audit."""
+    artifact = session.get(Artifact, artifact_id)
+    if artifact is None:
+        raise ServiceError(404, "Artifact not found")
+    before = artifact.review_status
+    artifact.review_status = review_status
+    try:
+        session.add(artifact)
+        append_audit(
+            session,
+            actor="owner",
+            action="artifact.review_status",
+            resource_type="artifact",
+            resource_id=artifact.id,
+            project_id=artifact.project_id,
+            task_id=artifact.task_id,
+            before={"review_status": before.value},
+            after={"review_status": review_status.value},
+            idempotency_key=f"audit:artifact:{artifact.id}:{review_status.value}",
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    session.refresh(artifact)
+    return artifact
 
 
 def get_board(session: Session, project_id: str) -> dict:

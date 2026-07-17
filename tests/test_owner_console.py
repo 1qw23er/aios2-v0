@@ -143,8 +143,9 @@ def test_board_marks_t6_t8_owner_action(client: TestClient) -> None:
     board = client.get(launch.headers["location"])
     text = board.text
     assert "需你处理 / 审批" in text
-    # Exactly the two owner-gate rows (T6, T8) carry the gate marker.
-    assert text.count('badge-gate">需你处理 / 审批') == 2
+    # The two owner-gate tasks (T6, T8) carry the gate marker both in the board
+    # table row and in the actionable "需要你处理的任务" block below it.
+    assert text.count('badge-gate">需你处理 / 审批') == 4
 
 
 # 7. Unknown project produces a readable not-found page.
@@ -193,15 +194,18 @@ def test_gate_badge_derived_from_persisted_routing_mode(client: TestClient) -> N
     launch = _launch_form(client, "gate 来源测试", "持久化路由。")
     board = client.get(launch.headers["location"])
     # T6 (人工审阅) and T8 (发布闸门) are launched with routing_mode=MANUAL.
-    assert board.text.count('badge-gate">需你处理 / 审批') == 2
+    # Each gate task carries the badge both in its board table row and in the
+    # actionable "需要你处理的任务" block below it -> 2 tasks x 2 locations = 4.
+    assert board.text.count('badge-gate">需你处理 / 审批') == 4
 
     # Flip T6's persisted routing_mode to FIXED; the badge must disappear for T6
-    # (only T8 remains) because the gate is read from persisted state.
+    # (only T8 remains) because the gate is read from persisted state. T8 still
+    # shows the badge in both its table row and the gate block -> 2.
     project_id = launch.headers["location"].rsplit("/", 1)[-1]
     _set_task_routing_mode(project_id, "T6 人工审阅", RoutingMode.FIXED)
 
     board_after = client.get(launch.headers["location"])
-    assert board_after.text.count('badge-gate">需你处理 / 审批') == 1
+    assert board_after.text.count('badge-gate">需你处理 / 审批') == 2
     # T6 is still rendered, just no longer flagged as an owner gate.
     assert "T6 人工审阅" in board_after.text
     assert "Traceback" not in board_after.text

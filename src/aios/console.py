@@ -47,6 +47,9 @@ def build_board_view(session: Session, project_id: str) -> dict[str, Any]:
     for tasks in board["tasks_by_status"].values():
         for task in tasks:
             board_task_by_id[task["id"]] = task
+    pending_by_task: dict[str, dict[str, Any]] = {
+        a.get("task_id"): a for a in board.get("pending_approvals", []) if a.get("task_id")
+    }
 
     ordered: list[dict[str, Any]] = []
     for task_def in V1_TASKS:
@@ -66,12 +69,15 @@ def build_board_view(session: Session, project_id: str) -> dict[str, Any]:
         assigned_agent_id = board_task.get("assigned_agent_id")
         assigned = agent_name.get(assigned_agent_id) if assigned_agent_id else None
         status = board_task["status"]
+        pending = pending_by_task.get(board_task["id"])
         ordered.append(
             {
                 "key": task_def["key"],
                 "title": task_def["title"],
+                "task_id": board_task["id"],
                 "department": department,
                 "is_gate": is_gate,
+                "pending_approval_id": pending["id"] if pending else None,
                 "assigned_agent": assigned,
                 "status": status,
                 "status_label": STATUS_LABELS.get(status, status),
@@ -193,6 +199,38 @@ def owner_board_html(view: dict[str, Any]) -> str:
         )
     rows_html = "\n".join(rows)
 
+    gate_items = [item for item in view["ordered"] if item["is_gate"]]
+    gate_cards: list[str] = []
+    for item in gate_items:
+        tid = escape(item["task_id"])
+        ttitle = escape(item["title"])
+        tstatus = escape(item["status_label"])
+        gate_cards.append(
+            f'<div class="gate-card">'
+            f'<div class="gate-head"><b>{ttitle}</b> '
+            f'<span class="badge badge-gate">需你处理 / 审批</span> '
+            f'<span class="badge">{tstatus}</span></div>'
+            f'<form method="post" action="/owner/tasks/{tid}/decide" class="gate-form">'
+            f'<input type="hidden" name="decision" value="approve">'
+            f'<button type="submit" class="btn-approve">批准并继续</button>'
+            f"</form>"
+            f'<form method="post" action="/owner/tasks/{tid}/decide" class="gate-form">'
+            f'<input type="hidden" name="decision" value="reject">'
+            f'<input type="text" name="rationale" placeholder="驳回理由（可选）">'
+            f'<button type="submit" class="btn-reject">驳回</button>'
+            f"</form>"
+            f'<form method="post" action="/owner/tasks/{tid}/revision" class="gate-form">'
+            f'<input type="text" name="feedback" placeholder="需要修订什么？">'
+            f'<button type="submit" class="btn-revise">要求修订</button>'
+            f"</form>"
+            f"</div>"
+        )
+    gate_html = (
+        '<div class="card"><h2>需要你处理的任务</h2>' + "\n".join(gate_cards) + "</div>"
+        if gate_cards
+        else ""
+    )
+
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -219,6 +257,18 @@ def owner_board_html(view: dict[str, Any]) -> str:
   .task-gate {{ background: #fffaf2; }}
   a {{ color: #2f6fed; text-decoration: none; }}
   .back {{ display: inline-block; margin-bottom: 14px; }}
+  .gate-card {{ background: #fffaf2; border: 1px solid #ffe0b3; border-radius: 10px;
+              padding: 16px 18px; margin-bottom: 14px; }}
+  .gate-head {{ margin-bottom: 10px; }}
+  .gate-form {{ display: flex; gap: 8px; align-items: center; margin-top: 8px; }}
+  .gate-form input[type="text"] {{ flex: 1; padding: 8px; border: 1px solid #d0d3d9;
+              border-radius: 6px; font-size: 14px; }}
+  .btn-approve {{ background: #1f9d55; color: #fff; border: 0; border-radius: 6px;
+              padding: 8px 16px; font-size: 14px; cursor: pointer; }}
+  .btn-reject {{ background: #b42318; color: #fff; border: 0; border-radius: 6px;
+              padding: 8px 16px; font-size: 14px; cursor: pointer; }}
+  .btn-revise {{ background: #2f6fed; color: #fff; border: 0; border-radius: 6px;
+              padding: 8px 16px; font-size: 14px; cursor: pointer; }}
 </style>
 </head>
 <body>
@@ -239,6 +289,7 @@ def owner_board_html(view: dict[str, Any]) -> str:
     {rows_html}
     </tbody>
   </table>
+  {gate_html}
   <p class="meta">标注「需你处理 / 审批」的任务（T6 人工审阅、T8 发布闸门）不会自动分配，
      需要你在系统中做出明确决定后才会继续。</p>
 </div>

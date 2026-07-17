@@ -16,16 +16,25 @@ from aios.console import (
     owner_not_found_html,
 )
 from aios.db import get_session, run_migrations
-from aios.models import Approval, Project, Task, new_id
+from aios.models import Approval, ApprovalStatus, Artifact, Project, Task, new_id
 from aios.orchestrator import Orchestrator, complete_task
 from aios.schemas import (
     ApprovalCreate,
+    ApprovalDecision,
+    ArtifactReviewUpdate,
     BoardRead,
     OrchestratorProcessResult,
     ProjectCreate,
+    RevisionRequest,
     TaskCreate,
 )
-from aios.services import ServiceError
+from aios.services import (
+    ServiceError,
+    decide_approval,
+    ensure_pending_approval,
+    request_revision,
+    set_artifact_review_status,
+)
 from aios.services import create_approval as create_approval_service
 from aios.services import create_project as create_project_service
 from aios.services import create_task as create_task_service
@@ -101,6 +110,32 @@ def create_app() -> FastAPI:
         except ServiceError as error:
             raise _translate(error) from error
 
+    @application.post("/approvals/{approval_id}/decide", response_model=Approval)
+    def decide_approval_endpoint(
+        approval_id: str,
+        decision: ApprovalDecision,
+        session: Session = Depends(get_session),
+    ) -> Approval:
+        try:
+            return decide_approval(session, approval_id, decision.decision, decision.rationale)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/artifacts/{artifact_id}/review-status",
+        response_model=Artifact,
+        status_code=status.HTTP_200_OK,
+    )
+    def set_artifact_review_status_endpoint(
+        artifact_id: str,
+        update: ArtifactReviewUpdate,
+        session: Session = Depends(get_session),
+    ) -> Artifact:
+        try:
+            return set_artifact_review_status(session, artifact_id, update.review_status)
+        except ServiceError as error:
+            raise _translate(error) from error
+
     @application.post(
         "/tasks/{task_id}/complete", response_model=Task, status_code=status.HTTP_200_OK
     )
@@ -122,6 +157,17 @@ def create_app() -> FastAPI:
             raise _translate(error) from error
         task = session.get(Task, task_id)
         return task
+
+    @application.post("/tasks/{task_id}/revision", response_model=Task)
+    def request_revision_endpoint(
+        task_id: str,
+        revision: RevisionRequest,
+        session: Session = Depends(get_session),
+    ) -> Task:
+        try:
+            return request_revision(session, task_id, revision.feedback)
+        except ServiceError as error:
+            raise _translate(error) from error
 
     @application.post(
         "/orchestrator/process",
@@ -280,6 +326,98 @@ def create_app() -> FastAPI:
                 status_code=500,
             )
         return HTMLResponse(owner_board_html(view))
+
+    @application.post(
+        "/owner/tasks/{task_id}/decide", response_class=HTMLResponse, response_model=None
+    )
+    def owner_decide(
+        task_id: str,
+        request: Request,
+        decision: str | None = Form(None),
+        rationale: str | None = Form(None),
+        session: Session = Depends(get_session),
+    ) -> HTMLResponse | RedirectResponse:
+        """Owner approves or rejects a gated task (T6 / T8) from the board.
+
+        Lazily creates the L2 gate approval (ensure_pending_approval) then decides it.
+        On APPROVED the orchestrator unlocks downstream tasks (T7 / T9 READY).
+        """
+        last_campaign_id = request.cookies.get("aios_last_campaign")
+        task = session.get(Task, task_id)
+        if task is None:
+            return HTMLResponse(owner_not_found_html(task_id), status_code=404)
+        if decision not in ("approve", "reject"):
+            return HTMLResponse(
+                owner_error_html(
+                    message="请选择「批准」或「驳回」。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        decision_enum = (
+            ApprovalStatus.APPROVED if decision == "approve" else ApprovalStatus.REJECTED
+        )
+        try:
+            approval = ensure_pending_approval(
+                session,
+                project_id=task.project_id,
+                task_id=task_id,
+                action_type="owner_gate",
+            )
+            decide_approval(session, approval.id, decision_enum, rationale)
+        except ServiceError as error:
+            return HTMLResponse(
+                owner_error_html(message=error.detail, last_campaign_id=last_campaign_id),
+                status_code=error.status_code,
+            )
+        except Exception:
+            return HTMLResponse(
+                owner_error_html(
+                    message="处理审批时系统出现意外错误，请稍后重试。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=500,
+            )
+        return RedirectResponse(url=f"/owner/board/{task.project_id}", status_code=303)
+
+    @application.post(
+        "/owner/tasks/{task_id}/revision", response_class=HTMLResponse, response_model=None
+    )
+    def owner_revision(
+        task_id: str,
+        request: Request,
+        feedback: str | None = Form(None),
+        session: Session = Depends(get_session),
+    ) -> HTMLResponse | RedirectResponse:
+        """Owner requests revision of a returned task; feedback is durably recorded."""
+        last_campaign_id = request.cookies.get("aios_last_campaign")
+        task = session.get(Task, task_id)
+        if task is None:
+            return HTMLResponse(owner_not_found_html(task_id), status_code=404)
+        if not feedback or not feedback.strip():
+            return HTMLResponse(
+                owner_error_html(
+                    message="请填写修订意见，说明需要改什么。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        try:
+            request_revision(session, task_id, feedback)
+        except ServiceError as error:
+            return HTMLResponse(
+                owner_error_html(message=error.detail, last_campaign_id=last_campaign_id),
+                status_code=error.status_code,
+            )
+        except Exception:
+            return HTMLResponse(
+                owner_error_html(
+                    message="处理修订时系统出现意外错误，请稍后重试。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=500,
+            )
+        return RedirectResponse(url=f"/owner/board/{task.project_id}", status_code=303)
 
     return application
 

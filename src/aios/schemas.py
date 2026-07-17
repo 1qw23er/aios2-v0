@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from aios.models import AdapterType, RiskLevel, RoutingMode
+from aios.models import AdapterType, ApprovalStatus, ArtifactReviewStatus, RiskLevel, RoutingMode
 
 
 class ProjectCreate(BaseModel):
@@ -37,6 +37,19 @@ class ApprovalCreate(BaseModel):
     action_type: str = Field(min_length=1)
     risk_level: RiskLevel
     rationale: str | None = None
+
+
+class ApprovalDecision(BaseModel):
+    decision: ApprovalStatus
+    rationale: str | None = None
+
+
+class RevisionRequest(BaseModel):
+    feedback: str = Field(min_length=1)
+
+
+class ArtifactReviewUpdate(BaseModel):
+    review_status: ArtifactReviewStatus
 
 
 class ModelRead(BaseModel):
