@@ -3,10 +3,18 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlmodel import Session, select
 
 from aios.campaign import CampaignLaunchResult, launch_campaign
+from aios.console import (
+    build_board_view,
+    owner_board_html,
+    owner_error_html,
+    owner_home_html,
+    owner_not_found_html,
+)
 from aios.db import get_session, run_migrations
 from aios.models import Approval, Project, Task, new_id
 from aios.orchestrator import Orchestrator, complete_task
@@ -180,6 +188,98 @@ def create_app() -> FastAPI:
             return get_board_service(session, project_id)
         except ServiceError as error:
             raise _translate(error) from error
+
+    # --- Minimal owner console (server-rendered HTML; no separate frontend) ---
+    # Reuses the SAME service layer as the JSON endpoints above:
+    #   POST /owner/launch      -> launch_campaign (behind POST /owner/campaigns)
+    #   GET  /owner/board/{id}  -> get_board_service (behind GET /owner/campaigns/{id})
+    # No campaign-launch domain logic is duplicated in this UI layer.
+
+    @application.get("/owner", response_class=HTMLResponse)
+    def owner_home(request: Request, session: Session = Depends(get_session)) -> HTMLResponse:
+        """Launch form. A fresh idempotency key is embedded so a double-click or
+        retry reuses the same key and never creates a duplicate campaign."""
+        last_campaign_id = request.cookies.get("aios_last_campaign")
+        return HTMLResponse(owner_home_html(idem=new_id("idem"), last_campaign_id=last_campaign_id))
+
+    @application.post("/owner/launch", response_class=HTMLResponse, response_model=None)
+    def owner_launch(
+        request: Request,
+        name: str | None = Form(None),
+        objective: str | None = Form(None),
+        idem: str | None = Form(None),
+        session: Session = Depends(get_session),
+    ) -> HTMLResponse | RedirectResponse:
+        idem_key = idem or new_id("idem")
+        if not name or not name.strip() or not objective or not objective.strip():
+            # Empty name/objective: surface a readable Chinese message (no raw JSON).
+            return HTMLResponse(
+                owner_home_html(
+                    idem=idem_key,
+                    error="campaign 名称与目标描述都不能为空，请填写后再启动。",
+                    last_campaign_id=request.cookies.get("aios_last_campaign"),
+                ),
+                status_code=400,
+            )
+        payload = ProjectCreate(name=name, objective=objective)
+        try:
+            result = launch_campaign(session, payload, idem_key)
+        except ServiceError as error:
+            # Preserve the same idem so a corrected retry stays a single logical attempt.
+            status_code = 400 if error.status_code == 400 else 409
+            return HTMLResponse(
+                owner_home_html(
+                    idem=idem_key,
+                    error=error.detail,
+                    last_campaign_id=request.cookies.get("aios_last_campaign"),
+                ),
+                status_code=status_code,
+            )
+        except Exception:
+            # Unexpected failure: return a readable HTML 500 page (never a stack trace).
+            # Preserve the same idem so a retry stays part of the same submission lifecycle.
+            return HTMLResponse(
+                owner_error_html(
+                    message="提交时系统出现意外错误，请稍后重试。你的提交标识保持不变。",
+                    idem=idem_key,
+                    last_campaign_id=request.cookies.get("aios_last_campaign"),
+                ),
+                status_code=500,
+            )
+        response = RedirectResponse(url=f"/owner/board/{result.project_id}", status_code=303)
+        response.set_cookie(
+            "aios_last_campaign", result.project_id, max_age=60 * 60 * 24 * 30
+        )
+        return response
+
+    @application.get("/owner/board/{project_id}", response_class=HTMLResponse)
+    def owner_board(
+        project_id: str,
+        request: Request,
+        session: Session = Depends(get_session),
+    ) -> HTMLResponse:
+        """Read-only board for a launched campaign (reuses get_board_service)."""
+        last_campaign_id = request.cookies.get("aios_last_campaign")
+        try:
+            view = build_board_view(session, project_id)
+        except ServiceError as error:
+            if error.status_code == 404:
+                return HTMLResponse(owner_not_found_html(project_id), status_code=404)
+            # Other handled errors still render as readable HTML, not a JSON body.
+            return HTMLResponse(
+                owner_error_html(message=error.detail, last_campaign_id=last_campaign_id),
+                status_code=error.status_code,
+            )
+        except Exception:
+            # Unexpected failure: readable HTML 500 page, never a stack trace.
+            return HTMLResponse(
+                owner_error_html(
+                    message="读取看板时系统出现意外错误，请稍后重试。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=500,
+            )
+        return HTMLResponse(owner_board_html(view))
 
     return application
 
