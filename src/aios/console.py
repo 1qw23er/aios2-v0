@@ -658,3 +658,118 @@ def owner_not_found_html(project_id: str) -> str:
 </div>
 </body>
 </html>"""
+
+
+def owner_measurement_html(report: dict[str, Any]) -> str:
+    """Read-only V1-I6 measurement report (Issue #40). No writes, no inputs."""
+    generated = escape(str(report.get("generated_at", "")))
+    total = report.get("total_campaigns", 0)
+    comp_rate = round(report.get("campaign_completion_rate", 0.0) * 100, 1)
+    human = report.get("total_human_interventions", 0)
+    avg_prod = report.get("avg_content_production_seconds")
+    avg_prod = f"{avg_prod:.0f}s" if avg_prod is not None else "—"
+    revisions = report.get("total_revisions", 0)
+    pub_rate = round(report.get("publishable_rate", 0.0) * 100, 1)
+    reuse = report.get("knowledge_reuse_campaigns", 0)
+    dev = report.get("developer_assisted_failures", 0)
+    notes = "".join(f"<li>{escape(n)}</li>" for n in report.get("notes", []))
+
+    campaigns = report.get("campaigns", [])
+    cards: list[str] = []
+    for c in campaigns:
+        name = escape(c.get("name", ""))
+        objective = escape(c.get("objective", ""))
+        status = escape(c.get("status", ""))
+        ts = c.get("task_statuses", {})
+        task_rows = "".join(
+            f"<tr><td>{escape(k)}</td><td>{escape(ts.get(k, '?'))}</td></tr>"
+            for k in (t["key"] for t in V1_TASKS)
+        )
+        arts = "".join(
+            f"<li>[{escape(a.get('task_key',''))}] {escape(a.get('type',''))}: "
+            f"{escape(str(a.get('summary','')))} "
+            f"({escape(a.get('review_status',''))})</li>"
+            for a in c.get("artifacts", [])
+        ) or "<li>无</li>"
+        rating = escape(str(c.get("quality_rating") or "—（owner 评分待填）"))
+        completion_pct = round(c.get("completion_rate", 0.0) * 100, 1)
+        metrics_block = "\n".join([
+            "<ul class=\"metrics\">",
+            f"<li>成功 Agent 执行：{c.get('successful_executions',0)} · "
+            f"失败：{c.get('execution_failures',0)} · 重试：{c.get('retries',0)}</li>",
+            f"<li>owner 批准：{c.get('owner_approvals',0)} · "
+            f"驳回：{c.get('owner_rejections',0)} · 修订：{c.get('owner_revisions',0)} · "
+            f"控制台外干预：{c.get('manual_interventions',0)}</li>",
+            f"<li>分发包可发布：{'是' if c.get('publish_ready_package') else '否'} · "
+            f"内容生产时长：{c.get('content_production_seconds') or '—'}s · "
+            f"owner 操作时长：{round(c.get('owner_operating_seconds',0.0))}s</li>",
+            f"<li>沉淀候选：{c.get('knowledge_candidates',0)} · "
+            f"批准事实：{c.get('approved_knowledge_facts',0)} · "
+            f"公司级事实：{c.get('company_scoped_facts',0)} · "
+            f"复用公司知识：{'是' if c.get('reused_company_knowledge') else '否'}</li>",
+            f"<li>owner 质量评级：{rating}</li>",
+            "</ul>",
+        ])
+        cards.append(f"""
+        <div class="card">
+          <h2>{name}</h2>
+          <div class="meta">目标：{objective}</div>
+          <div class="meta">状态：{status} · 完成率 {completion_pct}%</div>
+          <table>
+            <tr><th>任务</th><th>状态</th></tr>
+            {task_rows}
+          </table>
+          {metrics_block}
+          <details><summary>产物清单</summary><ul>{arts}</ul></details>
+        </div>""")
+
+    cards_html = "\n".join(cards) or '<div class="card">尚无 campaign 数据。</div>'
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>V1 测量报告 · AIOS</title>
+<style>
+  body {{ font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f5f6f8; color: #1f2329; }}
+  .wrap {{ max-width: 980px; margin: 32px auto; padding: 0 20px; }}
+  h1 {{ font-size: 22px; }}
+  h2 {{ font-size: 18px; margin: 0 0 8px; }}
+  .card {{ background: #fff; border-radius: 10px; padding: 22px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 20px; }}
+  .meta {{ color: #6b7280; font-size: 14px; margin: 4px 0; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
+  th, td {{ text-align: left; padding: 8px 12px; border-bottom: 1px solid #eef0f3;
+           font-size: 13px; }}
+  th {{ background: #f0f3f8; }}
+  .metrics {{ margin: 10px 0; padding-left: 18px; font-size: 13px; color: #374151; }}
+  .metrics li {{ margin: 3px 0; }}
+  .back {{ display: inline-block; margin-bottom: 14px; color: #2f6fed; text-decoration: none; }}
+  ul {{ font-size: 13px; }}
+  details {{ margin-top: 10px; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/owner">&larr; 返回控制台</a>
+  <h1>V1 测量报告（Issue #40）</h1>
+  <div class="meta">生成时间：{generated} · 共 {total} 个 campaign</div>
+  <div class="card">
+    <h2>聚合指标（Epic 9 项）</h2>
+    <ul class="metrics">
+      <li>campaign 完成率：{comp_rate}%</li>
+      <li>人工干预总次数：{human} · 修订总次数：{revisions}</li>
+      <li>平均内容生产时长：{avg_prod}</li>
+      <li>可发布产出率：{pub_rate}%</li>
+      <li>复用公司级知识的 campaign 数：{reuse}</li>
+      <li>需开发者协助的失败 campaign 数：{dev}</li>
+    </ul>
+    <details><summary>系统未捕获的指标（需 owner 手动填）</summary>
+      <ul>{notes}</ul></details>
+  </div>
+  {cards_html}
+</div>
+</body>
+</html>"""

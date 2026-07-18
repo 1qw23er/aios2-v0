@@ -13,6 +13,7 @@ from aios.console import (
     owner_board_html,
     owner_error_html,
     owner_home_html,
+    owner_measurement_html,
     owner_not_found_html,
 )
 from aios.db import get_session, run_migrations
@@ -24,6 +25,7 @@ from aios.distribution import (
 )
 from aios.execution import LLMExecutionAdapter, execute_task
 from aios.knowledge_service import KnowledgeService
+from aios.measurement import MeasurementService
 from aios.models import (
     Approval,
     ApprovalStatus,
@@ -405,6 +407,26 @@ def create_app() -> FastAPI:
             return get_board_service(session, project_id)
         except ServiceError as error:
             raise _translate(error) from error
+
+    @application.get("/owner/campaigns/{project_id}/measurement")
+    def owner_campaign_measurement(
+        project_id: str, session: Session = Depends(get_session)
+    ) -> dict:
+        """Read-only per-campaign V1-I6 metrics (Issue #40). No writes."""
+        try:
+            return MeasurementService(session).build_campaign(project_id).model_dump(
+                mode="json"
+            )
+        except ValueError as error:
+            raise _translate(ServiceError(404, str(error))) from error
+
+    @application.get("/owner/measurement", response_class=HTMLResponse)
+    def owner_measurement(
+        request: Request, session: Session = Depends(get_session)
+    ) -> HTMLResponse:
+        """Read-only V1-I6 measurement report across all campaigns (Issue #40)."""
+        report = MeasurementService(session).build_report().model_dump(mode="json")
+        return HTMLResponse(owner_measurement_html(report))
 
     # --- Minimal owner console (server-rendered HTML; no separate frontend) ---
     # Reuses the SAME service layer as the JSON endpoints above:
