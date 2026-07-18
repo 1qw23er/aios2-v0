@@ -16,6 +16,12 @@ from aios.console import (
     owner_not_found_html,
 )
 from aios.db import get_session, run_migrations
+from aios.distribution import (
+    assemble_distribution_package,
+    decide_publish_gate,
+    is_package_task,
+    is_publish_gate_task,
+)
 from aios.execution import LLMExecutionAdapter, execute_task
 from aios.models import Approval, ApprovalStatus, Artifact, Project, Task, new_id
 from aios.orchestrator import Orchestrator, complete_task
@@ -171,9 +177,58 @@ def create_app() -> FastAPI:
         protocol. Reusing one ``ExecutionAdapter`` (model-backed by default); tests
         inject a deterministic adapter. Idempotent on the ``Idempotency-Key`` header.
         """
+        # #35: the packaging task is assembled deterministically, not run via the LLM
+        # execution protocol.
+        if is_package_task(session, task_id):
+            raise HTTPException(
+                status_code=400,
+                detail="打包任务请调用 POST /tasks/{id}/package，不通过部门执行运行。",
+            )
         adapter = LLMExecutionAdapter()
         try:
             return execute_task(session, task_id, idempotency_key, adapter=adapter, actor="agent")
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/tasks/{task_id}/package", response_model=Artifact, status_code=status.HTTP_200_OK
+    )
+    def assemble_package_endpoint(
+        task_id: str,
+        session: Session = Depends(get_session),
+        idempotency_key: str = Header(alias="Idempotency-Key"),
+    ) -> Artifact:
+        """Assemble the distribution package (references T3/T4/T5 outputs) and open the
+        L3 publish gate. Deterministic + idempotent on the ``Idempotency-Key`` header;
+        nothing is posted to any external platform."""
+        task = session.get(Task, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if not is_package_task(session, task_id):
+            raise HTTPException(status_code=400, detail="该任务不是打包任务。")
+        try:
+            return assemble_distribution_package(session, task.project_id, idempotency_key)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post("/tasks/{task_id}/publish-gate", response_model=Approval)
+    def publish_gate_endpoint(
+        task_id: str,
+        decision: ApprovalDecision,
+        session: Session = Depends(get_session),
+    ) -> Approval:
+        """Decide the L3 publish gate. APPROVED marks the package ready (owner posts by
+        hand); REJECTED keeps it not ready. Rejected when no package / L3 approval
+        exists. No external.publish event is ever emitted."""
+        task = session.get(Task, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if not is_publish_gate_task(session, task_id):
+            raise HTTPException(status_code=400, detail="该任务不是发布闸门。")
+        try:
+            return decide_publish_gate(
+                session, task.project_id, decision.decision, decision.rationale
+            )
         except ServiceError as error:
             raise _translate(error) from error
 
@@ -386,13 +441,19 @@ def create_app() -> FastAPI:
             ApprovalStatus.APPROVED if decision == "approve" else ApprovalStatus.REJECTED
         )
         try:
-            approval = ensure_pending_approval(
-                session,
-                project_id=task.project_id,
-                task_id=task_id,
-                action_type="owner_gate",
-            )
-            decide_approval(session, approval.id, decision_enum, rationale)
+            # #35: the publish gate (T8) is decided through the L3 publish path so the
+            # distribution package is marked ready atomically -- never via the generic
+            # L2 owner-gate decision (which would not flip the package).
+            if is_publish_gate_task(session, task_id):
+                decide_publish_gate(session, task.project_id, decision_enum, rationale)
+            else:
+                approval = ensure_pending_approval(
+                    session,
+                    project_id=task.project_id,
+                    task_id=task_id,
+                    action_type="owner_gate",
+                )
+                decide_approval(session, approval.id, decision_enum, rationale)
         except ServiceError as error:
             return HTMLResponse(
                 owner_error_html(message=error.detail, last_campaign_id=last_campaign_id),
@@ -482,6 +543,16 @@ def create_app() -> FastAPI:
                 ),
                 status_code=400,
             )
+        # #35: the packaging task is assembled deterministically, not run via the LLM
+        # execution protocol -- steer the owner to "生成分发包" instead.
+        if is_package_task(session, task_id):
+            return HTMLResponse(
+                owner_error_html(
+                    message="打包任务请使用「生成分发包」按钮，不通过部门执行运行。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
         try:
             execute_task(
                 session, task_id, new_id("idem"), adapter=LLMExecutionAdapter(), actor="owner"
@@ -495,6 +566,119 @@ def create_app() -> FastAPI:
             return HTMLResponse(
                 owner_error_html(
                     message="部门执行时出现意外错误，请稍后重试。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=500,
+            )
+        return RedirectResponse(url=f"/owner/board/{task.project_id}", status_code=303)
+
+    @application.post(
+        "/owner/tasks/{task_id}/package", response_class=HTMLResponse, response_model=None
+    )
+    def owner_package(
+        task_id: str,
+        request: Request,
+        session: Session = Depends(get_session),
+    ) -> HTMLResponse | RedirectResponse:
+        """Owner assembles the distribution package from the T3/T4/T5 outputs.
+
+        Deterministic (no LLM): bundles the approved platform outputs into one
+        Artifact + opens the L3 publish gate. No content is ever posted anywhere.
+        """
+        last_campaign_id = request.cookies.get("aios_last_campaign")
+        task = session.get(Task, task_id)
+        if task is None:
+            return HTMLResponse(owner_not_found_html(task_id), status_code=404)
+        if last_campaign_id is not None and task.project_id != last_campaign_id:
+            return HTMLResponse(
+                owner_error_html(
+                    message="该任务不属于当前看板，无法操作。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        if not is_package_task(session, task_id):
+            return HTMLResponse(
+                owner_error_html(
+                    message="该任务不是打包任务，无法生成分发包。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        try:
+            assemble_distribution_package(session, task.project_id, new_id("idem"))
+        except ServiceError as error:
+            return HTMLResponse(
+                owner_error_html(message=error.detail, last_campaign_id=last_campaign_id),
+                status_code=error.status_code,
+            )
+        except Exception:
+            return HTMLResponse(
+                owner_error_html(
+                    message="生成分发包时系统出现意外错误，请稍后重试。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=500,
+            )
+        return RedirectResponse(url=f"/owner/board/{task.project_id}", status_code=303)
+
+    @application.post(
+        "/owner/tasks/{task_id}/publish", response_class=HTMLResponse, response_model=None
+    )
+    def owner_publish(
+        task_id: str,
+        request: Request,
+        decision: str | None = Form(None),
+        rationale: str | None = Form(None),
+        session: Session = Depends(get_session),
+    ) -> HTMLResponse | RedirectResponse:
+        """Owner decides the L3 publish gate: approve marks the package ready.
+
+        The system only flips the package to ready; the owner copies the content and
+        posts by hand. Nothing auto-posts and no external.publish event is emitted.
+        """
+        last_campaign_id = request.cookies.get("aios_last_campaign")
+        task = session.get(Task, task_id)
+        if task is None:
+            return HTMLResponse(owner_not_found_html(task_id), status_code=404)
+        if last_campaign_id is not None and task.project_id != last_campaign_id:
+            return HTMLResponse(
+                owner_error_html(
+                    message="该任务不属于当前看板，无法操作。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        if not is_publish_gate_task(session, task_id):
+            return HTMLResponse(
+                owner_error_html(
+                    message="该任务不是发布闸门，无法在此发布。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        if decision not in ("approve", "reject"):
+            return HTMLResponse(
+                owner_error_html(
+                    message="请选择「批准发布」或「驳回」。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        decision_enum = (
+            ApprovalStatus.APPROVED if decision == "approve" else ApprovalStatus.REJECTED
+        )
+        try:
+            decide_publish_gate(session, task.project_id, decision_enum, rationale)
+        except ServiceError as error:
+            return HTMLResponse(
+                owner_error_html(message=error.detail, last_campaign_id=last_campaign_id),
+                status_code=error.status_code,
+            )
+        except Exception:
+            return HTMLResponse(
+                owner_error_html(
+                    message="处理发布闸门时系统出现意外错误，请稍后重试。",
                     last_campaign_id=last_campaign_id,
                 ),
                 status_code=500,

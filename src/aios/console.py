@@ -6,7 +6,12 @@ from typing import Any
 from sqlmodel import Session, select
 
 from aios.campaign import V1_TASKS
-from aios.models import Agent, Artifact, RoutingMode
+from aios.distribution import (
+    get_package_artifact,
+    resolve_package_task,
+    resolve_publish_gate_task,
+)
+from aios.models import Agent, Artifact, ArtifactReviewStatus, RoutingMode
 from aios.services import get_board
 
 STATUS_LABELS: dict[str, str] = {
@@ -51,6 +56,19 @@ def build_board_view(session: Session, project_id: str) -> dict[str, Any]:
         a.get("task_id"): a for a in board.get("pending_approvals", []) if a.get("task_id")
     }
 
+    # V1-I4 (#35): resolve the packaging task (T7) and publish-gate task (T8) by the
+    # dependency graph, and the single distribution package artifact + its readiness.
+    package_task = resolve_package_task(session, project_id)
+    gate_task = resolve_publish_gate_task(session, project_id)
+    package_task_id = package_task.id if package_task else None
+    gate_task_id = gate_task.id if gate_task else None
+    package_artifact = get_package_artifact(session, project_id)
+    package_exists = package_artifact is not None
+    package_ready = (
+        package_artifact is not None
+        and package_artifact.review_status == ArtifactReviewStatus.APPROVED
+    )
+
     # Latest artifact summary per task, so the owner can see execution output.
     artifact_summary_by_task: dict[str, str] = {}
     for artifact in session.exec(select(Artifact).where(Artifact.task_id.isnot(None))).all():
@@ -79,22 +97,39 @@ def build_board_view(session: Session, project_id: str) -> dict[str, Any]:
         assigned = agent_name.get(assigned_agent_id) if assigned_agent_id else None
         status = board_task["status"]
         pending = pending_by_task.get(board_task["id"])
+        task_id = board_task["id"]
+        is_package = task_id == package_task_id
+        is_publish_gate = task_id == gate_task_id
+        # The packaging task (T7) is assembled deterministically, NOT run via the LLM
+        # execute path -- so it is executable only through "生成分发包".
+        can_package = is_package and status == "ready" and not package_exists
+        # The publish gate (T8) is actionable once the package + its L3 approval exist.
+        publish_actionable = (
+            is_publish_gate and package_exists and pending is not None and status == "ready"
+        )
         ordered.append(
             {
                 "key": task_def["key"],
                 "title": task_def["title"],
-                "task_id": board_task["id"],
+                "task_id": task_id,
                 "department": department,
                 "is_gate": is_gate,
+                "is_package": is_package,
+                "is_publish_gate": is_publish_gate,
+                "can_package": can_package,
+                "package_exists": is_package and package_exists,
+                "package_ready": is_package and package_ready,
+                "publish_actionable": publish_actionable,
                 "pending_approval_id": pending["id"] if pending else None,
                 "assigned_agent": assigned,
                 "status": status,
                 "status_label": STATUS_LABELS.get(status, status),
                 "depends_on": list(task_def.get("depends_on", [])),
-                "artifact_summary": artifact_summary_by_task.get(board_task["id"]),
+                "artifact_summary": artifact_summary_by_task.get(task_id),
                 "executable": (
                     status == "ready"
                     and not is_gate
+                    and not is_package
                     and bool(assigned_agent_id)
                 ),
             }
@@ -214,6 +249,18 @@ def owner_board_html(view: dict[str, Any]) -> str:
                 f'<form method="post" action="/owner/tasks/{tid}/execute" class="run-form">'
                 f'<button type="submit" class="btn-run">运行部门任务</button></form>'
             )
+        if item.get("can_package"):
+            tid = escape(item["task_id"])
+            extra.append(
+                f'<form method="post" action="/owner/tasks/{tid}/package" class="run-form">'
+                f'<button type="submit" class="btn-package">生成分发包</button></form>'
+            )
+        elif item.get("package_ready"):
+            extra.append('<div class="artifact-summary">分发包已就绪，可复制内容手动发布。</div>')
+        elif item.get("package_exists"):
+            extra.append(
+                '<div class="artifact-summary">分发包已生成，等待发布审批（见下方）。</div>'
+            )
         extra_html = "\n".join(extra)
         rows.append(
             f'<tr class="{row_class}">'
@@ -233,11 +280,40 @@ def owner_board_html(view: dict[str, Any]) -> str:
         tid = escape(item["task_id"])
         ttitle = escape(item["title"])
         tstatus = escape(item["status_label"])
-        gate_cards.append(
-            f'<div class="gate-card">'
+        head = (
             f'<div class="gate-head"><b>{ttitle}</b> '
             f'<span class="badge badge-gate">需你处理 / 审批</span> '
             f'<span class="badge">{tstatus}</span></div>'
+        )
+        if item.get("is_publish_gate"):
+            # V1-I4 (#35): the publish gate is a single approve/reject on the L3
+            # publish approval; approving marks the distribution package ready. The
+            # owner then copies the content and posts by hand -- nothing auto-posts.
+            if item.get("publish_actionable"):
+                body = (
+                    f'<form method="post" action="/owner/tasks/{tid}/publish" class="gate-form">'
+                    f'<input type="hidden" name="decision" value="approve">'
+                    f'<button type="submit" class="btn-approve">'
+                    f"批准发布闸门（标记分发包就绪）</button>"
+                    f"</form>"
+                    f'<form method="post" action="/owner/tasks/{tid}/publish" class="gate-form">'
+                    f'<input type="hidden" name="decision" value="reject">'
+                    f'<input type="text" name="rationale" placeholder="驳回理由（可选）">'
+                    f'<button type="submit" class="btn-reject">驳回</button>'
+                    f"</form>"
+                    '<div class="meta">批准后系统只标记分发包「就绪」，'
+                    "由你复制内容手动发布，系统不会自动发到任何平台。</div>"
+                )
+            else:
+                body = (
+                    '<div class="meta">请先在上方任务 T7 点击「生成分发包」，'
+                    "生成后这里会出现发布审批按钮。</div>"
+                )
+            gate_cards.append(f'<div class="gate-card">{head}{body}</div>')
+            continue
+        gate_cards.append(
+            f'<div class="gate-card">'
+            f"{head}"
             f'<form method="post" action="/owner/tasks/{tid}/decide" class="gate-form">'
             f'<input type="hidden" name="decision" value="approve">'
             f'<button type="submit" class="btn-approve">批准并继续</button>'
@@ -302,6 +378,8 @@ def owner_board_html(view: dict[str, Any]) -> str:
               color: #1f6b3a; }}
   .run-form {{ margin-top: 8px; }}
   .btn-run {{ background: #6d28d9; color: #fff; border: 0; border-radius: 6px;
+              padding: 6px 14px; font-size: 13px; cursor: pointer; }}
+  .btn-package {{ background: #b54708; color: #fff; border: 0; border-radius: 6px;
               padding: 6px 14px; font-size: 13px; cursor: pointer; }}
 </style>
 </head>

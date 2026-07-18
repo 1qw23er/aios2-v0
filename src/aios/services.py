@@ -207,7 +207,9 @@ def create_task(
     return task
 
 
-def create_approval(session: Session, request: ApprovalCreate, idempotency_key: str) -> Approval:
+def create_approval(
+    session: Session, request: ApprovalCreate, idempotency_key: str, commit: bool = True
+) -> Approval:
     fingerprint = request_fingerprint(request)
     replay = _replay(
         session,
@@ -253,9 +255,13 @@ def create_approval(session: Session, request: ApprovalCreate, idempotency_key: 
             after={"status": approval.status.value},
             idempotency_key=f"audit:{idempotency_key}",
         )
-        session.commit()
+        if commit:
+            session.commit()
+        else:
+            session.flush()
     except Exception:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     session.refresh(approval)
     return approval
@@ -268,6 +274,7 @@ def ensure_pending_approval(
     task_id: str | None,
     action_type: str,
     risk_level: RiskLevel = RiskLevel.L2,
+    commit: bool = True,
 ) -> Approval:
     """Return the task's existing PENDING approval, or create one (L2 gate by default).
 
@@ -291,7 +298,7 @@ def ensure_pending_approval(
         risk_level=risk_level,
         rationale=None,
     )
-    return create_approval(session, request, idempotency_key=new_id("idem"))
+    return create_approval(session, request, idempotency_key=new_id("idem"), commit=commit)
 
 
 def decide_approval(
