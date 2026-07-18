@@ -3,7 +3,7 @@ from __future__ import annotations
 from html import escape
 from typing import Any
 
-from sqlmodel import Session, select
+from sqlmodel import Session, or_, select
 
 from aios.campaign import V1_TASKS
 from aios.distribution import (
@@ -11,7 +11,16 @@ from aios.distribution import (
     resolve_package_task,
     resolve_publish_gate_task,
 )
-from aios.models import Agent, Artifact, ArtifactReviewStatus, RoutingMode
+from aios.models import (
+    Agent,
+    Artifact,
+    ArtifactReviewStatus,
+    KnowledgeCandidate,
+    KnowledgeCandidateStatus,
+    KnowledgeFact,
+    KnowledgeFactStatus,
+    RoutingMode,
+)
 from aios.services import get_board
 
 STATUS_LABELS: dict[str, str] = {
@@ -69,6 +78,54 @@ def build_board_view(session: Session, project_id: str) -> dict[str, Any]:
         and package_artifact.review_status == ArtifactReviewStatus.APPROVED
     )
 
+    # V1-I5 (#38): knowledge-preservation support. The T9 (knowledge_capture) task
+    # can be used to preserve a candidate from any APPROVED source artifact in this
+    # project; draft candidates in this project surface in a review area.
+    knowledge_task = next(
+        (d for d in V1_TASKS if d.get("key") == "T9"), None
+    )
+    knowledge_task_key = knowledge_task["key"] if knowledge_task else "T9"
+    approved_artifacts = list(
+        session.exec(
+            select(Artifact).where(
+                Artifact.project_id == project_id,
+                Artifact.review_status == ArtifactReviewStatus.APPROVED,
+            )
+        ).all()
+    )
+    pending_candidates = list(
+        session.exec(
+            select(KnowledgeCandidate).where(
+                KnowledgeCandidate.project_id == project_id,
+                KnowledgeCandidate.status == KnowledgeCandidateStatus.DRAFT,
+            )
+        ).all()
+    )
+
+    # Current knowledge series heads in this project's effective scope
+    # (project-local + company-wide), so the owner can SEE the latest version of
+    # each series when reviewing (and never has to track versions manually).
+    facts = session.exec(
+        select(KnowledgeFact).where(
+            or_(
+                KnowledgeFact.project_id == project_id,
+                KnowledgeFact.project_id.is_(None),
+            )
+        )
+    ).all()
+    _seen: dict[tuple[str, str | None], int] = {}
+    for f in facts:
+        if f.status != KnowledgeFactStatus.APPROVED:
+            continue
+        key = (f.series_id, f.project_id)
+        if _seen.get(key) is None or f.version > _seen[key]:
+            _seen[key] = f.version
+    series_heads = [
+        {"series_id": sid, "version": ver, "scope": "company" if pid is None else "project"}
+        for (sid, pid), ver in _seen.items()
+    ]
+    series_heads.sort(key=lambda s: (s["scope"], s["series_id"]))
+
     # Latest artifact summary per task, so the owner can see execution output.
     artifact_summary_by_task: dict[str, str] = {}
     for artifact in session.exec(select(Artifact).where(Artifact.task_id.isnot(None))).all():
@@ -100,9 +157,12 @@ def build_board_view(session: Session, project_id: str) -> dict[str, Any]:
         task_id = board_task["id"]
         is_package = task_id == package_task_id
         is_publish_gate = task_id == gate_task_id
+        is_knowledge = task_def.get("key") == knowledge_task_key
         # The packaging task (T7) is assembled deterministically, NOT run via the LLM
         # execute path -- so it is executable only through "生成分发包".
         can_package = is_package and status == "ready" and not package_exists
+        # The knowledge-capture task (T9) offers "沉淀知识" when a source exists.
+        can_preserve = is_knowledge and bool(approved_artifacts)
         # The publish gate (T8) is actionable once the package + its L3 approval exist.
         publish_actionable = (
             is_publish_gate and package_exists and pending is not None and status == "ready"
@@ -116,7 +176,9 @@ def build_board_view(session: Session, project_id: str) -> dict[str, Any]:
                 "is_gate": is_gate,
                 "is_package": is_package,
                 "is_publish_gate": is_publish_gate,
+                "is_knowledge": is_knowledge,
                 "can_package": can_package,
+                "can_preserve": can_preserve,
                 "package_exists": is_package and package_exists,
                 "package_ready": is_package and package_ready,
                 "publish_actionable": publish_actionable,
@@ -147,6 +209,22 @@ def build_board_view(session: Session, project_id: str) -> dict[str, Any]:
         "done_count": done_count,
         "total": len(ordered),
         "stage": stage,
+        "pending_candidates": [
+            {
+                "id": c.id,
+                "statement": c.statement,
+                "artifact_id": c.artifact_id,
+                "project_id": c.project_id,
+                "source_project_id": c.source_project_id,
+                "scope": "company" if c.project_id is None else "project",
+            }
+            for c in pending_candidates
+        ],
+        "series_heads": series_heads,
+        "approved_artifacts": [
+            {"id": a.id, "summary": (a.metadata_json or {}).get("summary", "")}
+            for a in approved_artifacts
+        ],
     }
 
 
@@ -261,6 +339,31 @@ def owner_board_html(view: dict[str, Any]) -> str:
             extra.append(
                 '<div class="artifact-summary">分发包已生成，等待发布审批（见下方）。</div>'
             )
+        if item.get("can_preserve"):
+            tid = escape(item["task_id"])
+            options = "".join(
+                f'<option value="{escape(a["id"])}">{escape(a["summary"] or a["id"])}</option>'
+                for a in view.get("approved_artifacts", [])
+            )
+            extra.append(
+                f'<form method="post" action="/owner/tasks/{tid}/preserve" class="run-form">'
+                f'<select name="artifact_id" class="preserve-select">{options}</select>'
+                f'<input type="text" name="statement" class="preserve-input" '
+                f'placeholder="提炼这条已批准产出的可复用知识">'
+                f'<fieldset class="scope-fieldset">'
+                f'<legend>知识范围</legend>'
+                f'<label class="scope-opt">'
+                f'<input type="radio" name="scope" value="project" checked> '
+                f"本项目（仅本 campaign 复用）</label>"
+                f'<label class="scope-opt">'
+                f'<input type="radio" name="scope" value="company"> '
+                f"全公司（所有 campaign 可复用）</label>"
+                f'<p class="scope-warn">⚠ 选择「全公司」会把来源 campaign 的知识提升为公司级，'
+                f"所有 campaign 都能自动复用。请确认你确实希望开放给全公司。</p>"
+                f"</fieldset>"
+                f'<button type="submit" class="btn-preserve">沉淀知识</button>'
+                f"</form>"
+            )
         extra_html = "\n".join(extra)
         rows.append(
             f'<tr class="{row_class}">'
@@ -335,6 +438,49 @@ def owner_board_html(view: dict[str, Any]) -> str:
         else ""
     )
 
+    # V1-I5 (#38): review area for knowledge candidates awaiting the owner's decision.
+    knowledge_cards: list[str] = []
+    series_options = "".join(
+        f'<option value="{escape(s["series_id"])}">'
+        f'{escape(s["series_id"])}（当前 v{s["version"]}，{escape(s["scope"])}）</option>'
+        for s in view.get("series_heads", [])
+    )
+    for cand in view.get("pending_candidates", []):
+        cid = escape(cand["id"])
+        stmt = escape(cand["statement"])
+        scope_label = "全公司" if cand["scope"] == "company" else "本项目"
+        knowledge_cards.append(
+            f'<div class="gate-card">'
+            f'<div class="gate-head"><b>待审阅知识</b></div>'
+            f'<div class="meta">陈述：{stmt}</div>'
+            f'<div class="meta">范围（创建时锁定，评审不可更改）：<b>{scope_label}</b></div>'
+            f'<form method="post" action="/owner/knowledge/{cid}/review" class="gate-form">'
+            f'<input type="hidden" name="decision" value="approve">'
+            f'<input type="text" name="series_id" class="series-input" list="series-heads" '
+            f'placeholder="系列（如 positioning，留空=新建系列）">'
+            f'<input type="hidden" name="version" value="">'
+            f'<input type="text" name="rationale" placeholder="审阅理由" required>'
+            f'<button type="submit" class="btn-approve">批准为知识事实</button>'
+            f'<p class="hint">版本号由系统自动分配：新系列为 v1，选择已有系列则续接其最新版本。</p>'
+            f"</form>"
+            f'<form method="post" action="/owner/knowledge/{cid}/review" class="gate-form">'
+            f'<input type="hidden" name="decision" value="reject">'
+            f'<input type="text" name="rationale" placeholder="驳回理由" required>'
+            f'<button type="submit" class="btn-reject">驳回</button>'
+            f"</form>"
+            f"</div>"
+        )
+    series_datalist = (
+        f'<datalist id="series-heads">{"".join(series_options)}</datalist>'
+        if series_options
+        else ""
+    )
+    knowledge_html = (
+        '<div class="card"><h2>待审阅知识</h2>' + "\n".join(knowledge_cards) + "</div>"
+        if knowledge_cards
+        else ""
+    )
+
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -381,6 +527,20 @@ def owner_board_html(view: dict[str, Any]) -> str:
               padding: 6px 14px; font-size: 13px; cursor: pointer; }}
   .btn-package {{ background: #b54708; color: #fff; border: 0; border-radius: 6px;
               padding: 6px 14px; font-size: 13px; cursor: pointer; }}
+  .btn-preserve {{ background: #0e7490; color: #fff; border: 0; border-radius: 6px;
+              padding: 6px 14px; font-size: 13px; cursor: pointer; }}
+  .preserve-select {{ padding: 6px 8px; border: 1px solid #d0d3d9; border-radius: 6px;
+              font-size: 13px; max-width: 220px; }}
+  .preserve-input {{ flex: 1; padding: 6px 8px; border: 1px solid #d0d3d9; border-radius: 6px;
+              font-size: 13px; min-width: 180px; }}
+  .scope-fieldset {{ border: 1px solid #e3e6ea; border-radius: 8px; margin: 8px 0 4px;
+              padding: 8px 10px; }}
+  .scope-fieldset legend {{ font-size: 12px; color: #6b7280; padding: 0 4px; }}
+  .scope-opt {{ display: block; font-size: 13px; margin: 4px 0; font-weight: 400; }}
+  .scope-warn {{ color: #b45309; background: #fffbeb; border: 1px solid #fde68a;
+              border-radius: 6px; padding: 6px 8px; font-size: 12px; margin: 6px 0 0; }}
+  .series-input {{ flex: 1; padding: 8px; border: 1px solid #d0d3d9; border-radius: 6px;
+              font-size: 13px; }}
 </style>
 </head>
 <body>
@@ -402,6 +562,8 @@ def owner_board_html(view: dict[str, Any]) -> str:
     </tbody>
   </table>
   {gate_html}
+  {knowledge_html}
+  {series_datalist}
   <p class="meta">标注「需你处理 / 审批」的任务（T6 人工审阅、T8 发布闸门）不会自动分配，
      需要你在系统中做出明确决定后才会继续。</p>
 </div>

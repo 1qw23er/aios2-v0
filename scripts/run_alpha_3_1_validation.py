@@ -290,10 +290,10 @@ def _manual_approve_and_review(
 
     service = KnowledgeService(session)
     approve_candidate = service.submit_candidate(
-        artifact.id, "Vendor A leads the AI e-commerce market", PROJECT_ID, "human_ceo"
+        artifact.id, "Vendor A leads the AI e-commerce market", "project", "human_ceo"
     )
     reject_candidate = service.submit_candidate(
-        artifact.id, "Market grows 20% yearly without caveat", PROJECT_ID, "human_ceo"
+        artifact.id, "Market grows 20% yearly without caveat", "project", "human_ceo"
     )
     approved = service.review_candidate(
         approve_candidate.id,

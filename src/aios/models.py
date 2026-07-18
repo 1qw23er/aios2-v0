@@ -269,7 +269,11 @@ class KnowledgeCandidate(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("kcand"), primary_key=True)
     artifact_id: str = Field(foreign_key="artifact.id", index=True)
+    # Effective knowledge scope: NULL = company-wide, otherwise the owning project.
     project_id: str | None = Field(default=None, foreign_key="project.id", index=True)
+    # Provenance: the campaign that produced the source artifact. NEVER NULL, so
+    # source-campaign ownership can always be enforced even for company-scoped facts.
+    source_project_id: str = Field(foreign_key="project.id", index=True)
     statement: str
     status: KnowledgeCandidateStatus = Field(default=KnowledgeCandidateStatus.DRAFT, index=True)
     submitted_by: str
@@ -301,7 +305,11 @@ class KnowledgeFact(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("kfact"), primary_key=True)
     series_id: str = Field(index=True)
     version: int = Field(ge=1)
+    # Effective knowledge scope: NULL = company-wide, otherwise the owning project.
     project_id: str | None = Field(default=None, foreign_key="project.id", index=True)
+    # Provenance: the campaign that produced the source artifact. NEVER NULL, so
+    # source-campaign ownership can always be enforced even for company-scoped facts.
+    source_project_id: str = Field(foreign_key="project.id", index=True)
     statement: str
     status: KnowledgeFactStatus = Field(default=KnowledgeFactStatus.APPROVED, index=True)
     source_candidate_id: str = Field(foreign_key="knowledge_candidate.id", index=True)

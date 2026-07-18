@@ -4,7 +4,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from aios.models import AdapterType, ApprovalStatus, ArtifactReviewStatus, RiskLevel, RoutingMode
+from aios.models import (
+    AdapterType,
+    ApprovalStatus,
+    ArtifactReviewStatus,
+    KnowledgeReviewDecisionValue,
+    RiskLevel,
+    RoutingMode,
+)
 
 
 class ProjectCreate(BaseModel):
@@ -47,6 +54,36 @@ class ApprovalDecision(BaseModel):
 
 class RevisionRequest(BaseModel):
     feedback: str = Field(min_length=1)
+
+
+class KnowledgeCandidateCreate(BaseModel):
+    """Owner submits a reusable knowledge candidate from an APPROVED source artifact.
+
+    Mirrors ``KnowledgeService.submit_candidate``; ``scope`` is "project" (reusable
+    only inside the source campaign) or "company" (reusable by every campaign). The
+    source-campaign provenance is recorded by the service; this schema only carries
+    the owner's effective-scope choice.
+    """
+
+    artifact_id: str = Field(min_length=1)
+    statement: str = Field(min_length=1)
+    scope: str = "project"
+
+
+class KnowledgeReviewRequest(BaseModel):
+    """Owner review of a knowledge candidate -> versioned ``KnowledgeFact``.
+
+    Mirrors ``KnowledgeService.review_candidate``. ``series_id``/``version`` are
+    required only on APPROVE (the service enforces positive version + series scoping);
+    REJECT needs only ``decision`` + ``rationale``.
+    """
+
+    decision: KnowledgeReviewDecisionValue
+    reviewer: str = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+    series_id: str | None = None
+    version: int | None = None
+    supersedes_fact_id: str | None = None
 
 
 class ArtifactReviewUpdate(BaseModel):

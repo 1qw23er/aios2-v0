@@ -339,10 +339,11 @@ class ContextService:
                     "version": fact.version,
                     "scope": scope,
                     "project_id": fact.project_id,
-                    "statement": fact.statement,
-                    "source_candidate_id": candidate.id,
-                    "source_artifact_id": artifact.id,
-                    "review_decision_id": review.id,
+                "statement": fact.statement,
+                "source_candidate_id": candidate.id,
+                "source_artifact_id": artifact.id,
+                "source_project_id": fact.source_project_id,
+                "review_decision_id": review.id,
                 }
             )
             fact_reference: dict[str, Any] = _reference(

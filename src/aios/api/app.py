@@ -23,13 +23,26 @@ from aios.distribution import (
     is_publish_gate_task,
 )
 from aios.execution import LLMExecutionAdapter, execute_task
-from aios.models import Approval, ApprovalStatus, Artifact, Project, Task, new_id
+from aios.knowledge_service import KnowledgeService
+from aios.models import (
+    Approval,
+    ApprovalStatus,
+    Artifact,
+    Capability,
+    KnowledgeCandidate,
+    KnowledgeReviewDecisionValue,
+    Project,
+    Task,
+    new_id,
+)
 from aios.orchestrator import Orchestrator, complete_task
 from aios.schemas import (
     ApprovalCreate,
     ApprovalDecision,
     ArtifactReviewUpdate,
     BoardRead,
+    KnowledgeCandidateCreate,
+    KnowledgeReviewRequest,
     OrchestratorProcessResult,
     ProjectCreate,
     RevisionRequest,
@@ -276,6 +289,90 @@ def create_app() -> FastAPI:
             processed_events=len(result.events),
             activated_task_ids=sorted(result.activated_task_ids),
         )
+
+    # --- V1-I5 (#38): knowledge preservation (reuses KnowledgeService) ---
+
+    @application.post(
+        "/knowledge/candidates",
+        response_model=dict,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_knowledge_candidate(
+        payload: KnowledgeCandidateCreate,
+        session: Session = Depends(get_session),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict:
+        """Owner submits a reusable knowledge candidate from an APPROVED artifact.
+
+        Reuses ``KnowledgeService.submit_candidate``; the service enforces the
+        APPROVED source + exact-scope rule (AC2), so a non-approved source is 422.
+        """
+        try:
+            candidate = KnowledgeService(session).submit_candidate(
+                payload.artifact_id,
+                payload.statement,
+                payload.scope,
+                "owner",
+            )
+            return {
+                "id": candidate.id,
+                "artifact_id": candidate.artifact_id,
+                "project_id": candidate.project_id,
+                "source_project_id": candidate.source_project_id,
+                "scope": "company" if candidate.project_id is None else "project",
+                "statement": candidate.statement,
+                "status": candidate.status.value,
+            }
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/knowledge/candidates/{candidate_id}/review",
+        response_model=dict,
+    )
+    def review_knowledge_candidate(
+        candidate_id: str,
+        payload: KnowledgeReviewRequest,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        """Owner reviews a knowledge candidate into a versioned KnowledgeFact.
+
+        Reuses ``KnowledgeService.review_candidate`` (versioning / supersede logic).
+        APPROVE needs series_id + version; REJECT needs only decision + rationale.
+        """
+        try:
+            decision_value = (
+                payload.decision.value
+                if isinstance(payload.decision, KnowledgeReviewDecisionValue)
+                else payload.decision
+            )
+            version = payload.version
+            supersedes = payload.supersedes_fact_id
+            # Auto-compute the next contiguous version when the caller omits it.
+            if decision_value == KnowledgeReviewDecisionValue.APPROVE.value and version is None:
+                candidate = session.get(KnowledgeCandidate, candidate_id)
+                if candidate is None:
+                    raise ServiceError(404, "Knowledge candidate not found")
+                series = payload.series_id or f"series:{candidate.id}"
+                version, head_id = KnowledgeService(session).next_version(
+                    series, candidate.project_id
+                )
+                supersedes = head_id
+            result = KnowledgeService(session).review_candidate(
+                candidate_id,
+                decision_value,
+                payload.reviewer,
+                payload.rationale,
+                series_id=payload.series_id,
+                version=version,
+                supersedes_fact_id=supersedes,
+            )
+            return {
+                "decision": result.decision.decision.value,
+                "fact_id": result.fact.id if result.fact else None,
+            }
+        except ServiceError as error:
+            raise _translate(error) from error
 
     @application.post(
         "/owner/campaigns",
@@ -684,6 +781,212 @@ def create_app() -> FastAPI:
                 status_code=500,
             )
         return RedirectResponse(url=f"/owner/board/{task.project_id}", status_code=303)
+
+    @application.post(
+        "/owner/tasks/{task_id}/preserve", response_class=HTMLResponse, response_model=None
+    )
+    def owner_preserve(
+        task_id: str,
+        request: Request,
+        artifact_id: str | None = Form(None),
+        statement: str | None = Form(None),
+        scope: str | None = Form(None),
+        session: Session = Depends(get_session),
+    ) -> HTMLResponse | RedirectResponse:
+        """Owner preserves knowledge from an APPROVED source artifact (T9 action).
+
+        Reuses ``KnowledgeService.submit_candidate``; the source must be APPROVED
+        (AC2). The candidate then appears in the board's review area for the owner.
+        Scope is chosen here (project default; company is explicit opt-in) and is
+        read-only at review time -- review can never change it.
+        """
+        last_campaign_id = request.cookies.get("aios_last_campaign")
+        task = session.get(Task, task_id)
+        if task is None:
+            return HTMLResponse(owner_not_found_html(task_id), status_code=404)
+        # #38 B5: only the T9 knowledge-capture task may preserve knowledge.
+        # ``required_capabilities`` stores capability IDs (UUIDs), so resolve the
+        # canonical "knowledge_capture" capability id and check membership.
+        kc_cap = session.exec(
+            select(Capability).where(Capability.name == "knowledge_capture")
+        ).first()
+        if kc_cap is None or kc_cap.id not in (task.required_capabilities or []):
+            return HTMLResponse(
+                owner_error_html(
+                    message="只有 T9 知识沉淀任务可以沉淀知识，请在该任务下操作。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        if last_campaign_id is not None and task.project_id != last_campaign_id:
+            return HTMLResponse(
+                owner_error_html(
+                    message="该任务不属于当前看板，无法操作。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        if not artifact_id or not artifact_id.strip() or not statement or not statement.strip():
+            return HTMLResponse(
+                owner_error_html(
+                    message="请选择已批准的来源并填写知识陈述。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        # #38 B2 (source ownership): the approved artifact must belong to the active
+        # campaign, so the candidate's provenance is the campaign the owner is in.
+        artifact = session.get(Artifact, artifact_id.strip())
+        if (
+            artifact is not None
+            and last_campaign_id is not None
+            and artifact.project_id != last_campaign_id
+        ):
+            return HTMLResponse(
+                owner_error_html(
+                    message="来源产物不属于当前 campaign，无法在此沉淀。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        effective_scope = scope if scope in ("project", "company") else "project"
+        try:
+            KnowledgeService(session).submit_candidate(
+                artifact_id.strip(),
+                statement.strip(),
+                effective_scope,
+                "owner",
+            )
+        except ServiceError as error:
+            return HTMLResponse(
+                owner_error_html(message=error.detail, last_campaign_id=last_campaign_id),
+                status_code=error.status_code,
+            )
+        except Exception:
+            return HTMLResponse(
+                owner_error_html(
+                    message="沉淀知识时系统出现意外错误，请稍后重试。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=500,
+            )
+        return RedirectResponse(url=f"/owner/board/{task.project_id}", status_code=303)
+
+    @application.post(
+        "/owner/knowledge/{candidate_id}/review",
+        response_class=HTMLResponse,
+        response_model=None,
+    )
+    def owner_review_knowledge(
+        candidate_id: str,
+        request: Request,
+        decision: str | None = Form(None),
+        reviewer: str | None = Form(None),
+        rationale: str | None = Form(None),
+        series_id: str | None = Form(None),
+        version: str | None = Form(None),
+        session: Session = Depends(get_session),
+    ) -> HTMLResponse | RedirectResponse:
+        """Owner reviews a knowledge candidate -> versioned KnowledgeFact.
+
+        Reuses ``KnowledgeService.review_candidate``. approve needs series_id +
+        version; reject needs only a rationale.
+        """
+        last_campaign_id = request.cookies.get("aios_last_campaign")
+        if decision not in ("approve", "reject"):
+            return HTMLResponse(
+                owner_error_html(
+                    message="请选择「批准」或「驳回」。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        if not rationale or not rationale.strip():
+            return HTMLResponse(
+                owner_error_html(
+                    message="请填写审阅理由。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        # #38 B2 (trust boundary): load the candidate and verify it belongs to the
+        # active owner campaign's source provenance, and is still pending review.
+        # Review can never change scope -- scope was fixed at preserve time.
+        if last_campaign_id is None:
+            return HTMLResponse(
+                owner_error_html(
+                    message="无法确认当前 campaign，请先打开对应看板再评审。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        candidate = session.get(KnowledgeCandidate, candidate_id)
+        if candidate is None:
+            return HTMLResponse(owner_not_found_html(candidate_id), status_code=404)
+        if candidate.source_project_id != last_campaign_id:
+            return HTMLResponse(
+                owner_error_html(
+                    message="该知识候选不属于当前 campaign，无法跨 campaign 评审。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=400,
+            )
+        decision_value = (
+            KnowledgeReviewDecisionValue.APPROVE
+            if decision == "approve"
+            else KnowledgeReviewDecisionValue.REJECT
+        )
+        parsed_version = None
+        if version and version.strip():
+            try:
+                parsed_version = int(version.strip())
+            except ValueError:
+                return HTMLResponse(
+                    owner_error_html(
+                        message="版本号必须为正整数。",
+                        last_campaign_id=last_campaign_id,
+                    ),
+                    status_code=400,
+                )
+        # Auto-compute the next contiguous version when the owner leaves it blank,
+        # so the owner never has to track versions manually (V1-I5 requirement).
+        series = series_id.strip() if series_id else None
+        supersedes = None
+        if decision_value == KnowledgeReviewDecisionValue.APPROVE and parsed_version is None:
+            if not series:
+                series = f"series:{candidate.id}"
+            parsed_version, head_id = KnowledgeService(session).next_version(
+                series, candidate.project_id
+            )
+            supersedes = head_id
+        try:
+            KnowledgeService(session).review_candidate(
+                candidate.id,
+                decision_value,
+                reviewer or "owner",
+                rationale.strip(),
+                series_id=series,
+                version=parsed_version,
+                supersedes_fact_id=supersedes,
+            )
+        except ServiceError as error:
+            return HTMLResponse(
+                owner_error_html(message=error.detail, last_campaign_id=last_campaign_id),
+                status_code=error.status_code,
+            )
+        except Exception:
+            return HTMLResponse(
+                owner_error_html(
+                    message="审阅知识时系统出现意外错误，请稍后重试。",
+                    last_campaign_id=last_campaign_id,
+                ),
+                status_code=500,
+            )
+        # Return to the board the candidate belongs to (best-effort via cookie).
+        target = last_campaign_id or candidate_id
+        return RedirectResponse(
+            url=f"/owner/board/{target}", status_code=303
+        )
 
     return application
 

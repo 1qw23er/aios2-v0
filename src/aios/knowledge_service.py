@@ -41,21 +41,54 @@ class KnowledgeService:
         self,
         artifact_id: str,
         statement: str,
-        project_id: str | None,
+        scope: str,
         submitted_by: str,
     ) -> KnowledgeCandidate:
+        """Preserve a knowledge candidate from an APPROVED artifact.
+
+        ``scope`` is "project" (reusable only inside the source campaign) or
+        "company" (reusable by every campaign). The source-campaign provenance is
+        ALWAYS recorded in ``source_project_id`` (the artifact's campaign) so that
+        source ownership can be enforced even for company-scoped facts.
+
+        Idempotent: a repeated submission with the same artifact + statement
+        returns the existing candidate instead of creating a duplicate.
+        """
+        if scope not in ("project", "company"):
+            raise ServiceError(422, "scope must be 'project' or 'company'")
+        statement = _required(statement, "statement")
+        submitted_by = _required(submitted_by, "submitted_by")
         artifact = self.session.get(Artifact, artifact_id)
         if artifact is None:
             raise ServiceError(404, "Source Artifact not found")
         if artifact.review_status != ArtifactReviewStatus.APPROVED:
             raise ServiceError(422, "Source Artifact must be approved")
-        if project_id != artifact.project_id:
-            raise ServiceError(422, "Candidate scope must exactly match Artifact scope")
+        if artifact.project_id is None:
+            raise ServiceError(
+                422,
+                "Source Artifact must belong to a campaign to preserve knowledge",
+            )
+        # Provenance is the artifact's campaign -- never lost, even for company scope.
+        source_project_id = artifact.project_id
+        # Effective scope: NULL (company-wide) or the source campaign (project-local).
+        project_id = None if scope == "company" else artifact.project_id
+
+        # Idempotency: same artifact + statement -> exactly one candidate.
+        existing = self.session.exec(
+            select(KnowledgeCandidate).where(
+                KnowledgeCandidate.artifact_id == artifact.id,
+                KnowledgeCandidate.statement == statement,
+            )
+        ).first()
+        if existing is not None:
+            return existing
+
         candidate = KnowledgeCandidate(
             artifact_id=artifact.id,
             project_id=project_id,
-            statement=_required(statement, "statement"),
-            submitted_by=_required(submitted_by, "submitted_by"),
+            source_project_id=source_project_id,
+            statement=statement,
+            submitted_by=submitted_by,
         )
         try:
             self.session.add(candidate)
@@ -74,6 +107,7 @@ class KnowledgeService:
                     "artifact_id": artifact.id,
                     "scope": "company" if project_id is None else "project",
                     "project_id": project_id,
+                    "source_project_id": source_project_id,
                     "status": candidate.status.value,
                 },
                 idempotency_key=f"audit:knowledge:candidate:{candidate.id}:created",
@@ -84,6 +118,30 @@ class KnowledgeService:
             raise
         self.session.refresh(candidate)
         return candidate
+
+    def next_version(
+        self, series_id: str, project_id: str | None
+    ) -> tuple[int, str | None]:
+        """Return (next_version, current_head_id) for a series within a scope.
+
+        ``project_id`` is the EFFECTIVE scope (NULL = company-wide), matching the
+        fact's ``project_id``. The next version is always ``head.version + 1``
+        (contiguous); for a brand-new series it is ``1`` with no head.
+        """
+        rows = list(
+            self.session.exec(
+                select(KnowledgeFact).where(
+                    KnowledgeFact.series_id == series_id,
+                    KnowledgeFact.project_id == project_id,
+                )
+            )
+        )
+        head = max(
+            (row for row in rows if row.status == KnowledgeFactStatus.APPROVED),
+            key=lambda row: row.version,
+            default=None,
+        )
+        return (head.version + 1 if head is not None else 1, head.id if head is not None else None)
 
     def review_candidate(
         self,
@@ -119,8 +177,10 @@ class KnowledgeService:
         artifact = self.session.get(Artifact, candidate.artifact_id)
         if artifact is None or artifact.review_status != ArtifactReviewStatus.APPROVED:
             raise ServiceError(409, "Source Artifact is no longer approved")
-        if candidate.project_id != artifact.project_id:
-            raise ServiceError(409, "Candidate and Artifact scopes conflict")
+        # Provenance guard: the candidate must still trace to this artifact's
+        # campaign. Effective scope (project_id) may legitimately differ (company).
+        if candidate.source_project_id != artifact.project_id:
+            raise ServiceError(409, "Candidate provenance conflicts with its artifact")
         review = KnowledgeReviewDecision(
             candidate_id=candidate.id,
             decision=decision,
@@ -168,10 +228,12 @@ class KnowledgeService:
             and existing.rationale == rationale
         )
         if decision == KnowledgeReviewDecisionValue.APPROVE:
+            # A replay of the same APPROVE (same decision/reviewer/rationale/series)
+            # is a safe idempotent no-op even if the route auto-computed a different
+            # next version -- version/supersedes are derived internals, not the
+            # owner's intent. Cross-decision changes (approve -> reject) still conflict.
             matches = matches and fact is not None and (
                 fact.series_id == (series_id or "").strip()
-                and fact.version == version
-                and fact.supersedes_fact_id == supersedes_fact_id
             )
         elif fact is not None or any(
             value is not None for value in (series_id, version, supersedes_fact_id)
@@ -239,14 +301,20 @@ class KnowledgeService:
                 raise ServiceError(409, "Knowledge series has no approved head")
             if supersedes_fact_id != head.id:
                 raise ServiceError(409, "Replacement must supersede the current approved head")
-            if version <= head.version:
-                raise ServiceError(422, "Replacement version must be greater than current head")
+            # Contiguous versioning: a replacement must be exactly head + 1.
+            if version != head.version + 1:
+                raise ServiceError(
+                    422,
+                    f"Replacement version must be the current head version + 1 "
+                    f"(head is v{head.version})",
+                )
         candidate.status = KnowledgeCandidateStatus.APPROVED
         candidate.updated_at = now_utc()
         fact = KnowledgeFact(
             series_id=series_id,
             version=version,
             project_id=candidate.project_id,
+            source_project_id=candidate.source_project_id,
             statement=candidate.statement,
             source_candidate_id=candidate.id,
             source_artifact_id=candidate.artifact_id,

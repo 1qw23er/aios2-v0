@@ -64,6 +64,7 @@ def _approved_candidate(session: Session) -> KnowledgeCandidate:
     candidate = KnowledgeCandidate(
         artifact_id=artifact.id,
         project_id=project.id,
+        source_project_id=project.id,
         statement="S",
         submitted_by="human",
     )
@@ -134,4 +135,4 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
         }
         assert "knowledge_fact" not in tables
     command.upgrade(config, "head")
-    assert revision() == "20260717_0006"
+    assert revision() == "20260718_0007"

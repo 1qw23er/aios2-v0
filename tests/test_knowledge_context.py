@@ -39,9 +39,11 @@ def approve(
     source: Artifact,
     statement: str,
     series_id: str,
+    *,
+    scope: str = "project",
 ):
     service = KnowledgeService(session)
-    candidate = service.submit_candidate(source.id, statement, source.project_id, "submitter")
+    candidate = service.submit_candidate(source.id, statement, scope, "submitter")
     return service.review_candidate(
         candidate.id,
         KnowledgeReviewDecisionValue.APPROVE,
@@ -65,8 +67,12 @@ def test_context_includes_only_company_and_same_project_active_knowledge(
         session.add(task)
         session.commit()
 
+        # Company-scoped fact: the source artifact belongs to the "Other"
+        # campaign but is promoted to company scope at preserve time, so it is
+        # reusable by every campaign (including "Current").
+        company_source = artifact(session, other.id, "company")
         company_fact = approve(
-            session, artifact(session, None, "company"), "Company fact", "company-series"
+            session, company_source, "Company fact", "company-series", scope="company"
         )
         project_fact = approve(
             session,

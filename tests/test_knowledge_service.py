@@ -51,14 +51,19 @@ def test_submit_candidate_requires_approved_exact_scope_artifact(tmp_path: Path)
     with Session(get_engine(url)) as session:
         project, artifact = seed_artifact(session)
         candidate = KnowledgeService(session).submit_candidate(
-            artifact.id, "  Verified statement  ", project.id, " human_submitter "
+            artifact.id, "  Verified statement  ", "project", " human_submitter "
         )
         assert candidate.statement == "Verified statement"
         assert candidate.submitted_by == "human_submitter"
         assert candidate.status == KnowledgeCandidateStatus.DRAFT
-        with pytest.raises(ServiceError, match="exactly match"):
+        # Effective scope and source provenance both trace to the artifact's
+        # campaign; scope is chosen explicitly -- there is no silent promotion.
+        assert candidate.project_id == project.id
+        assert candidate.source_project_id == project.id
+        # An unrecognized scope is rejected outright.
+        with pytest.raises(ServiceError, match="scope"):
             KnowledgeService(session).submit_candidate(
-                artifact.id, "Widened", None, "human_submitter"
+                artifact.id, "Widened", "galaxy", "human_submitter"
             )
         audits = list(session.exec(select(AuditLog)))
         assert [audit.action for audit in audits] == ["knowledge.candidate.created"]
@@ -71,13 +76,13 @@ def test_submit_candidate_rejects_unapproved_and_empty_fields(tmp_path: Path) ->
         project, artifact = seed_artifact(session, approved=False)
         with pytest.raises(ServiceError, match="approved"):
             KnowledgeService(session).submit_candidate(
-                artifact.id, "Statement", project.id, "human"
+                artifact.id, "Statement", "project", "human"
             )
         artifact.review_status = ArtifactReviewStatus.APPROVED
         session.add(artifact)
         session.commit()
         with pytest.raises(ServiceError, match="non-empty"):
-            KnowledgeService(session).submit_candidate(artifact.id, " ", project.id, "human")
+            KnowledgeService(session).submit_candidate(artifact.id, " ", "project", "human")
 
 
 def test_rejection_is_terminal_idempotent_and_creates_no_fact(tmp_path: Path) -> None:
@@ -85,7 +90,7 @@ def test_rejection_is_terminal_idempotent_and_creates_no_fact(tmp_path: Path) ->
     with Session(get_engine(url)) as session:
         project, artifact = seed_artifact(session)
         service = KnowledgeService(session)
-        candidate = service.submit_candidate(artifact.id, "Claim", project.id, "submitter")
+        candidate = service.submit_candidate(artifact.id, "Claim", "project", "submitter")
         first = service.review_candidate(
             candidate.id,
             KnowledgeReviewDecisionValue.REJECT,
@@ -120,7 +125,7 @@ def test_approval_and_supersession_keep_one_head(tmp_path: Path) -> None:
     with Session(get_engine(url)) as session:
         project, artifact = seed_artifact(session)
         service = KnowledgeService(session)
-        first_candidate = service.submit_candidate(artifact.id, "Fact v1", project.id, "submitter")
+        first_candidate = service.submit_candidate(artifact.id, "Fact v1", "project", "submitter")
         first = service.review_candidate(
             first_candidate.id,
             KnowledgeReviewDecisionValue.APPROVE,
@@ -131,7 +136,7 @@ def test_approval_and_supersession_keep_one_head(tmp_path: Path) -> None:
         )
         assert first.fact is not None
         assert first.fact.status == KnowledgeFactStatus.APPROVED
-        second_candidate = service.submit_candidate(artifact.id, "Fact v2", project.id, "submitter")
+        second_candidate = service.submit_candidate(artifact.id, "Fact v2", "project", "submitter")
         second = service.review_candidate(
             second_candidate.id,
             KnowledgeReviewDecisionValue.APPROVE,
@@ -158,7 +163,7 @@ def test_first_fact_and_head_rules_are_service_enforced(tmp_path: Path) -> None:
     with Session(get_engine(url)) as session:
         project, artifact = seed_artifact(session)
         candidate = KnowledgeService(session).submit_candidate(
-            artifact.id, "Disconnected", project.id, "submitter"
+            artifact.id, "Disconnected", "project", "submitter"
         )
         with pytest.raises(ServiceError, match="version 1"):
             KnowledgeService(session).review_candidate(
@@ -174,8 +179,14 @@ def test_first_fact_and_head_rules_are_service_enforced(tmp_path: Path) -> None:
 def test_company_artifact_produces_only_company_candidate(tmp_path: Path) -> None:
     url = database(tmp_path, "company.db")
     with Session(get_engine(url)) as session:
+        # A company-scoped fact must still come from a campaign-backed artifact;
+        # its source provenance (source_project_id) is the artifact's campaign,
+        # while its EFFECTIVE scope (project_id) is NULL for company-wide reuse.
+        project = Project(name="Company", objective="Reuse everywhere")
+        session.add(project)
+        session.flush()
         artifact = Artifact(
-            project_id=None,
+            project_id=project.id,
             type=ArtifactType.JSON,
             uri="company.json",
             checksum="sha256:company",
@@ -184,9 +195,10 @@ def test_company_artifact_produces_only_company_candidate(tmp_path: Path) -> Non
         session.add(artifact)
         session.commit()
         candidate = KnowledgeService(session).submit_candidate(
-            artifact.id, "Company fact", None, "company_reviewer"
+            artifact.id, "Company fact", "company", "company_reviewer"
         )
         assert candidate.project_id is None
+        assert candidate.source_project_id == project.id
 
 
 def test_concurrent_replacements_leave_one_approved_head(tmp_path: Path) -> None:
@@ -194,7 +206,7 @@ def test_concurrent_replacements_leave_one_approved_head(tmp_path: Path) -> None
     with Session(get_engine(url)) as session:
         project, artifact = seed_artifact(session)
         service = KnowledgeService(session)
-        root_candidate = service.submit_candidate(artifact.id, "Root", project.id, "submitter")
+        root_candidate = service.submit_candidate(artifact.id, "Root", "project", "submitter")
         root_result = service.review_candidate(
             root_candidate.id,
             KnowledgeReviewDecisionValue.APPROVE,
@@ -204,10 +216,10 @@ def test_concurrent_replacements_leave_one_approved_head(tmp_path: Path) -> None
             version=1,
         )
         first_candidate = service.submit_candidate(
-            artifact.id, "Replacement A", project.id, "submitter"
+            artifact.id, "Replacement A", "project", "submitter"
         )
         second_candidate = service.submit_candidate(
-            artifact.id, "Replacement B", project.id, "submitter"
+            artifact.id, "Replacement B", "project", "submitter"
         )
         root_id = root_result.fact.id
         candidate_ids = [first_candidate.id, second_candidate.id]
