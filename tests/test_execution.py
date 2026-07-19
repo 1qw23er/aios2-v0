@@ -31,13 +31,11 @@ from aios.services import ServiceError
 
 
 @pytest.fixture
-def client(tmp_path) -> TestClient:
-    import os
-
-    os.environ["AIOS_DATABASE_URL"] = f"sqlite:///{tmp_path / 'exec.db'}"
+def client(tmp_path, monkeypatch) -> TestClient:
+    monkeypatch.setenv("AIOS_DATABASE_URL", f"sqlite:///{tmp_path / 'exec.db'}")
     # Force the production adapter to be unconfigured so the endpoint returns 503.
-    os.environ.pop("AIOS_AGENT_API_KEY", None)
-    os.environ.pop("AIOS_AGENT_BASE_URL", None)
+    monkeypatch.delenv("AIOS_AGENT_API_KEY", raising=False)
+    monkeypatch.delenv("AIOS_AGENT_BASE_URL", raising=False)
     with TestClient(create_app(), follow_redirects=False) as test_client:
         yield test_client
 

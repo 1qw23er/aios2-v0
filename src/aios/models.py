@@ -44,6 +44,35 @@ class AdapterType(StrEnum):
     MODEL = "model"
 
 
+class DelegationMode(StrEnum):
+    """How a department agent is reached (Agent Interoperability Gateway, #57).
+
+    - remote_api: HTTP endpoint, async submit + status poll or callback.
+    - a2a: remote agent-to-agent task collaboration protocol.
+    - mcp: MCP worker bridge (tool/context connectivity, sync tool call).
+    - workstation: external closed agent via local export/import package.
+
+    MCP and A2A are deliberately NOT interchangeable: MCP is primarily
+    tool/context connectivity; A2A is remote agent task collaboration.
+    """
+
+    REMOTE_API = "remote_api"
+    A2A = "a2a"
+    MCP = "mcp"
+    WORKSTATION = "workstation"
+
+
+class DelegatedRunStatus(StrEnum):
+    """Lifecycle of one remote execution delegated to an external agent (#57)."""
+
+    SUBMITTED = "submitted"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
 class ArtifactType(StrEnum):
     MARKDOWN = "markdown"
     JSON = "json"
@@ -114,6 +143,26 @@ class AgentStatus(StrEnum):
     MAINTENANCE = "maintenance"
 
 
+class AgentTrustLevel(StrEnum):
+    """Single trust axis for the Agent Interoperability Gateway (#104).
+
+    NOT a generic permission framework — merely one dimension used at the
+    delegation boundary to decide whether an agent may be used for external
+    delegation, and with what capability ceiling.
+
+    - internal: AIOS-owned department agent; full trust.
+    - verified_external: a vetted external/closed-source agent allowed to run
+      delegated tasks, but it can never mutate internal workflow state (that
+      restriction is structural, not permission-based).
+    - experimental: unvetted external agent. BLOCKED from delegation until
+      promoted, so a misconfigured/unknown agent cannot silently execute work.
+    """
+
+    INTERNAL = "internal"
+    VERIFIED_EXTERNAL = "verified_external"
+    EXPERIMENTAL = "experimental"
+
+
 class RoutingMode(StrEnum):
     FIXED = "fixed"
     PREFERRED_WITH_FALLBACK = "preferred_with_fallback"
@@ -131,6 +180,10 @@ class Project(SQLModel, table=True):
     status: ProjectStatus = ProjectStatus.PROPOSED
     owner: str = "human_ceo"
     budget_limit: float = 0.0
+    # Agent Interoperability Gateway hardening (#104): running spend accrued by
+    # delegated runs. Compared against ``budget_limit`` to HARD-block remote
+    # execution when the project is over budget (0.0 limit = no enforcement).
+    budget_used: float = 0.0
     success_metrics: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
@@ -143,14 +196,29 @@ class Agent(SQLModel, table=True):
     name: str
     role: str
     adapter_type: AdapterType
+    # Agent Interoperability Gateway (#57): how this agent is reached.
+    # remote_api / a2a / mcp / workstation. LLMExecutionAdapter-backed agents
+    # leave this None (they run in-process via the execution protocol).
+    delegation_mode: DelegationMode | None = Field(default=None, index=True)
     capabilities: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     permissions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     cost_policy: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     endpoint: str | None = None
+    # Secret reference handle ONLY (e.g. "secret://hermes-api-key"). The actual
+    # secret lives in an external secret store and is NEVER persisted on any
+    # TaskContext / Artifact / AuditLog payload. config_ref is reused for the same
+    # opaque-reference purpose for non-secret config.
     config_ref: str | None = None
+    secret_ref: str | None = Field(default=None, index=True)
+    callback_url: str | None = None
     enabled: bool = True
     limitations: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     status: AgentStatus = Field(default=AgentStatus.AVAILABLE, index=True)
+    # Agent Interoperability Gateway hardening (#104): single trust axis used to
+    # gate external delegation. Defaults to INTERNAL for pre-existing agents.
+    trust_level: AgentTrustLevel = Field(
+        default=AgentTrustLevel.INTERNAL, index=True
+    )
 
 
 class Capability(SQLModel, table=True):
@@ -200,6 +268,15 @@ class Artifact(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("art"), primary_key=True)
     project_id: str = Field(foreign_key="project.id", index=True)
     task_id: str | None = Field(default=None, foreign_key="task.id", index=True)
+    # Agent Interoperability Gateway (#57): when produced by a delegated agent,
+    # record which adapter/agent produced it and the immutable provenance bundle
+    # (remote run id, remote status, usage, model/agent identity, retry attempt).
+    adapter_id: str | None = Field(default=None, foreign_key="agent.id", index=True)
+    # "execution_protocol" | "delegated:<mode>"
+    source: str | None = Field(default=None, index=True)
+    provenance_json: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column("provenance", JSON)
+    )
     type: ArtifactType
     uri: str
     checksum: str
@@ -207,6 +284,47 @@ class Artifact(SQLModel, table=True):
     external_result_id: str | None = Field(default=None, unique=True, index=True)
     result_checksum: str | None = None
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column("metadata", JSON))
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class DelegatedRun(SQLModel, table=True):
+    """One remote execution of a task delegated to an external agent (#57).
+
+    The orchestration/Task services NEVER learn the agent's internal models,
+    prompts, memory, or tools. They only see this record + the resulting
+    unverified Artifact (which must pass schema validation before task completion).
+
+    Security: ``secret_ref`` is an opaque handle to an external secret store.
+    The actual secret is resolved at call time and is NEVER written here, nor into
+    TaskContext / Artifact / AuditLog payloads.
+    """
+
+    __tablename__ = "delegated_run"
+
+    id: str = Field(default_factory=lambda: new_id("run"), primary_key=True)
+    project_id: str = Field(foreign_key="project.id", index=True)
+    task_id: str = Field(foreign_key="task.id", index=True)
+    agent_id: str = Field(foreign_key="agent.id", index=True)
+    delegation_mode: DelegationMode
+    # Opaque handle to the external secret store (e.g. "secret://hermes-api-key").
+    secret_ref: str | None = Field(default=None, index=True)
+    status: DelegatedRunStatus = Field(default=DelegatedRunStatus.SUBMITTED, index=True)
+    # Idempotency key: H(task_id, agent_id, attempt). The remote agent honors it so
+    # a retried submit never double-executes. Unique per attempt.
+    idempotency_key: str = Field(unique=True, index=True)
+    attempt: int = Field(default=1, ge=1)
+    remote_run_id: str | None = Field(default=None, index=True)
+    remote_status: str | None = None
+    # Immutable context delivery: the projected, least-privilege context snapshot
+    # sent to the agent. Stored so a run is fully auditable and replayable.
+    context_ref: str | None = None
+    callback_url: str | None = None
+    # Cost / usage captured from the agent's return (provenance). In currency units.
+    cost: float = 0.0
+    usage: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    error: str | None = None
+    submitted_at: datetime = Field(default_factory=now_utc)
+    finished_at: datetime | None = None
     created_at: datetime = Field(default_factory=now_utc)
 
 

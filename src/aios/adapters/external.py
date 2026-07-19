@@ -8,6 +8,9 @@ from jsonschema import ValidationError, validate
 from pydantic import BaseModel, Field
 
 from aios.context_render import render_task_context_markdown, task_context_payload
+from aios.delegation import DelegatedExecutionAdapter as _DelegatedExecutionAdapter
+from aios.models import Agent as _Agent
+from aios.models import DelegationMode as _DelegationMode
 from aios.models import TaskContext
 
 
@@ -97,3 +100,92 @@ class ExternalWorkstationAdapter:
         except (OSError, ValueError, ValidationError) as error:
             raise ResultValidationError(str(error)) from error
         return result
+
+
+# --- Agent Interoperability Gateway (#57), capability B: workstation export/import ---
+# Reuses the existing ExternalWorkstationAdapter rather than rebuilding it. The
+# closed-source agent (e.g. 扣子/Coze no-code bot) is driven by a human/operator
+# who exports the task packet, runs it in the external tool, and drops the result
+# file back into the inbox. The agent never touches Task/Approval/KnowledgeFact
+# state directly; it only produces a validated ExternalResult -> Artifact.
+
+
+class WorkstationAdapter(_DelegatedExecutionAdapter):
+    """Delegated adapter backed by local export/import packages (workstation mode).
+
+    Unlike RemoteApiAdapter, there is no live callback: submission writes the
+    task packet to the outbox (WAITING_EXTERNAL), and ingestion reads the result
+    file once an operator has placed it in the inbox. The run is marked RUNNING
+    until a result appears.
+    """
+
+    mode = _DelegationMode.WORKSTATION
+
+    def __init__(self, *, agent: _Agent, outbox: Path, inbox: Path) -> None:
+        super().__init__(agent=agent)
+        self._ws = ExternalWorkstationAdapter(outbox=outbox, inbox=inbox)
+
+    def submit(self, *, delegated_run, projected_context, output_schema, remote_callback_url):
+        packet = {
+            "task_id": delegated_run.task_id,
+            "project": {"id": delegated_run.project_id},
+            "role": self.agent.role,
+            "instructions": projected_context.get("instructions", ""),
+            "inputs": projected_context.get("dependency_outputs", []),
+            "acceptance_criteria": projected_context.get("acceptance_criteria", []),
+            "output_schema": output_schema,
+        }
+        exported = self._ws.export_task(packet, context=projected_context.get("objective", ""))
+        # Cache the output schema alongside the packet so ingest_result can
+        # re-validate the delivered artifact data without a base-class signature
+        # change. (ExternalWorkstationAdapter.import_result validates the whole
+        # ExternalResult against output_schema, which is the wrong shape here.)
+        schema_path = exported.packet_path.parent / "output_schema.json"
+        schema_path.write_text(
+            json.dumps(output_schema, ensure_ascii=False), encoding="utf-8"
+        )
+        return {
+            "remote_run_id": f"ws:{delegated_run.task_id}",
+            "remote_status": "waiting_external",
+            "exported_to": str(exported.packet_path),
+        }
+
+    def status(self, *, delegated_run):
+        result_file = self._ws.inbox / f"{delegated_run.task_id}.result.json"
+        if result_file.exists():
+            return {"remote_status": "succeeded", "finished": True, "result": None}
+        return {"remote_status": "waiting_external", "finished": False, "result": None}
+
+    def cancel(self, *, delegated_run):
+        pass  # workstation runs are operator-driven; nothing to cancel remotely
+
+    def ingest_result(self, *, delegated_run):
+        # Read the operator-dropped result, validate each artifact's *data*
+        # against the cached output schema, and normalize to an Artifact dict.
+        # We intentionally bypass ExternalWorkstationAdapter.import_result because
+        # its schema check applies to the top-level ExternalResult, not the
+        # per-artifact data the task's output_schema actually describes.
+        result_file = self._ws.inbox / f"{delegated_run.task_id}.result.json"
+        payload = json.loads(result_file.read_text(encoding="utf-8"))
+        external = ExternalResult.model_validate(payload)
+        schema_path = (
+            self._ws.outbox / delegated_run.task_id / "output_schema.json"
+        )
+        output_schema = (
+            json.loads(schema_path.read_text(encoding="utf-8"))
+            if schema_path.exists()
+            else None
+        )
+        if output_schema is not None:
+            for art in external.artifacts:
+                data = art.get("data", {})
+                try:
+                    validate(instance=data, schema=output_schema)
+                except ValidationError as exc:  # noqa: BLE001
+                    raise ResultValidationError(
+                        f"artifact {art.get('uri')} failed schema: {exc.message}"
+                    ) from exc
+        return {
+            "summary": external.summary,
+            "artifacts": external.artifacts,
+        }

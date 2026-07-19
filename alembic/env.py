@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config, pool
@@ -10,6 +11,11 @@ import aios.models  # noqa: F401
 from alembic import context
 
 config = context.config
+# Honor AIOS_DATABASE_URL (used everywhere else) when set, so migrations target
+# the same database the app uses without editing alembic.ini.
+_env_url = os.getenv("AIOS_DATABASE_URL")
+if _env_url:
+    config.set_main_option("sqlalchemy.url", _env_url)
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 

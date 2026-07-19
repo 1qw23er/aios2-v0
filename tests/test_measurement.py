@@ -82,12 +82,10 @@ class ScriptedExecutionAdapter:
 
 
 @pytest.fixture
-def client(tmp_path) -> TestClient:
-    import os
-
-    os.environ["AIOS_DATABASE_URL"] = f"sqlite:///{tmp_path / 'measurement.db'}"
-    os.environ.pop("AIOS_AGENT_API_KEY", None)
-    os.environ.pop("AIOS_AGENT_BASE_URL", None)
+def client(tmp_path, monkeypatch) -> TestClient:
+    monkeypatch.setenv("AIOS_DATABASE_URL", f"sqlite:///{tmp_path / 'measurement.db'}")
+    monkeypatch.delenv("AIOS_AGENT_API_KEY", raising=False)
+    monkeypatch.delenv("AIOS_AGENT_BASE_URL", raising=False)
     with TestClient(create_app(), follow_redirects=False) as test_client:
         yield test_client
 

@@ -213,9 +213,39 @@ def execute_task(
 
     checksum = _artifact_checksum(result)
     primary = result.artifacts[0] if result.artifacts else {}
+    # Agent Interoperability Gateway (#57): if the adapter is a delegated
+    # external agent, record provenance (adapter id, mode, remote run id, usage)
+    # so the result is fully attributable and auditable. The secret itself is
+    # NEVER written here (only the opaque secret_ref lives on DelegatedRun).
+    from aios.delegation import DelegatedExecutionAdapter
+
+    adapter_id = getattr(adapter, "agent_id", None) or (
+        adapter.agent.id if isinstance(adapter, DelegatedExecutionAdapter) else None
+    )
+    source = (
+        f"delegated:{adapter.mode.value}"
+        if isinstance(adapter, DelegatedExecutionAdapter)
+        else "execution_protocol"
+    )
+    provenance_json: dict[str, Any] = {}
+    if isinstance(adapter, DelegatedExecutionAdapter):
+        run = getattr(result, "_run", None)
+        if run is not None:
+            provenance_json = {
+                "delegated_run_id": run.id,
+                "remote_run_id": run.remote_run_id,
+                "remote_status": run.remote_status,
+                "attempt": run.attempt,
+                "cost": run.cost,
+                "usage": run.usage,
+                "secret_ref": run.secret_ref,  # opaque handle, never the secret
+            }
     artifact = Artifact(
         project_id=task.project_id,
         task_id=task.id,
+        adapter_id=adapter_id,
+        source=source,
+        provenance_json=provenance_json,
         type=ArtifactType(primary.get("type", "json")),
         uri=primary.get("uri") or f"exec://{task.id}/{idempotency_key}",
         checksum=checksum,
@@ -224,7 +254,7 @@ def execute_task(
         metadata_json={
             "summary": result.summary,
             "actor": actor,
-            "adapter": "execution_protocol",
+            "adapter": source,
             "context_hash": context.context_hash,
             "artifacts": result.artifacts,
             "claims": result.claims,
