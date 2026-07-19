@@ -7,9 +7,16 @@ from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Reques
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlmodel import Session, select
 
+from aios.agent_registry import (
+    get_agent,
+    list_agents,
+    register_agent,
+    set_agent_enabled,
+)
 from aios.campaign import CampaignLaunchResult, launch_campaign
 from aios.console import (
     build_board_view,
+    owner_agents_html,
     owner_board_html,
     owner_error_html,
     owner_home_html,
@@ -27,6 +34,7 @@ from aios.execution import LLMExecutionAdapter, execute_task
 from aios.knowledge_service import KnowledgeService
 from aios.measurement import MeasurementService
 from aios.models import (
+    Agent,
     Approval,
     ApprovalStatus,
     Artifact,
@@ -39,6 +47,8 @@ from aios.models import (
 )
 from aios.orchestrator import Orchestrator, complete_task
 from aios.schemas import (
+    AgentEnabledUpdate,
+    AgentRegister,
     ApprovalCreate,
     ApprovalDecision,
     ArtifactReviewUpdate,
@@ -428,6 +438,64 @@ def create_app() -> FastAPI:
         report = MeasurementService(session).build_report().model_dump(mode="json")
         return HTMLResponse(owner_measurement_html(report))
 
+    # --- Agent Interoperability Gateway: DB-backed agent registry (#57, #61) ---
+    # Reuses the same ``agent_registry`` service as the owner console below.
+
+    @application.get("/agents", response_model=list[Agent])
+    def list_registered_agents(
+        session: Session = Depends(get_session),
+    ) -> list[Agent]:
+        return list_agents(session)
+
+    @application.post(
+        "/agents", response_model=Agent, status_code=status.HTTP_201_CREATED
+    )
+    def create_agent(
+        request: AgentRegister,
+        session: Session = Depends(get_session),
+    ) -> Agent:
+        try:
+            return register_agent(
+                session,
+                name=request.name,
+                role=request.role,
+                adapter_type=request.adapter_type,
+                delegation_mode=request.delegation_mode,
+                capabilities=request.capabilities,
+                endpoint=request.endpoint,
+                secret_ref=request.secret_ref,
+                callback_url=request.callback_url,
+                trust_level=request.trust_level,
+                timeout_s=request.timeout_s,
+                max_retries=request.max_retries,
+                config_ref=request.config_ref,
+                limitations=request.limitations,
+                enabled=request.enabled,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.get("/agents/{agent_id}", response_model=Agent)
+    def read_agent(
+        agent_id: str,
+        session: Session = Depends(get_session),
+    ) -> Agent:
+        try:
+            return get_agent(session, agent_id)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.put("/agents/{agent_id}/enabled", response_model=Agent)
+    def update_agent_enabled(
+        agent_id: str,
+        request: AgentEnabledUpdate,
+        session: Session = Depends(get_session),
+    ) -> Agent:
+        try:
+            return set_agent_enabled(session, agent_id, request.enabled)
+        except ServiceError as error:
+            raise _translate(error) from error
+
     # --- Minimal owner console (server-rendered HTML; no separate frontend) ---
     # Reuses the SAME service layer as the JSON endpoints above:
     #   POST /owner/launch      -> launch_campaign (behind POST /owner/campaigns)
@@ -440,6 +508,86 @@ def create_app() -> FastAPI:
         retry reuses the same key and never creates a duplicate campaign."""
         last_campaign_id = request.cookies.get("aios_last_campaign")
         return HTMLResponse(owner_home_html(idem=new_id("idem"), last_campaign_id=last_campaign_id))
+
+    @application.get("/owner/agents", response_class=HTMLResponse)
+    def owner_agents(
+        request: Request, session: Session = Depends(get_session)
+    ) -> HTMLResponse:
+        """Agent registry console: list + registration form (#57, #61)."""
+        agents = list_agents(session)
+        return HTMLResponse(owner_agents_html(agents))
+
+    @application.post("/owner/agents/register", response_class=HTMLResponse, response_model=None)
+    def owner_agent_register(
+        request: Request,
+        name: str | None = Form(None),
+        role: str | None = Form(None),
+        adapter_type: str | None = Form(None),
+        delegation_mode: str | None = Form(None),
+        capabilities: str | None = Form(None),
+        endpoint: str | None = Form(None),
+        secret_ref: str | None = Form(None),
+        callback_url: str | None = Form(None),
+        trust_level: str | None = Form(None),
+        timeout_s: str | None = Form("300"),
+        max_retries: str | None = Form("3"),
+        limitations: str | None = Form(None),
+        enabled: str | None = Form(None),
+        session: Session = Depends(get_session),
+    ) -> HTMLResponse | RedirectResponse:
+        def _show_error(msg: str) -> HTMLResponse:
+            return HTMLResponse(
+                owner_agents_html(list_agents(session), error=msg), status_code=400
+            )
+
+        if not name or not name.strip() or not role or not role.strip():
+            return _show_error("agent 名称与角色都不能为空。")
+        if not adapter_type or not adapter_type.strip():
+            return _show_error("必须选择适配器类型。")
+        try:
+            ts = float(timeout_s or "300")
+            mr = int(max_retries or "3")
+        except ValueError:
+            return _show_error("超时 / 重试次数必须为数字。")
+        caps = [c.strip() for c in (capabilities or "").split(",") if c.strip()]
+        lims = [lim.strip() for lim in (limitations or "").split(",") if lim.strip()]
+        try:
+            register_agent(
+                session,
+                name=name,
+                role=role,
+                adapter_type=adapter_type,
+                delegation_mode=delegation_mode or None,
+                capabilities=caps,
+                endpoint=endpoint or None,
+                secret_ref=secret_ref or None,
+                callback_url=callback_url or None,
+                trust_level=trust_level or None,
+                timeout_s=ts,
+                max_retries=mr,
+                limitations=lims,
+                enabled=enabled is not None,
+            )
+        except ServiceError as error:
+            return _show_error(error.detail)
+        return RedirectResponse(url="/owner/agents", status_code=303)
+
+    @application.post(
+        "/owner/agents/{agent_id}/toggle", response_class=HTMLResponse, response_model=None
+    )
+    def owner_agent_toggle(
+        agent_id: str,
+        request: Request,
+        enabled: str | None = Form(None),
+        session: Session = Depends(get_session),
+    ) -> HTMLResponse | RedirectResponse:
+        try:
+            set_agent_enabled(session, agent_id, enabled is not None)
+        except ServiceError as error:
+            return HTMLResponse(
+                owner_agents_html(list_agents(session), error=error.detail), status_code=400
+            )
+        return RedirectResponse(url="/owner/agents", status_code=303)
 
     @application.post("/owner/launch", response_class=HTMLResponse, response_model=None)
     def owner_launch(

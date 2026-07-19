@@ -217,7 +217,7 @@ def execute_task(
     # external agent, record provenance (adapter id, mode, remote run id, usage)
     # so the result is fully attributable and auditable. The secret itself is
     # NEVER written here (only the opaque secret_ref lives on DelegatedRun).
-    from aios.delegation import DelegatedExecutionAdapter
+    from aios.delegation import DelegatedExecutionAdapter, build_delegated_provenance
 
     adapter_id = getattr(adapter, "agent_id", None) or (
         adapter.agent.id if isinstance(adapter, DelegatedExecutionAdapter) else None
@@ -231,15 +231,17 @@ def execute_task(
     if isinstance(adapter, DelegatedExecutionAdapter):
         run = getattr(result, "_run", None)
         if run is not None:
-            provenance_json = {
-                "delegated_run_id": run.id,
-                "remote_run_id": run.remote_run_id,
-                "remote_status": run.remote_status,
-                "attempt": run.attempt,
-                "cost": run.cost,
-                "usage": run.usage,
-                "secret_ref": run.secret_ref,  # opaque handle, never the secret
-            }
+            # The outer `run` object is stale: `_wait_for_completion` updates
+            # remote_status/finished_at on a fresh DB-bound row inside its own
+            # session. Re-read by id so provenance reflects the *final* run state
+            # (Contract point 10). Cheap, idempotent, and avoids detached-object
+            # drift between the in-memory run and what the DB actually persisted.
+            from aios.models import DelegatedRun
+
+            persisted_run = session.get(DelegatedRun, run.id)
+            provenance_json = build_delegated_provenance(
+                adapter, persisted_run if persisted_run is not None else run
+            )
     artifact = Artifact(
         project_id=task.project_id,
         task_id=task.id,

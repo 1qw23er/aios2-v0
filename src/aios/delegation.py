@@ -36,7 +36,7 @@ from typing import Any, Protocol
 
 from sqlmodel import Session
 
-from aios.audit import append_audit, redact_secrets
+from aios.audit import AuditEvent, append_audit, redact_secrets
 from aios.models import (
     Agent,
     AgentTrustLevel,
@@ -45,6 +45,7 @@ from aios.models import (
     DelegationMode,
     Project,
     Task,
+    new_id,
     now_utc,
 )
 
@@ -52,6 +53,43 @@ from aios.models import (
 def make_idempotency_key(task_id: str, agent_id: str, attempt: int) -> str:
     raw = f"{task_id}|{agent_id}|{attempt}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def cancel_run(run: DelegatedRun) -> DelegatedRunStatus:
+    """Cancel an in-flight delegated run (Contract point 8).
+
+    Idempotent: a terminal run (succeeded / failed / cancelled) is left
+    untouched. Emits ``delegation.cancelled`` for audit and returns the
+    resulting status. The adapter-side cancellation (if any) is the caller's
+    responsibility -- this only records the orchestrator's decision.
+    """
+    with _session() as s:
+        r = s.get(DelegatedRun, run.id)
+        if r.status in (
+            DelegatedRunStatus.SUCCEEDED,
+            DelegatedRunStatus.FAILED,
+            DelegatedRunStatus.CANCELLED,
+        ):
+            return r.status
+        r.status = DelegatedRunStatus.CANCELLED
+        r.finished_at = now_utc()
+        r.error = "cancelled by owner"
+        s.add(r)
+        s.commit()
+        append_audit(
+            s,
+            actor="gateway",
+            action=AuditEvent.DELEGATION_CANCELLED,
+            resource_type="delegated_run",
+            resource_id=r.id,
+            project_id=r.project_id,
+            task_id=r.task_id,
+            before={},
+            after={"status": "cancelled"},
+            idempotency_key=f"audit:cancel:{r.id}:{new_id('k')}",
+        )
+        s.commit()
+        return r.status
 
 
 # ---------------------------------------------------------------------------
@@ -159,14 +197,20 @@ class DelegatedExecutionAdapter:
         backoff_base: float | None = None,
     ) -> None:
         self.agent = agent
+        # Per-agent tuning wins over class defaults (design review v1 §6).
+        # Falls back to the class default when the agent row leaves them at 0.
         if max_retries is not None:
             self.max_retries = max_retries
+        else:
+            self.max_retries = int(getattr(agent, "max_retries", 0) or 0) or self.max_retries
         if backoff_base is not None:
             self.backoff_base = backoff_base
+        # Per-delegation timeout ceiling (design review v1 §6). Default 300s.
+        self.timeout_s = float(getattr(agent, "timeout_s", 0.0) or 0.0) or 300.0
 
     # --- capability discovery (Contract point 1) ---
     def discover_capabilities(self) -> dict[str, Any]:
-        return {
+        caps = {
             "agent_id": self.agent.id,
             "name": self.agent.name,
             "mode": self.mode.value,
@@ -174,6 +218,26 @@ class DelegatedExecutionAdapter:
             "capabilities": self.agent.capabilities,
             "callback_url": self.agent.callback_url,
         }
+        # Observability: every discovery is recorded (design review v1 §1).
+        # Best-effort and non-fatal — discovery must never break on audit failure.
+        try:
+            with _session() as s:
+                append_audit(
+                    s,
+                    actor="gateway",
+                    action=AuditEvent.AGENT_DISCOVER,
+                    resource_type="agent",
+                    resource_id=self.agent.id,
+                    project_id=None,
+                    task_id=None,
+                    before={},
+                    after={"mode": self.mode.value},
+                    idempotency_key=f"audit:discover:{self.agent.id}:{new_id('k')}",
+                )
+                s.commit()
+        except Exception:  # noqa: BLE001
+            pass
+        return caps
 
     # --- the unified run() entry used by execute_task (Contract point 4 identity) ---
     def run(
@@ -235,8 +299,39 @@ class DelegatedExecutionAdapter:
                         f"delegated run ended {final['status'].value}: {final.get('error')}"
                     )
                 artifact_like = self.ingest_result(delegated_run=run)
+                # Observability: result received back from the external agent.
+                with _session() as s:
+                    append_audit(
+                        s,
+                        actor="gateway",
+                        action=AuditEvent.AGENT_RESULT_RECEIVED,
+                        resource_type="delegated_run",
+                        resource_id=run.id,
+                        project_id=run.project_id,
+                        task_id=run.task_id,
+                        before={},
+                        after={"mode": self.mode.value},
+                        idempotency_key=f"audit:result:{run.id}:{new_id('k')}",
+                    )
+                    s.commit()
                 # Validate before returning (execute_task re-validates too).
                 self._validate(artifact_like, output_schema)
+                # Observability: the external result passed schema validation and
+                # may now complete the task (Contract point 6 + 10).
+                with _session() as s:
+                    append_audit(
+                        s,
+                        actor="gateway",
+                        action=AuditEvent.ARTIFACT_VALIDATED,
+                        resource_type="delegated_run",
+                        resource_id=run.id,
+                        project_id=run.project_id,
+                        task_id=run.task_id,
+                        before={},
+                        after={"schema": "passed"},
+                        idempotency_key=f"audit:validated:{run.id}:{new_id('k')}",
+                    )
+                    s.commit()
                 # Accrue budget from the actual run cost (0 if not reported).
                 self._accrue_budget(run)
                 return _to_execution_result(artifact_like, run)
@@ -320,12 +415,25 @@ class DelegatedExecutionAdapter:
             r.remote_run_id = info.get("remote_run_id")
             r.remote_status = info.get("remote_status")
             r.updated_helper() if hasattr(r, "updated_helper") else None
+            # Observability: the task was delegated to the external agent.
+            append_audit(
+                s,
+                actor="gateway",
+                action=AuditEvent.AGENT_DELEGATE,
+                resource_type="agent",
+                resource_id=self.agent.id,
+                project_id=r.project_id,
+                task_id=r.task_id,
+                before={},
+                after={"mode": self.mode.value, "remote_run_id": r.remote_run_id},
+                idempotency_key=f"audit:delegate:{r.id}:{new_id('k')}",
+            )
             s.add(r)
             s.commit()
 
     def _wait_for_completion(self, run: DelegatedRun) -> dict[str, Any]:
         """Poll until finished (callback mode would instead be pushed)."""
-        deadline = time.time() + 180  # per-delegation timeout (Contract 7)
+        deadline = time.time() + self.timeout_s  # per-agent timeout (Contract 7)
         while time.time() < deadline:
             info = self.status(delegated_run=run)
             with _session() as s:
@@ -395,7 +503,7 @@ class DelegatedExecutionAdapter:
             append_audit(
                 s,
                 actor="gateway",
-                action="delegated_run.failed",
+                action=AuditEvent.DELEGATION_FAILED,
                 resource_type="delegated_run",
                 resource_id=r.id,
                 project_id=r.project_id,
@@ -404,6 +512,7 @@ class DelegatedExecutionAdapter:
                 after={"error": error, "attempt": r.attempt},
                 idempotency_key=f"audit:run:{r.id}:failed",
             )
+            s.commit()
 
     def _validate(self, artifact_like: dict[str, Any], output_schema: dict[str, Any]) -> None:
         from jsonschema import validate
@@ -429,6 +538,45 @@ class _ExecutionResultShim:
         self.claims: list[dict[str, Any]] = []
         self.artifacts = artifact_like.get("artifacts", [])
         self._run = run  # attached so execute_task can read provenance
+
+    def model_dump(self, mode: str = "json") -> dict[str, Any]:
+        """Pydantic-compatible dump so ``execute_task`` (which calls
+        ``result.model_dump`` for the artifact checksum) works unchanged with
+        delegated adapters. Without this, real delegated runs crash in
+        ``_artifact_checksum``."""
+        return {
+            "summary": self.summary,
+            "artifacts": self.artifacts,
+            "claims": self.claims,
+        }
+
+
+def build_delegated_provenance(
+    adapter: DelegatedExecutionAdapter, run: DelegatedRun
+) -> dict[str, Any]:
+    """Assemble the immutable provenance bundle for a delegated result (Contract point 10).
+
+    Captures WHO/WHAT produced the artifact (agent id + name + delegation mode), the
+    remote run identity, usage/cost, and the run timeline — WITHOUT any secret value
+    (only the opaque ``secret_ref`` handle is carried). The resulting dict is stored on
+    ``Artifact.provenance_json`` so every delegated result is fully attributable and
+    auditable, satisfying Epic #57's "every result enters with provenance" rule.
+    """
+    return {
+        "agent_id": adapter.agent.id,
+        "agent_name": adapter.agent.name,
+        "mode": adapter.mode.value,
+        "delegated_run_id": run.id,
+        "remote_run_id": run.remote_run_id,
+        "remote_status": run.remote_status,
+        "attempt": run.attempt,
+        "cost": run.cost,
+        "usage": run.usage,
+        # Opaque handle to the external secret store — NEVER the secret value.
+        "secret_ref": run.secret_ref,
+        "submitted_at": run.submitted_at.isoformat() if run.submitted_at else None,
+        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+    }
 
 
 def _session():

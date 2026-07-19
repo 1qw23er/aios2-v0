@@ -12,9 +12,12 @@ from aios.distribution import (
     resolve_publish_gate_task,
 )
 from aios.models import (
+    AdapterType,
     Agent,
+    AgentTrustLevel,
     Artifact,
     ArtifactReviewStatus,
+    DelegationMode,
     KnowledgeCandidate,
     KnowledgeCandidateStatus,
     KnowledgeFact,
@@ -770,6 +773,149 @@ def owner_measurement_html(report: dict[str, Any]) -> str:
       <ul>{notes}</ul></details>
   </div>
   {cards_html}
+</div>
+</body>
+</html>"""
+
+
+def owner_agents_html(agents: list[Agent], *, error: str | None = None) -> str:
+    """Render the agent registry: a list of registered agents + a registration form.
+
+    Mirrors ``owner_home_html`` styling (server-rendered, no separate frontend). The
+    owner can register a new agent or enable/disable an existing one without touching
+    code or the database directly (#57, #61). Secret values are NEVER entered here —
+    only an opaque ``secret_ref`` handle.
+    """
+    error_block = ""
+    if error:
+        error_block = f'<div class="msg msg-error">{escape(error)}</div>'
+
+    rows: list[str] = []
+    for a in agents:
+        dm = a.delegation_mode.value if a.delegation_mode else "—（本地适配器）"
+        enabled_badge = (
+            '<span class="badge badge-on">启用</span>'
+            if a.enabled
+            else '<span class="badge badge-off">停用</span>'
+        )
+        toggle_label = "停用" if a.enabled else "启用"
+        toggle_value = "false" if a.enabled else "true"
+        rows.append(
+            f"""<tr>
+              <td>{escape(a.name)}</td>
+              <td>{escape(a.role)}</td>
+              <td>{escape(a.adapter_type.value)}</td>
+              <td>{escape(dm)}</td>
+              <td>{escape(a.trust_level.value)}</td>
+              <td>{enabled_badge}</td>
+              <td>{escape(a.endpoint or "—")}</td>
+              <td>
+                <form method="post" action="/owner/agents/{escape(a.id)}/toggle" class="run-form">
+                  <input type="hidden" name="enabled" value="{toggle_value}">
+                  <button type="submit" class="btn-run">{toggle_label}</button>
+                </form>
+              </td>
+            </tr>"""
+        )
+    rows_html = "\n".join(rows) if rows else '<tr><td colspan="8">暂无已注册 agent。</td></tr>'
+
+    adapter_opts = "".join(
+        f'<option value="{at.value}">{at.value}</option>' for at in AdapterType
+    )
+    mode_opts = "".join(
+        f'<option value="{dm.value}">{dm.value}</option>' for dm in DelegationMode
+    )
+    trust_opts = "".join(
+        f'<option value="{tl.value}"{" selected" if tl == AgentTrustLevel.INTERNAL else ""}>'
+        f"{tl.value}</option>"
+        for tl in AgentTrustLevel
+    )
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent 注册表 · 控制台</title>
+<style>
+  body {{ font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f5f6f8; color: #1f2329; }}
+  .wrap {{ max-width: 920px; margin: 40px auto; padding: 0 20px; }}
+  h1 {{ font-size: 22px; }}
+  .card {{ background: #fff; border-radius: 10px; padding: 24px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 20px; }}
+  label {{ display: block; font-weight: 600; margin: 14px 0 6px; }}
+  input, select, textarea {{ width: 100%; box-sizing: border-box; padding: 10px;
+                     border: 1px solid #d0d3d9; border-radius: 6px; font-size: 15px; }}
+  textarea {{ min-height: 60px; resize: vertical; }}
+  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }}
+  button {{ margin-top: 18px; width: 100%; padding: 12px; font-size: 16px;
+           background: #2f6fed; color: #fff; border: 0; border-radius: 6px;
+           cursor: pointer; }}
+  button:hover {{ background: #2559c9; }}
+  .msg {{ padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; font-size: 14px; }}
+  .msg-error {{ background: #fdecea; color: #b42318; border: 1px solid #f5c2bd; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+  th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid #eceef1; }}
+  th {{ color: #6b7280; font-weight: 600; }}
+  .badge {{ padding: 2px 8px; border-radius: 10px; font-size: 12px; }}
+  .badge-on {{ background: #e7f7ec; color: #1a7f37; }}
+  .badge-off {{ background: #f1f2f4; color: #6b7280; }}
+  .btn-run {{ width: auto; margin: 0; padding: 6px 12px; font-size: 13px; background: #2f6fed; }}
+  .hint {{ color: #6b7280; font-size: 13px; margin-top: 8px; }}
+  a {{ color: #2f6fed; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/owner">&larr; 返回控制台</a>
+  <h1>Agent 注册表</h1>
+  <div class="card">
+    <h2>已注册 Agent</h2>
+    <table>
+      <tr><th>名称</th><th>角色</th><th>适配器</th><th>委托模式</th>
+          <th>信任等级</th><th>状态</th><th>端点</th><th>操作</th></tr>
+      {rows_html}
+    </table>
+  </div>
+  <div class="card">
+    <h2>注册新 Agent</h2>
+    {error_block}
+    <form method="post" action="/owner/agents/register">
+      <div class="grid">
+        <div><label for="name">名称</label>
+          <input id="name" name="name" type="text" required placeholder="例如：Hermes"></div>
+        <div><label for="role">角色</label>
+          <input id="role" name="role" type="text" required placeholder="例如：内容岗"></div>
+        <div><label for="adapter_type">适配器类型</label>
+          <select id="adapter_type" name="adapter_type" required>{adapter_opts}</select></div>
+        <div><label for="delegation_mode">委托模式（外部 agent 必填）</label>
+          <select id="delegation_mode" name="delegation_mode">{mode_opts}</select></div>
+        <div><label for="trust_level">信任等级</label>
+          <select id="trust_level" name="trust_level">{trust_opts}</select></div>
+        <div><label for="endpoint">端点 URL</label>
+          <input id="endpoint" name="endpoint" type="text" placeholder="https://...（可选）"></div>
+        <div><label for="callback_url">回调 URL</label>
+          <input id="callback_url" name="callback_url" type="text" placeholder="https://.../callback（可选）"></div>
+        <div><label for="secret_ref">凭证引用（仅不透明句柄，如 secret://hermes-key）</label>
+          <input id="secret_ref" name="secret_ref" type="text" placeholder="secret://...（可选）"></div>
+        <div><label for="timeout_s">超时（秒）</label>
+          <input id="timeout_s" name="timeout_s" type="number" value="300" step="1"></div>
+        <div><label for="max_retries">最大重试次数</label>
+          <input id="max_retries" name="max_retries" type="number" value="3" step="1"></div>
+      </div>
+      <label for="capabilities">能力（逗号分隔，可选）</label>
+      <input id="capabilities" name="capabilities" type="text" placeholder="写作, 排版, 审核">
+      <label for="limitations">限制（逗号分隔，可选）</label>
+      <input id="limitations" name="limitations" type="text" placeholder="不支持视频生成">
+      <label style="display:inline; font-weight:400;">
+        <input type="checkbox" name="enabled" value="true" checked
+               style="width:auto; display:inline;"> 注册后启用
+      </label>
+      <button type="submit">注册 Agent</button>
+    </form>
+    <p class="hint">仅填写不透明凭证引用（secret://...），切勿粘贴真实密钥——密钥只在外部分发执行边界解析，绝不落库。</p>
+  </div>
 </div>
 </body>
 </html>"""

@@ -2,12 +2,29 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import JSON, Column
 from sqlmodel import Field, Session, SQLModel
 
 from aios.models import new_id, now_utc
+
+
+class AuditEvent(StrEnum):
+    """Canonical audit event taxonomy for the Agent Interoperability Gateway (#57).
+
+    These are the event ``action`` strings emitted across a delegated run's
+    lifecycle. They are deliberately stable, vendor-neutral strings so the
+    audit trail stays queryable regardless of which external agent ran.
+    """
+
+    AGENT_DISCOVER = "agent.discover"
+    AGENT_DELEGATE = "agent.delegate"
+    AGENT_RESULT_RECEIVED = "agent.result_received"
+    ARTIFACT_VALIDATED = "artifact.validated"
+    DELEGATION_FAILED = "delegation.failed"
+    DELEGATION_CANCELLED = "delegation.cancelled"
 
 # Dict keys whose *values* are credentials and must never be persisted.
 SECRET_KEYS = {"secret", "token", "password", "credential", "api_key", "api-key"}

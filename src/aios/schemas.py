@@ -127,3 +127,30 @@ class OrchestratorProcessResult(BaseModel):
 
     processed_events: int
     activated_task_ids: list[str]
+
+
+class AgentRegister(BaseModel):
+    """Owner registers a new agent in the DB-backed registry (#57, #61).
+
+    Only an opaque ``secret_ref`` handle is accepted — never a raw secret value.
+    """
+
+    name: str = Field(min_length=1)
+    role: str = Field(min_length=1)
+    adapter_type: str = Field(min_length=1)
+    delegation_mode: str | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    endpoint: str | None = None
+    secret_ref: str | None = None
+    callback_url: str | None = None
+    trust_level: str = "internal"
+    timeout_s: float = 300.0
+    max_retries: int = 3
+    config_ref: str | None = None
+    limitations: list[str] = Field(default_factory=list)
+    enabled: bool = True
+
+
+class AgentEnabledUpdate(BaseModel):
+    enabled: bool
+

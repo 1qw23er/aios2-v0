@@ -219,6 +219,13 @@ class Agent(SQLModel, table=True):
     trust_level: AgentTrustLevel = Field(
         default=AgentTrustLevel.INTERNAL, index=True
     )
+    # Agent Interoperability Gateway (#57): per-agent delegation tuning.
+    #  - timeout_s: per-delegation wall-clock ceiling before the run is marked
+    #    EXPIRED and retried / failed (design review v1 §6). Default 300s.
+    #  - max_retries: retry attempts on transient failure before TASK FAILED
+    #    (reuses the W1 self-heal pattern). Default 3.
+    timeout_s: float = 300.0
+    max_retries: int = 3
 
 
 class Capability(SQLModel, table=True):
