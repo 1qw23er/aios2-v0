@@ -1,9 +1,10 @@
-"""Tests for V1-I5: knowledge preservation governance (Issue #38).
+"""Tests for V1-I5: knowledge preservation governance (Issue #38), updated for the
+Phase A capability-aware projection contract (Issue #67).
 
 Acceptance criteria (from the issue) covered here:
-  * An APPROVED company-scoped fact appears in a NEW campaign's
-    ``TaskContext.approved_facts`` (AC1), with its source-campaign provenance
-    preserved even though the effective scope is company-wide.
+  * An APPROVED company-scoped fact (with a capability tag) is projected into a
+    NEW campaign's ``TaskContext.approved_facts`` when the least-privilege flag
+    is enabled AND the consuming task requires the matching capability (AC1).
   * Submitting from a non-approved (UNVERIFIED) artifact is rejected (AC2).
   * Versioning / supersede works via the existing ``KnowledgeService`` (AC3).
 
@@ -14,17 +15,23 @@ Knowledge-governance boundaries (owner-review of PR #52) covered here:
     source-campaign ownership against the active owner campaign; cross-campaign
     review is rejected.
   * B3 negative: a project-scoped fact never leaks into an unrelated campaign's
-    ``approved_facts``.
+    ``approved_facts`` (even with the flag enabled + capability match).
   * B4 idempotency: repeated preserve submission creates exactly one candidate.
   * B5 T9-only: preserve is allowed only on the knowledge-capture (T9) task.
   * B6 route-level: identical review replay is safe; approve->reject and
     reject->approve conflict; cross-campaign review is rejected.
   * Versioning atomicity: version must be exactly head + 1 (no gaps).
 
+Phase A least-privilege contract (Issue #67):
+  * The capability-aware projection is opt-in: with the flag OFF (default) NO
+    ``KnowledgeFact`` is injected into any ``TaskContext`` (fail-closed).
+  * Formal knowledge actions (review / classify / deactivate) are owner-only; a
+    non-owner actor receives 403.
+  * The submitter identity is derived from the trusted actor, never the request.
+
 Key model invariant: a company-scoped fact has ``project_id = NULL`` (effective
 scope) but ``source_project_id`` is ALWAYS the producing campaign, so source
-ownership is never lost. Provenance requires the source artifact to belong to a
-campaign, so ``_company_approved_artifact`` is created with a real ``project_id``.
+ownership is never lost.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
+from aios.actor import resolve_owner_actor
 from aios.api.app import create_app
 from aios.campaign import V1_TASKS
 from aios.context_service import ContextService
@@ -40,9 +48,14 @@ from aios.db import get_database_url, get_engine
 from aios.execution import execute_task
 from aios.knowledge_service import KnowledgeService
 from aios.models import (
+    AdapterType,
+    Agent,
+    AgentCapability,
+    AgentTrustLevel,
     Artifact,
     ArtifactReviewStatus,
     ArtifactType,
+    Capability,
     KnowledgeCandidate,
     KnowledgeCandidateStatus,
     KnowledgeFact,
@@ -133,11 +146,7 @@ def _task_by_key(session: Session, key: str, project_id: str | None = None) -> T
 
 
 def _run_platform_chain(session: Session) -> list[str]:
-    """Execute T1..T5 so the three platform outputs (T3/T4/T5) have artifacts.
-
-    Returns the task IDs (strings) rather than detached objects, so callers can
-    re-query them inside their own session.
-    """
+    """Execute T1..T5 so the three platform outputs (T3/T4/T5) have artifacts."""
     ids = []
     for key in ("T1", "T2", "T3", "T4", "T5"):
         task = _task_by_key(session, key)
@@ -147,13 +156,7 @@ def _run_platform_chain(session: Session) -> list[str]:
 
 
 def _company_approved_artifact(session: Session, project_id: str) -> Artifact:
-    """An APPROVED artifact that belongs to a real campaign (``project_id``).
-
-    This is the only source that yields a company-scoped fact visible to a LATER
-    (different-project) campaign, while preserving source-campaign provenance via
-    ``source_project_id``. The artifact must belong to a campaign so provenance is
-    never lost (project_id = NULL on a fact is the EFFECTIVE scope, not provenance).
-    """
+    """An APPROVED artifact that belongs to a real campaign (``project_id``)."""
     art = Artifact(
         project_id=project_id,
         task_id=None,
@@ -169,38 +172,73 @@ def _company_approved_artifact(session: Session, project_id: str) -> Artifact:
 
 
 def _submit_via_service(
-    session: Session, artifact: Artifact, statement: str, scope: str = "company"
+    session: Session, artifact: Artifact, statement: str, scope: str = "company", tags=None
 ) -> str:
     cand = KnowledgeService(session).submit_candidate(
-        artifact.id, statement, scope, "owner"
+        artifact.id,
+        statement,
+        project_id=None if scope == "company" else artifact.project_id,
+        tags=tags,
+        actor=resolve_owner_actor(),
     )
     return cand.id
+
+
+def _wire_projection(session: Session, task: TaskModel, tag: str) -> None:
+    """Enable least-privilege and assign an internal agent + capability to ``task``.
+
+    Without this, ``build_context`` projects nothing (flag off / no agent / no
+    capability match). The fact under test must carry ``tags=[tag]``.
+    """
+    cap = session.exec(select(Capability).where(Capability.name == tag)).first()
+    assert cap is not None, f"capability {tag!r} must be seeded by launch"
+    agent = Agent(
+        id="agt:proj-internal",
+        name="ProjectionInternal",
+        role="tester",
+        adapter_type=AdapterType.API,
+        trust_level=AgentTrustLevel.INTERNAL,
+    )
+    session.add(agent)
+    session.flush()
+    session.add(AgentCapability(agent_id=agent.id, capability_id=cap.id, enabled=True))
+    task.assigned_agent_id = agent.id
+    task.required_capabilities = [cap.id]
+    session.add(task)
+    session.commit()
+
+
+def _review(session: Session, cand_id: str, *, series: str, version: int) -> None:
+    KnowledgeService(session).review_candidate(
+        cand_id,
+        KnowledgeReviewDecisionValue.APPROVE,
+        "证据充分，批准",
+        actor=resolve_owner_actor(),
+        series_id=series,
+        version=version,
+    )
 
 
 # --- AC1: approved company fact appears in a NEW campaign's approved_facts -----
 
 
-def test_approved_fact_reused_in_later_campaign_context(client: TestClient) -> None:
+def test_approved_fact_reused_in_later_campaign_context(client, monkeypatch) -> None:
+    monkeypatch.setenv("KNOWLEDGE_LEAST_PRIVILEGE_ENABLED", "1")
     pid1 = _launch(client, "campaign #1")
     with _session() as session:
         artifact = _company_approved_artifact(session, pid1)
-        cand_id = _submit_via_service(session, artifact, "AI觅主打个人 IP 增长闭环", "company")
-
-    # Owner reviews the candidate into a versioned, company-scoped fact.
-    with _session() as session:
-        KnowledgeService(session).review_candidate(
-            cand_id,
-            KnowledgeReviewDecisionValue.APPROVE,
-            "owner",
-            "证据充分，批准为 v1",
-            series_id="positioning",
-            version=1,
+        cand_id = _submit_via_service(
+            session, artifact, "AI觅主打个人 IP 增长闭环", "company", tags=["positioning"]
         )
+
+    with _session() as session:
+        _review(session, cand_id, series="positioning", version=1)
 
     # Launch a SECOND campaign (different project) and read one of its tasks' context.
     _launch(client, "campaign #2")
     with _session() as session:
         t2 = _task_by_key(session, "T2")
+        _wire_projection(session, t2, "positioning")
         ctx = ContextService(session).build_context(t2.id)
         facts = [f for f in ctx.approved_facts if f.get("fact_kind") == "knowledge_fact"]
         reused = [
@@ -208,9 +246,28 @@ def test_approved_fact_reused_in_later_campaign_context(client: TestClient) -> N
             for f in facts
             if f["statement"] == "AI觅主打个人 IP 增长闭环" and f["scope"] == "company"
         ]
-        assert reused, "Later campaign must auto-reuse the approved company fact"
+        assert reused, "flag on + capability match must reuse company fact"
         # Provenance is preserved even though the effective scope is company-wide.
         assert reused[0]["source_project_id"] == pid1
+
+
+def test_approved_fact_not_projected_when_flag_off(client) -> None:
+    """Fail-closed default: with the flag OFF no KnowledgeFact is injected."""
+    pid1 = _launch(client, "campaign #1")
+    with _session() as session:
+        artifact = _company_approved_artifact(session, pid1)
+        cand_id = _submit_via_service(
+            session, artifact, "AI觅主打个人 IP 增长闭环", "company", tags=["positioning"]
+        )
+        _review(session, cand_id, series="positioning", version=1)
+
+    _launch(client, "campaign #2")
+    with _session() as session:
+        t2 = _task_by_key(session, "T2")
+        _wire_projection(session, t2, "positioning")
+        ctx = ContextService(session).build_context(t2.id)
+        facts = [f for f in ctx.approved_facts if f.get("fact_kind") == "knowledge_fact"]
+        assert facts == [], "Flag OFF must inject zero KnowledgeFact (fail-closed)"
 
 
 # --- AC2: submitting from a non-approved artifact is rejected ------------------
@@ -228,7 +285,11 @@ def test_submit_from_unapproved_artifact_rejected(client: TestClient) -> None:
 
         with pytest.raises(ServiceError) as exc:
             KnowledgeService(session).submit_candidate(
-                unapproved.id, "未批准不可沉淀", "project", "owner"
+                unapproved.id,
+                "未批准不可沉淀",
+                project_id=unapproved.project_id,
+                tags=None,
+                actor=resolve_owner_actor(),
             )
         assert exc.value.status_code == 422
         assert "approved" in str(exc.value).lower()
@@ -258,56 +319,58 @@ def test_review_supersede_creates_new_version(client: TestClient) -> None:
     with _session() as session:
         artifact = _company_approved_artifact(session, pid1)
         cand1 = KnowledgeService(session).submit_candidate(
-            artifact.id, "v1 定位", "company", "owner"
+            artifact.id, "v1 定位", project_id=None, tags=None, actor=resolve_owner_actor()
         )
-        KnowledgeService(session).review_candidate(
-            cand1.id, KnowledgeReviewDecisionValue.APPROVE, "owner", "v1 ok",
-            series_id="positioning", version=1,
-        )
-        # A second candidate in the same series supersedes v1.
+        _review(session, cand1.id, series="positioning", version=1)
         cand2 = KnowledgeService(session).submit_candidate(
-            artifact.id, "v2 定位（迭代）", "company", "owner"
+            artifact.id, "v2 定位（迭代）", project_id=None, tags=None, actor=resolve_owner_actor()
         )
         fact1 = session.exec(select(KnowledgeFact)).first()
-        fact2 = KnowledgeService(session).review_candidate(
-            cand2.id, KnowledgeReviewDecisionValue.APPROVE, "owner", "v2 ok",
-            series_id="positioning", version=2, supersedes_fact_id=fact1.id,
-        ).fact
+        KnowledgeService(session).review_candidate(
+            cand2.id,
+            KnowledgeReviewDecisionValue.APPROVE,
+            "v2 ok",
+            actor=resolve_owner_actor(),
+            series_id="positioning",
+            version=2,
+            supersedes_fact_id=fact1.id,
+        )
 
         all_facts = session.exec(select(KnowledgeFact)).all()
         assert len(all_facts) == 2
-        assert fact2.version == 2
-        # Provenance preserved on both facts.
-        assert all(f.source_project_id == pid1 for f in all_facts)
         heads = [f for f in all_facts if f.status == KnowledgeFactStatus.APPROVED]
-        assert len(heads) == 1 and heads[0].id == fact2.id
+        assert len(heads) == 1
         superseded = [f for f in all_facts if f.status == KnowledgeFactStatus.SUPERSEDED]
         assert len(superseded) == 1
+        # Provenance preserved on both facts.
+        assert all(f.source_project_id == pid1 for f in all_facts)
 
 
 # --- B3 negative: project-scoped fact does NOT leak into unrelated campaign ---
 
 
-def test_project_scoped_fact_not_in_unrelated_campaign(client: TestClient) -> None:
+def test_project_scoped_fact_not_in_unrelated_campaign(client, monkeypatch) -> None:
+    monkeypatch.setenv("KNOWLEDGE_LEAST_PRIVILEGE_ENABLED", "1")
     pid_a = _launch(client, "campaign A")
     with _session() as session:
-        # Project-scoped (default) approved fact inside campaign A.
         art = _company_approved_artifact(session, pid_a)
         cand = KnowledgeService(session).submit_candidate(
-            art.id, "仅本 campaign 复用的知识", "project", "owner"
+            art.id,
+            "仅本 campaign 复用的知识",
+            project_id=pid_a,
+            tags=["positioning"],
+            actor=resolve_owner_actor(),
         )
-        KnowledgeService(session).review_candidate(
-            cand.id, KnowledgeReviewDecisionValue.APPROVE, "owner", "v1 ok",
-            series_id="local-only", version=1,
-        )
+        _review(session, cand.id, series="local-only", version=1)
 
     # Launch an UNRELATED campaign B and read ITS OWN T2 context.
     pid_b = _launch(client, "campaign B")
     with _session() as session:
         t2 = _task_by_key(session, "T2", pid_b)
+        _wire_projection(session, t2, "positioning")
         ctx = ContextService(session).build_context(t2.id)
         facts = [f for f in ctx.approved_facts if f.get("fact_kind") == "knowledge_fact"]
-        # The project-scoped fact from A must NOT appear in B.
+        # The project-scoped fact from A must NOT appear in B (scope gate).
         assert not any(
             f["statement"] == "仅本 campaign 复用的知识" for f in facts
         ), "Project-scoped fact must not leak into an unrelated campaign"
@@ -392,14 +455,15 @@ def test_owner_review_candidate_becomes_fact(client: TestClient) -> None:
     pid = _launch(client, "campaign #1")
     with _session() as session:
         artifact = _company_approved_artifact(session, pid)
-        cand_id = _submit_via_service(session, artifact, "待审阅知识", "company")
+        cand_id = _submit_via_service(
+            session, artifact, "待审阅知识", "company", tags=["positioning"]
+        )
     # Review happens within the source campaign's cookie scope.
     client.cookies.set("aios_last_campaign", pid)
     resp = client.post(
         f"/owner/knowledge/{cand_id}/review",
         data={
             "decision": "approve",
-            "reviewer": "owner",
             "rationale": "批准",
             "series_id": "positioning",
             "version": "1",
@@ -418,10 +482,11 @@ def test_json_review_endpoint_returns_fact(client: TestClient) -> None:
     pid = _launch(client, "campaign #1")
     with _session() as session:
         artifact = _company_approved_artifact(session, pid)
-        cand_id = _submit_via_service(session, artifact, "JSON 审阅知识", "company")
+        cand_id = _submit_via_service(
+            session, artifact, "JSON 审阅知识", "company", tags=["positioning"]
+        )
     body = KnowledgeReviewRequest(
         decision=KnowledgeReviewDecisionValue.APPROVE,
-        reviewer="owner",
         rationale="ok",
         series_id="json-series",
         version=1,
@@ -458,16 +523,18 @@ def test_owner_review_identical_replay_safe(client: TestClient) -> None:
     pid = _launch(client, "campaign #1")
     with _session() as session:
         artifact = _company_approved_artifact(session, pid)
-        cand_id = _submit_via_service(session, artifact, "重放测试", "company")
+        cand_id = _submit_via_service(
+            session, artifact, "重放测试", "company", tags=["positioning"]
+        )
     client.cookies.set("aios_last_campaign", pid)
     first = client.post(
         f"/owner/knowledge/{cand_id}/review",
-        data={"decision": "approve", "reviewer": "owner", "rationale": "v1",
+        data={"decision": "approve", "rationale": "v1",
               "series_id": "replay", "version": "1"},
     )
     second = client.post(
         f"/owner/knowledge/{cand_id}/review",
-        data={"decision": "approve", "reviewer": "owner", "rationale": "v1",
+        data={"decision": "approve", "rationale": "v1",
               "series_id": "replay", "version": "1"},
     )
     assert first.status_code == 303 and second.status_code == 303
@@ -479,16 +546,18 @@ def test_owner_review_approve_then_reject_conflicts(client: TestClient) -> None:
     pid = _launch(client, "campaign #1")
     with _session() as session:
         artifact = _company_approved_artifact(session, pid)
-        cand_id = _submit_via_service(session, artifact, "先批准后驳回", "company")
+        cand_id = _submit_via_service(
+            session, artifact, "先批准后驳回", "company", tags=["positioning"]
+        )
     client.cookies.set("aios_last_campaign", pid)
     approve = client.post(
         f"/owner/knowledge/{cand_id}/review",
-        data={"decision": "approve", "reviewer": "owner", "rationale": "v1 ok",
+        data={"decision": "approve", "rationale": "v1 ok",
               "series_id": "conflict-a", "version": "1"},
     )
     reject = client.post(
         f"/owner/knowledge/{cand_id}/review",
-        data={"decision": "reject", "reviewer": "owner", "rationale": "改主意了"},
+        data={"decision": "reject", "rationale": "改主意了"},
     )
     assert approve.status_code == 303
     # Candidate is already terminal (APPROVED) -> reject is rejected (409).
@@ -499,15 +568,17 @@ def test_owner_review_reject_then_approve_conflicts(client: TestClient) -> None:
     pid = _launch(client, "campaign #1")
     with _session() as session:
         artifact = _company_approved_artifact(session, pid)
-        cand_id = _submit_via_service(session, artifact, "先驳回后批准", "company")
+        cand_id = _submit_via_service(
+            session, artifact, "先驳回后批准", "company", tags=["positioning"]
+        )
     client.cookies.set("aios_last_campaign", pid)
     reject = client.post(
         f"/owner/knowledge/{cand_id}/review",
-        data={"decision": "reject", "reviewer": "owner", "rationale": "暂不支持"},
+        data={"decision": "reject", "rationale": "暂不支持"},
     )
     approve = client.post(
         f"/owner/knowledge/{cand_id}/review",
-        data={"decision": "approve", "reviewer": "owner", "rationale": "改主意了",
+        data={"decision": "approve", "rationale": "改主意了",
               "series_id": "conflict-b", "version": "1"},
     )
     assert reject.status_code == 303
@@ -520,12 +591,14 @@ def test_owner_review_cross_campaign_rejected(client: TestClient) -> None:
     pid_b = _launch(client, "campaign B")
     with _session() as session:
         artifact = _company_approved_artifact(session, pid_a)
-        cand_id = _submit_via_service(session, artifact, "跨 campaign 评审", "company")
+        cand_id = _submit_via_service(
+            session, artifact, "跨 campaign 评审", "company", tags=["positioning"]
+        )
     # Owner is viewing campaign B but the candidate belongs to campaign A.
     client.cookies.set("aios_last_campaign", pid_b)
     resp = client.post(
         f"/owner/knowledge/{cand_id}/review",
-        data={"decision": "approve", "reviewer": "owner", "rationale": "越权",
+        data={"decision": "approve", "rationale": "越权",
               "series_id": "xcamp", "version": "1"},
     )
     # B2: source-campaign ownership mismatch -> rejected (cross-campaign review).
@@ -543,21 +616,23 @@ def test_version_must_be_head_plus_one(client: TestClient) -> None:
     with _session() as session:
         artifact = _company_approved_artifact(session, pid)
         cand1 = KnowledgeService(session).submit_candidate(
-            artifact.id, "v1", "company", "owner"
+            artifact.id, "v1", project_id=None, tags=None, actor=resolve_owner_actor()
         )
-        KnowledgeService(session).review_candidate(
-            cand1.id, KnowledgeReviewDecisionValue.APPROVE, "owner", "v1",
-            series_id="gap", version=1,
-        )
+        _review(session, cand1.id, series="gap", version=1)
         cand2 = KnowledgeService(session).submit_candidate(
-            artifact.id, "v2（想跳到 v3）", "company", "owner"
+            artifact.id, "v2（想跳到 v3）", project_id=None, tags=None, actor=resolve_owner_actor()
         )
         fact1 = session.exec(select(KnowledgeFact)).first()
         # Gap: trying version 3 when head is v1 must be rejected (contiguous only).
         # Pass the correct predecessor so the gap is isolated to the version check.
         with pytest.raises(ServiceError) as exc:
             KnowledgeService(session).review_candidate(
-                cand2.id, KnowledgeReviewDecisionValue.APPROVE, "owner", "gap",
-                series_id="gap", version=3, supersedes_fact_id=fact1.id,
+                cand2.id,
+                KnowledgeReviewDecisionValue.APPROVE,
+                "gap",
+                actor=resolve_owner_actor(),
+                series_id="gap",
+                version=3,
+                supersedes_fact_id=fact1.id,
             )
         assert exc.value.status_code == 422

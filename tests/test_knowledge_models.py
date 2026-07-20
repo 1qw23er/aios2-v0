@@ -26,12 +26,16 @@ def test_knowledge_model_defaults_and_provenance() -> None:
         artifact_id="art_one",
         project_id="prj_one",
         statement="Reviewed statement",
-        submitted_by="human",
+        submitted_by_kind="owner",
+        submitted_by_owner_id="owner",
+        submitted_by="owner:owner",
     )
     decision = KnowledgeReviewDecision(
         candidate_id=candidate.id,
         decision=KnowledgeReviewDecisionValue.APPROVE,
-        reviewer="reviewer",
+        reviewer_kind="owner",
+        reviewer_owner_id="owner",
+        reviewer="owner:owner",
         rationale="Verified source",
     )
     fact = KnowledgeFact(
@@ -66,7 +70,9 @@ def _approved_candidate(session: Session) -> KnowledgeCandidate:
         project_id=project.id,
         source_project_id=project.id,
         statement="S",
-        submitted_by="human",
+        submitted_by_kind="owner",
+        submitted_by_owner_id="owner",
+        submitted_by="owner:owner",
     )
     session.add(candidate)
     session.flush()
@@ -92,13 +98,17 @@ def test_unique_terminal_review_is_database_enforced(tmp_path: Path) -> None:
                 KnowledgeReviewDecision(
                     candidate_id=candidate.id,
                     decision=KnowledgeReviewDecisionValue.APPROVE,
-                    reviewer="a",
+                    reviewer_kind="owner",
+                    reviewer_owner_id="owner",
+                    reviewer="owner:owner",
                     rationale="r",
                 ),
                 KnowledgeReviewDecision(
                     candidate_id=candidate.id,
                     decision=KnowledgeReviewDecisionValue.REJECT,
-                    reviewer="b",
+                    reviewer_kind="owner",
+                    reviewer_owner_id="owner",
+                    reviewer="owner:owner",
                     rationale="r",
                 ),
             ]
@@ -136,8 +146,9 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
         assert "knowledge_fact" not in tables
     command.upgrade(config, "head")
     # Head advanced past the Alpha-3 knowledge layer by the Agent Interop
-    # Gateway work (#57 / #104 / #57-slices) and the Independent Review Protocol
-    # (#64): 20260719_0001 + 20260719_0002 + 20260719_0003 + 20260719_0004. The
-    # round-trip mechanics above already prove the knowledge migrations; this
-    # final step only confirms we can return to the current head.
-    assert revision() == "20260719_0004"
+    # Gateway work (#57 / #104 / #57-slices): 20260719_0001 + 20260719_0002 +
+    # 20260719_0003, Independent Review Protocol (#64): 20260719_0004, and the
+    # Phase A knowledge-tags slice (#67): 20260720_0005. The round-trip
+    # mechanics above already prove the knowledge migrations; this final step
+    # only confirms we can return to the current head.
+    assert revision() == "20260720_0005"

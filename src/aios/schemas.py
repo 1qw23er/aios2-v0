@@ -59,31 +59,46 @@ class RevisionRequest(BaseModel):
 class KnowledgeCandidateCreate(BaseModel):
     """Owner submits a reusable knowledge candidate from an APPROVED source artifact.
 
-    Mirrors ``KnowledgeService.submit_candidate``; ``scope`` is "project" (reusable
-    only inside the source campaign) or "company" (reusable by every campaign). The
-    source-campaign provenance is recorded by the service; this schema only carries
-    the owner's effective-scope choice.
+    Mirrors ``KnowledgeService.submit_candidate``. ``scope`` is "project" (reusable
+    only inside the source campaign) or "company" (reusable by every campaign); it
+    selects the effective ``project_id`` the service records. The submitter identity
+    is NEVER taken from the request -- it is always derived from the trusted owner
+    actor. ``tags`` is the optional initial capability classification (canonical
+    tags only); if omitted the candidate carries the legacy sentinel until the owner
+    classifies it.
     """
 
     artifact_id: str = Field(min_length=1)
     statement: str = Field(min_length=1)
     scope: str = "project"
+    tags: list[str] | None = None
 
 
 class KnowledgeReviewRequest(BaseModel):
     """Owner review of a knowledge candidate -> versioned ``KnowledgeFact``.
 
-    Mirrors ``KnowledgeService.review_candidate``. ``series_id``/``version`` are
-    required only on APPROVE (the service enforces positive version + series scoping);
-    REJECT needs only ``decision`` + ``rationale``.
+    Mirrors ``KnowledgeService.review_candidate``. The reviewer identity is NEVER
+    taken from the request -- it is always derived from the trusted owner actor.
+    ``series_id``/``version`` are required only on APPROVE (the service enforces
+    positive version + series scoping); REJECT needs only ``decision`` + ``rationale``.
     """
 
     decision: KnowledgeReviewDecisionValue
-    reviewer: str = Field(min_length=1)
     rationale: str = Field(min_length=1)
     series_id: str | None = None
     version: int | None = None
     supersedes_fact_id: str | None = None
+
+
+class KnowledgeClassifyRequest(BaseModel):
+    """Owner-only classification of a legacy sentinel candidate/fact -> canonical tags.
+
+    The owner supplies the canonical capability tags; the service enforces the
+    one-time sentinel -> canonical transition and rejects any already-classified
+    target.
+    """
+
+    tags: list[str] = Field(min_length=1)
 
 
 class ArtifactReviewUpdate(BaseModel):

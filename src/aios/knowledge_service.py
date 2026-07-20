@@ -5,7 +5,13 @@ from dataclasses import dataclass
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import Session, select
 
+from aios.actor import ActorContext
 from aios.audit import append_audit
+from aios.knowledge_tags import (
+    LEGACY_UNCLASSIFIED,
+    is_legacy_unclassified,
+    normalize_tags,
+)
 from aios.models import (
     Artifact,
     ArtifactReviewStatus,
@@ -33,6 +39,19 @@ def _required(value: str, field: str) -> str:
     return normalized
 
 
+def _assert_knowledge_owner_actor(actor: ActorContext) -> None:
+    """Formal knowledge actions are owner-only.
+
+    ``ActorContext(kind="system")`` may NOT manufacture owner approval: a system
+    actor receives 403 here exactly like an agent actor. The only path that lets
+    a non-owner identity mutate knowledge is a future, separately-reviewed slice
+    that supplies an existing immutable owner Approval / KnowledgeReviewDecision
+    reference -- out of scope for Phase A.
+    """
+    if actor.kind != "owner" or not actor.owner_id:
+        raise ServiceError(403, "knowledge formal actions require owner identity")
+
+
 class KnowledgeService:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -41,23 +60,23 @@ class KnowledgeService:
         self,
         artifact_id: str,
         statement: str,
-        scope: str,
-        submitted_by: str,
+        *,
+        project_id: str | None,
+        tags: list[str] | None,
+        actor: ActorContext,
     ) -> KnowledgeCandidate:
         """Preserve a knowledge candidate from an APPROVED artifact.
 
-        ``scope`` is "project" (reusable only inside the source campaign) or
-        "company" (reusable by every campaign). The source-campaign provenance is
-        ALWAYS recorded in ``source_project_id`` (the artifact's campaign) so that
-        source ownership can be enforced even for company-scoped facts.
+        ``project_id`` is the single source of truth for scope: ``None`` =>
+        company-wide, any value => project-scoped (must equal the source
+        campaign). The legacy free-text ``scope`` / ``submitted_by`` strings are
+        gone -- scope is derived from ``project_id`` and the submitter identity
+        is derived from the trusted ``actor``.
 
         Idempotent: a repeated submission with the same artifact + statement
         returns the existing candidate instead of creating a duplicate.
         """
-        if scope not in ("project", "company"):
-            raise ServiceError(422, "scope must be 'project' or 'company'")
         statement = _required(statement, "statement")
-        submitted_by = _required(submitted_by, "submitted_by")
         artifact = self.session.get(Artifact, artifact_id)
         if artifact is None:
             raise ServiceError(404, "Source Artifact not found")
@@ -68,10 +87,17 @@ class KnowledgeService:
                 422,
                 "Source Artifact must belong to a campaign to preserve knowledge",
             )
-        # Provenance is the artifact's campaign -- never lost, even for company scope.
         source_project_id = artifact.project_id
         # Effective scope: NULL (company-wide) or the source campaign (project-local).
-        project_id = None if scope == "company" else artifact.project_id
+        if project_id is None:
+            effective_project_id: str | None = None
+        else:
+            if project_id != source_project_id:
+                raise ServiceError(
+                    422,
+                    "project-scoped candidate must match its source campaign",
+                )
+            effective_project_id = project_id
 
         # Idempotency: same artifact + statement -> exactly one candidate.
         existing = self.session.exec(
@@ -83,12 +109,17 @@ class KnowledgeService:
         if existing is not None:
             return existing
 
+        normalized_tags = normalize_tags(tags)
         candidate = KnowledgeCandidate(
             artifact_id=artifact.id,
-            project_id=project_id,
+            project_id=effective_project_id,
             source_project_id=source_project_id,
             statement=statement,
-            submitted_by=submitted_by,
+            tags=normalized_tags,
+            submitted_by_kind=actor.kind,
+            submitted_by_owner_id=actor.owner_id if actor.kind == "owner" else None,
+            submitted_by_agent_id=actor.agent_id if actor.kind == "agent" else None,
+            submitted_by=actor.derive_submitted_by(),
         )
         try:
             self.session.add(candidate)
@@ -105,10 +136,12 @@ class KnowledgeService:
                 after={
                     "candidate_id": candidate.id,
                     "artifact_id": artifact.id,
-                    "scope": "company" if project_id is None else "project",
-                    "project_id": project_id,
+                    "scope": "company" if effective_project_id is None else "project",
+                    "project_id": effective_project_id,
                     "source_project_id": source_project_id,
                     "status": candidate.status.value,
+                    "submitted_by_kind": candidate.submitted_by_kind,
+                    "tags": normalized_tags,
                 },
                 idempotency_key=f"audit:knowledge:candidate:{candidate.id}:created",
             )
@@ -147,9 +180,9 @@ class KnowledgeService:
         self,
         candidate_id: str,
         decision: KnowledgeReviewDecisionValue,
-        reviewer: str,
         rationale: str,
         *,
+        actor: ActorContext,
         series_id: str | None = None,
         version: int | None = None,
         supersedes_fact_id: str | None = None,
@@ -158,11 +191,16 @@ class KnowledgeService:
             decision = KnowledgeReviewDecisionValue(decision)
         except ValueError as exc:
             raise ServiceError(422, "Review decision is invalid") from exc
-        reviewer = _required(reviewer, "reviewer")
         rationale = _required(rationale, "rationale")
+        _assert_knowledge_owner_actor(actor)
         candidate = self.session.get(KnowledgeCandidate, candidate_id)
         if candidate is None:
             raise ServiceError(404, "Knowledge candidate not found")
+        # A candidate still carrying the legacy sentinel cannot be reviewed: it
+        # must first be classified by the owner (classify_candidate_tags).
+        if is_legacy_unclassified(candidate.tags):
+            raise ServiceError(422, "candidate must be classified before review")
+        reviewer = actor.derive_reviewer()
         replay = self._review_replay(
             candidate,
             decision,
@@ -184,6 +222,9 @@ class KnowledgeService:
         review = KnowledgeReviewDecision(
             candidate_id=candidate.id,
             decision=decision,
+            reviewer_kind=actor.kind,
+            reviewer_owner_id=actor.owner_id if actor.kind == "owner" else None,
+            reviewer_agent_id=actor.agent_id if actor.kind == "agent" else None,
             reviewer=reviewer,
             rationale=rationale,
         )
@@ -265,6 +306,7 @@ class KnowledgeService:
                 after={
                     "status": candidate.status.value,
                     "review_decision_id": review.id,
+                    "reviewer_kind": review.reviewer_kind,
                     "rationale": review.rationale,
                 },
                 idempotency_key=f"audit:knowledge:candidate:{candidate.id}:rejected",
@@ -316,6 +358,9 @@ class KnowledgeService:
             project_id=candidate.project_id,
             source_project_id=candidate.source_project_id,
             statement=candidate.statement,
+            # Fact tags are copied from the (already classified) candidate and are
+            # then immutable except for the one-time sentinel -> canonical fix.
+            tags=list(candidate.tags),
             source_candidate_id=candidate.id,
             source_artifact_id=candidate.artifact_id,
             review_decision_id=review.id,
@@ -351,6 +396,8 @@ class KnowledgeService:
                     "scope": "company" if fact.project_id is None else "project",
                     "project_id": fact.project_id,
                     "supersedes_fact_id": supersedes_fact_id,
+                    "reviewer_kind": review.reviewer_kind,
+                    "tags": fact.tags,
                     "rationale": review.rationale,
                 },
                 idempotency_key=f"audit:knowledge:fact:{fact.id}:approved",
@@ -366,8 +413,10 @@ class KnowledgeService:
         self.session.refresh(fact)
         return KnowledgeReviewResult(review, fact)
 
-    def deactivate_fact(self, fact_id: str, actor: str, rationale: str) -> KnowledgeFact:
-        actor = _required(actor, "actor")
+    def deactivate_fact(
+        self, fact_id: str, rationale: str, *, actor: ActorContext
+    ) -> KnowledgeFact:
+        _assert_knowledge_owner_actor(actor)
         rationale = _required(rationale, "rationale")
         fact = self.session.get(KnowledgeFact, fact_id)
         if fact is None:
@@ -381,14 +430,18 @@ class KnowledgeService:
             self.session.flush()
             append_audit(
                 self.session,
-                actor=actor,
+                actor=actor.derive_reviewer(),
                 action="knowledge.fact.deactivated",
                 resource_type="knowledge_fact",
                 resource_id=fact.id,
                 project_id=fact.project_id,
                 task_id=None,
                 before={"status": KnowledgeFactStatus.APPROVED.value},
-                after={"status": fact.status.value, "rationale": rationale},
+                after={
+                    "status": fact.status.value,
+                    "reviewer_kind": actor.kind,
+                    "rationale": rationale,
+                },
                 idempotency_key=f"audit:knowledge:fact:{fact.id}:deactivated",
             )
             self.session.commit()
@@ -397,3 +450,96 @@ class KnowledgeService:
             raise
         self.session.refresh(fact)
         return fact
+
+    def classify_knowledge(
+        self, fact_id: str, tags: list[str], *, actor: ActorContext
+    ) -> KnowledgeFact:
+        """Owner-only: promote a legacy sentinel fact to canonical tags once.
+
+        The only allowed tag transition is ``["__legacy_unclassified__"]`` ->
+        canonical tags. Any other (already-classified, or canonical -> canonical)
+        fact is rejected -- fact tags are otherwise immutable.
+        """
+        _assert_knowledge_owner_actor(actor)
+        fact = self.session.get(KnowledgeFact, fact_id)
+        if fact is None:
+            raise ServiceError(404, "Knowledge fact not found")
+        if not is_legacy_unclassified(fact.tags):
+            raise ServiceError(
+                409, "fact is already classified or not eligible for classification"
+            )
+        normalized = normalize_tags(tags)
+        fact.tags = normalized
+        fact.updated_at = now_utc()
+        try:
+            self.session.add(fact)
+            self.session.flush()
+            append_audit(
+                self.session,
+                actor=actor.derive_reviewer(),
+                action="knowledge.fact.classified",
+                resource_type="knowledge_fact",
+                resource_id=fact.id,
+                project_id=fact.project_id,
+                task_id=None,
+                before={"tags": [LEGACY_UNCLASSIFIED]},
+                after={
+                    "tags": normalized,
+                    "reviewer_kind": actor.kind,
+                },
+                idempotency_key=f"audit:knowledge:fact:{fact.id}:classified",
+            )
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        self.session.refresh(fact)
+        return fact
+
+    def classify_candidate_tags(
+        self, candidate_id: str, tags: list[str], *, actor: ActorContext
+    ) -> KnowledgeCandidate:
+        """Owner-only: promote a legacy DRAFT sentinel candidate to canonical tags once.
+
+        Eligibility: ``status == DRAFT`` and ``tags == ["__legacy_unclassified__"]``.
+        The only allowed transition is sentinel -> canonical; anything else (a
+        non-DRAFT candidate, a candidate that is already classified, or a second
+        classification) is rejected.
+        """
+        _assert_knowledge_owner_actor(actor)
+        candidate = self.session.get(KnowledgeCandidate, candidate_id)
+        if candidate is None:
+            raise ServiceError(404, "Knowledge candidate not found")
+        if candidate.status != KnowledgeCandidateStatus.DRAFT:
+            raise ServiceError(409, "only a DRAFT candidate can be classified")
+        if not is_legacy_unclassified(candidate.tags):
+            raise ServiceError(
+                409, "candidate is already classified or not eligible for classification"
+            )
+        normalized = normalize_tags(tags)
+        candidate.tags = normalized
+        candidate.updated_at = now_utc()
+        try:
+            self.session.add(candidate)
+            self.session.flush()
+            append_audit(
+                self.session,
+                actor=actor.derive_reviewer(),
+                action="knowledge.candidate.classified",
+                resource_type="knowledge_candidate",
+                resource_id=candidate.id,
+                project_id=candidate.project_id,
+                task_id=None,
+                before={"tags": [LEGACY_UNCLASSIFIED]},
+                after={
+                    "tags": normalized,
+                    "reviewer_kind": actor.kind,
+                },
+                idempotency_key=f"audit:knowledge:candidate:{candidate.id}:classified",
+            )
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        self.session.refresh(candidate)
+        return candidate

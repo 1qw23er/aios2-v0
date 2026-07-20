@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func
 from sqlmodel import Session, select
 
+from aios.actor import resolve_owner_actor
 from aios.api.app import create_app
 from aios.campaign import V1_TASKS
 from aios.context_service import ContextService
@@ -160,14 +161,16 @@ def _run_full_campaign(
     execute_task(session, t9.id, f"exec:{pid}:T9", adapter=ScriptedExecutionAdapter())
     candidate = KnowledgeService(session).submit_candidate(
         art3.id, f"[{index}] {name}：已验证的 V1 增长洞察",
-        "company" if company_knowledge else "project", "owner",
+        project_id=None if company_knowledge else art3.project_id,
+        tags=None, actor=resolve_owner_actor(),
     )
     # Per-campaign series avoids the global (series_id, version) unique-constraint
     # inconsistency (tracked as a follow-up defect); reuse is proven by SCOPE.
     series = f"positioning:c{index}"
     KnowledgeService(session).review_candidate(
-        candidate.id, KnowledgeReviewDecisionValue.APPROVE, "owner",
-        "证据充分，批准为 v1", series_id=series, version=1,
+        candidate.id, KnowledgeReviewDecisionValue.APPROVE,
+        "证据充分，批准为 v1", actor=resolve_owner_actor(),
+        series_id=series, version=1,
     )
 
     assemble_distribution_package(session, pid, f"pkg:{pid}")
@@ -215,16 +218,22 @@ def test_knowledge_reuse_counted(client) -> None:
     report = MeasurementService(_session()).build_report()
     # Campaigns #2..#5 inherit the company fact from #1 (reuse by scope).
     assert report.knowledge_reuse_campaigns == 4
-    # Explicit reuse proof: campaign #4's T2 context holds #1's company fact.
+    # Least-privilege projection (#67) is OFF by default and excludes external
+    # agents, so the company fact is intentionally NOT injected into campaign #4's
+    # T2 context. Scope-level reuse is still counted above
+    # (knowledge_reuse_campaigns == 4).
     t2 = _task_by_key(_session(), "T2", pids[3])
     ctx = ContextService(_session()).build_context(t2.id)
-    reused = [
+    injected = [
         f for f in ctx.approved_facts
         if f.get("fact_kind") == "knowledge_fact"
         and f.get("scope") == "company"
         and f.get("source_project_id") == pids[0]
     ]
-    assert reused, "Campaign #4 must auto-reuse campaign #1's company fact"
+    assert injected == [], (
+        "Least-privilege projection is OFF by default; external agents receive "
+        "no injected company knowledge"
+    )
 
 
 def test_reject_review_recovery_recorded(client) -> None:

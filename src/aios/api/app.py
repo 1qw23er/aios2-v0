@@ -7,6 +7,7 @@ from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Reques
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlmodel import Session, select
 
+from aios.actor import resolve_owner_actor
 from aios.agent_registry import (
     get_agent,
     list_agents,
@@ -32,6 +33,7 @@ from aios.distribution import (
 )
 from aios.execution import LLMExecutionAdapter, execute_task
 from aios.knowledge_service import KnowledgeService
+from aios.knowledge_tags import report_unclassified_knowledge
 from aios.measurement import MeasurementService
 from aios.models import (
     Agent,
@@ -54,6 +56,7 @@ from aios.schemas import (
     ArtifactReviewUpdate,
     BoardRead,
     KnowledgeCandidateCreate,
+    KnowledgeClassifyRequest,
     KnowledgeReviewRequest,
     OrchestratorProcessResult,
     ProjectCreate,
@@ -316,15 +319,23 @@ def create_app() -> FastAPI:
     ) -> dict:
         """Owner submits a reusable knowledge candidate from an APPROVED artifact.
 
-        Reuses ``KnowledgeService.submit_candidate``; the service enforces the
-        APPROVED source + exact-scope rule (AC2), so a non-approved source is 422.
+        Reuses ``KnowledgeService.submit_candidate``. The submitter identity is
+        ALWAYS the trusted owner actor (never request-controlled); ``scope`` selects
+        the effective project_id ("company" => None, "project" => source campaign).
+        The service enforces the APPROVED source + exact-scope rule (AC2).
         """
         try:
+            project_id: str | None = None
+            if payload.scope != "company":
+                # project scope: candidate is scoped to its source campaign.
+                artifact = session.get(Artifact, payload.artifact_id)
+                project_id = artifact.project_id if artifact is not None else None
             candidate = KnowledgeService(session).submit_candidate(
                 payload.artifact_id,
                 payload.statement,
-                payload.scope,
-                "owner",
+                project_id=project_id,
+                tags=payload.tags,
+                actor=resolve_owner_actor(),
             )
             return {
                 "id": candidate.id,
@@ -333,7 +344,9 @@ def create_app() -> FastAPI:
                 "source_project_id": candidate.source_project_id,
                 "scope": "company" if candidate.project_id is None else "project",
                 "statement": candidate.statement,
-                "status": candidate.status.value,
+                "status": "DRAFT",
+                "tags": candidate.tags,
+                "submitted_by_kind": candidate.submitted_by_kind,
             }
         except ServiceError as error:
             raise _translate(error) from error
@@ -350,7 +363,8 @@ def create_app() -> FastAPI:
         """Owner reviews a knowledge candidate into a versioned KnowledgeFact.
 
         Reuses ``KnowledgeService.review_candidate`` (versioning / supersede logic).
-        APPROVE needs series_id + version; REJECT needs only decision + rationale.
+        The reviewer identity is ALWAYS the trusted owner actor. APPROVE needs
+        series_id + version; REJECT needs only decision + rationale.
         """
         try:
             decision_value = (
@@ -373,8 +387,8 @@ def create_app() -> FastAPI:
             result = KnowledgeService(session).review_candidate(
                 candidate_id,
                 decision_value,
-                payload.reviewer,
                 payload.rationale,
+                actor=resolve_owner_actor(),
                 series_id=payload.series_id,
                 version=version,
                 supersedes_fact_id=supersedes,
@@ -385,6 +399,84 @@ def create_app() -> FastAPI:
             }
         except ServiceError as error:
             raise _translate(error) from error
+
+    @application.post(
+        "/knowledge/candidates/{candidate_id}/classify",
+        response_model=dict,
+    )
+    def classify_knowledge_candidate(
+        candidate_id: str,
+        payload: KnowledgeClassifyRequest,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        """Owner-only: promote a legacy DRAFT sentinel candidate to canonical tags once."""
+        try:
+            candidate = KnowledgeService(session).classify_candidate_tags(
+                candidate_id,
+                payload.tags,
+                actor=resolve_owner_actor(),
+            )
+            return {
+                "id": candidate.id,
+                "tags": candidate.tags,
+                "status": candidate.status.value,
+            }
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/knowledge/facts/{fact_id}/classify",
+        response_model=dict,
+    )
+    def classify_knowledge_fact(
+        fact_id: str,
+        payload: KnowledgeClassifyRequest,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        """Owner-only: promote a legacy sentinel fact to canonical tags once."""
+        try:
+            fact = KnowledgeService(session).classify_knowledge(
+                fact_id,
+                payload.tags,
+                actor=resolve_owner_actor(),
+            )
+            return {
+                "id": fact.id,
+                "tags": fact.tags,
+                "status": fact.status.value,
+            }
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/knowledge/facts/{fact_id}/deactivate",
+        response_model=dict,
+    )
+    def deactivate_knowledge_fact(
+        fact_id: str,
+        payload: RevisionRequest,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        """Owner-only: deactivate an approved knowledge fact (owner gate)."""
+        try:
+            fact = KnowledgeService(session).deactivate_fact(
+                fact_id,
+                payload.feedback,
+                actor=resolve_owner_actor(),
+            )
+            return {"id": fact.id, "status": fact.status.value}
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.get(
+        "/knowledge/unclassified",
+        response_model=list,
+    )
+    def list_unclassified_knowledge(
+        session: Session = Depends(get_session),
+    ) -> list[dict]:
+        """Owner-visible report of approved facts still carrying the legacy sentinel."""
+        return report_unclassified_knowledge(session)
 
     @application.post(
         "/owner/campaigns",
@@ -1021,11 +1113,16 @@ def create_app() -> FastAPI:
             )
         effective_scope = scope if scope in ("project", "company") else "project"
         try:
+            project_id = None
+            if effective_scope != "company":
+                source = session.get(Artifact, artifact_id.strip())
+                project_id = source.project_id if source is not None else None
             KnowledgeService(session).submit_candidate(
                 artifact_id.strip(),
                 statement.strip(),
-                effective_scope,
-                "owner",
+                project_id=project_id,
+                tags=None,
+                actor=resolve_owner_actor(),
             )
         except ServiceError as error:
             return HTMLResponse(
@@ -1051,7 +1148,6 @@ def create_app() -> FastAPI:
         candidate_id: str,
         request: Request,
         decision: str | None = Form(None),
-        reviewer: str | None = Form(None),
         rationale: str | None = Form(None),
         series_id: str | None = Form(None),
         version: str | None = Form(None),
@@ -1133,8 +1229,8 @@ def create_app() -> FastAPI:
             KnowledgeService(session).review_candidate(
                 candidate.id,
                 decision_value,
-                reviewer or "owner",
                 rationale.strip(),
+                actor=resolve_owner_actor(),
                 series_id=series,
                 version=parsed_version,
                 supersedes_fact_id=supersedes,

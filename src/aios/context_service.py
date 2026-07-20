@@ -10,9 +10,15 @@ from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from aios.audit import append_audit
+from aios.knowledge_tags import (
+    CAPABILITY_KNOWLEDGE_TAGS,
+    ensure_knowledge_projection_ready,
+    is_projection_enabled,
+)
 from aios.models import (
     Agent,
     AgentCapability,
+    AgentTrustLevel,
     Artifact,
     ArtifactReviewStatus,
     Capability,
@@ -136,9 +142,14 @@ class ContextService:
                     "selected_assignment",
                 )
             )
-        outputs, facts = self._dependency_content(task, references)
+        outputs, reviewed_facts = self._dependency_content(task, references)
         decisions = self._decisions(project.id, references)
-        facts.extend(self._knowledge_facts(project.id, references))
+        # Capability-aware least-privilege KnowledgeFact projection. Returns a list
+        # of (fact_dict, projection_meta) tuples; empty when the flag is off, the
+        # agent is external, or no capability intersection exists. Never falls back
+        # to the old scope-wide full injection.
+        projected = self._select_knowledge_facts(project.id, references, agent, task)
+        facts = reviewed_facts + [item[0] for item in projected]
         policies = self._policies(project.id, references)
         agent_profile = self._agent_profile(agent, references)
         references.sort(
@@ -195,6 +206,37 @@ class ContextService:
                 },
                 idempotency_key=f"audit:context:{context.id}",
             )
+            # Structured, redacted, idempotent projection audit -- committed in the
+            # same transaction as the TaskContext. No knowledge statement text is
+            # persisted, and the consuming task's project is recorded even when the
+            # fact is company-scoped (fact_source_project_id records the source).
+            for _fact_dict, meta in projected:
+                append_audit(
+                    self.session,
+                    actor="context_service",
+                    action="knowledge.fact.projected",
+                    resource_type="knowledge_fact",
+                    resource_id=meta["fact_id"],
+                    project_id=project.id,
+                    task_id=task.id,
+                    before={},
+                    after={
+                        "task_id": task.id,
+                        "task_project_id": task.project_id,
+                        "agent_id": meta["agent_id"],
+                        "fact_id": meta["fact_id"],
+                        "series_id": meta["series_id"],
+                        "version": meta["version"],
+                        "fact_scope": meta["fact_scope"],
+                        "fact_source_project_id": meta["fact_source_project_id"],
+                        "matched_capabilities": meta["matched_capabilities"],
+                        "matched_tags": meta["matched_tags"],
+                        "projection_mode": "least_privilege",
+                    },
+                    idempotency_key=(
+                        f"audit:knowledge:projection:{context.id}:{meta['fact_id']}"
+                    ),
+                )
             self.session.commit()
         except Exception:
             self.session.rollback()
@@ -299,11 +341,92 @@ class ContextService:
                     )
         return outputs, facts
 
+    def _select_knowledge_facts(
+        self,
+        project_id: str,
+        references: list[dict[str, Any]],
+        agent: Agent | None,
+        task: Task,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """Gate + select knowledge facts for projection.
+
+        Returns [] (no injection) when: no agent is assigned, the agent is
+        external/experimental, the least-privilege flag is OFF, the readiness gate
+        fails (sentinel facts remain), or the assigned agent lacks a required
+        capability. Otherwise delegates to ``_knowledge_facts``.
+        """
+        if agent is None:
+            return []
+        if agent.trust_level != AgentTrustLevel.INTERNAL:
+            # External / experimental agents receive no KnowledgeFact projection.
+            # (Safe external export is a separate, reviewed slice.)
+            return []
+        if not is_projection_enabled():
+            # Fail-closed: zero injection, no scope-wide fallback.
+            return []
+        # Refuse to activate while legacy unclassified facts remain.
+        ensure_knowledge_projection_ready(self.session)
+        # Fail-closed: the assigned agent must satisfy every required capability.
+        self._assert_required_capabilities(task, agent)
+        return self._knowledge_facts(project_id, references, agent, task)
+
+    def _assert_required_capabilities(self, task: Task, agent: Agent) -> None:
+        required_ids = set(task.required_capabilities or [])
+        if not required_ids:
+            return
+        enabled = self.session.exec(
+            select(AgentCapability).where(
+                AgentCapability.agent_id == agent.id,
+                AgentCapability.enabled.is_(True),
+            )
+        ).all()
+        agent_cap_ids = {ac.capability_id for ac in enabled}
+        missing = required_ids - agent_cap_ids
+        if missing:
+            raise ServiceError(
+                422,
+                f"assigned agent lacks required capability: {sorted(missing)}",
+            )
+
     def _knowledge_facts(
         self,
         project_id: str,
         references: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
+        agent: Agent,
+        task: Task,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        # Resolve agent enabled capability names.
+        agent_caps = self.session.exec(
+            select(AgentCapability)
+            .where(
+                AgentCapability.agent_id == agent.id,
+                AgentCapability.enabled.is_(True),
+            )
+            .order_by(AgentCapability.capability_id)
+        ).all()
+        agent_cap_names: set[str] = set()
+        for ac in agent_caps:
+            cap = self.session.get(Capability, ac.capability_id)
+            if cap is None:
+                raise ServiceError(409, "Agent capability reference is missing")
+            agent_cap_names.add(cap.name)
+        # Resolve task required capability names.
+        task_cap_names: set[str] = set()
+        for cap_id in (task.required_capabilities or []):
+            cap = self.session.get(Capability, cap_id)
+            if cap is None:
+                raise ServiceError(404, "Required capability not found")
+            task_cap_names.add(cap.name)
+        # Capability intersection (defense in depth): only capabilities both
+        # required by the task AND enabled on the agent are eligible.
+        eff_caps = task_cap_names & agent_cap_names
+        required_tags: set[str] = set()
+        for cap in eff_caps:
+            required_tags |= set(CAPABILITY_KNOWLEDGE_TAGS.get(cap, frozenset()))
+        # Empty capability set / empty tag set => zero injection.
+        if not required_tags:
+            return []
+
         rows = list(
             self.session.exec(
                 select(KnowledgeFact).where(
@@ -315,37 +438,50 @@ class ContextService:
                 )
             )
         )
-        rows.sort(
-            key=lambda row: (
-                0 if row.project_id is None else 1,
-                row.series_id,
-                row.version,
-                row.id,
-            )
-        )
-        result: list[dict[str, Any]] = []
+        # Keep only the latest APPROVED version per series.
+        head_by_series: dict[str, KnowledgeFact] = {}
         for fact in rows:
+            current = head_by_series.get(fact.series_id)
+            if current is None or (fact.version, fact.id) > (current.version, current.id):
+                head_by_series[fact.series_id] = fact
+        result: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for fact in sorted(
+            head_by_series.values(), key=lambda f: (f.series_id, f.version, f.id)
+        ):
             candidate = self.session.get(KnowledgeCandidate, fact.source_candidate_id)
             review = self.session.get(KnowledgeReviewDecision, fact.review_decision_id)
             artifact = self.session.get(Artifact, fact.source_artifact_id)
             if candidate is None or review is None or artifact is None:
                 raise ServiceError(409, "Knowledge fact provenance is missing")
+            matched = sorted(set(fact.tags) & required_tags)
+            if not matched:
+                continue
             scope = "company" if fact.project_id is None else "project"
-            result.append(
-                {
-                    "fact_kind": "knowledge_fact",
-                    "fact_id": fact.id,
-                    "series_id": fact.series_id,
-                    "version": fact.version,
-                    "scope": scope,
-                    "project_id": fact.project_id,
+            fact_dict = {
+                "fact_kind": "knowledge_fact",
+                "fact_id": fact.id,
+                "series_id": fact.series_id,
+                "version": fact.version,
+                "scope": scope,
+                "project_id": fact.project_id,
                 "statement": fact.statement,
                 "source_candidate_id": candidate.id,
                 "source_artifact_id": artifact.id,
                 "source_project_id": fact.source_project_id,
                 "review_decision_id": review.id,
-                }
-            )
+                "matched_tags": matched,
+            }
+            meta = {
+                "fact_id": fact.id,
+                "series_id": fact.series_id,
+                "version": fact.version,
+                "fact_scope": scope,
+                "fact_source_project_id": fact.source_project_id,
+                "agent_id": agent.id,
+                "matched_capabilities": sorted(eff_caps),
+                "matched_tags": matched,
+            }
+            result.append((fact_dict, meta))
             fact_reference: dict[str, Any] = _reference(
                 "knowledge_fact",
                 fact.id,

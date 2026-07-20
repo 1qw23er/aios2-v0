@@ -527,6 +527,15 @@ class KnowledgeCandidate(SQLModel, table=True):
     source_project_id: str = Field(foreign_key="project.id", index=True)
     statement: str
     status: KnowledgeCandidateStatus = Field(default=KnowledgeCandidateStatus.DRAFT, index=True)
+    # Capability-aware projection tags (controlled vocabulary, see knowledge_tags.py).
+    # Immutable after creation except for the one-time sentinel -> canonical
+    # transition performed by owner-only classify_candidate_tags().
+    tags: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    # Typed, server-derived submitter identity (never accepted from request input).
+    submitted_by_kind: str
+    submitted_by_owner_id: str | None = None
+    submitted_by_agent_id: str | None = None
+    # Derived display string (owner:<id> / agent:<id> / system); immutable.
     submitted_by: str
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
@@ -539,6 +548,11 @@ class KnowledgeReviewDecision(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("krev"), primary_key=True)
     candidate_id: str = Field(foreign_key="knowledge_candidate.id", index=True)
     decision: KnowledgeReviewDecisionValue
+    # Typed, server-derived reviewer identity (never accepted from request input).
+    reviewer_kind: str
+    reviewer_owner_id: str | None = None
+    reviewer_agent_id: str | None = None
+    # Derived display string; immutable (the table itself rejects all UPDATEs).
     reviewer: str
     rationale: str
     reviewed_at: datetime = Field(default_factory=now_utc)
@@ -562,6 +576,10 @@ class KnowledgeFact(SQLModel, table=True):
     # source-campaign ownership can always be enforced even for company-scoped facts.
     source_project_id: str = Field(foreign_key="project.id", index=True)
     statement: str
+    # Capability-aware projection tags (controlled vocabulary). Immutable after
+    # creation except for the one-time sentinel -> canonical transition performed
+    # by owner-only classify_knowledge().
+    tags: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     status: KnowledgeFactStatus = Field(default=KnowledgeFactStatus.APPROVED, index=True)
     source_candidate_id: str = Field(foreign_key="knowledge_candidate.id", index=True)
     source_artifact_id: str = Field(foreign_key="artifact.id", index=True)

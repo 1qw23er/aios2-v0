@@ -100,11 +100,14 @@ def test_alpha_3_1_end_to_end_workflow(tmp_path: Path) -> None:
             c.status == KnowledgeCandidateStatus.REJECTED for c in candidates
         )
 
-        # Step 9: approved fact flows into planning + writing TaskContexts.
+        # Step 9: the approved KnowledgeFact exists (asserted above). Under the
+        # least-privilege projection design (#67), external agents do NOT receive
+        # injected knowledge facts, so it is intentionally absent from the
+        # planning/writing TaskContexts' approved_facts.
         for task_id in (PLANNING_ID, WRITING_ID):
             ctx = next(c for c in contexts if c.task_id == task_id)
             fact_ids = {f["fact_id"] for f in ctx.approved_facts}
-            assert facts[0].id in fact_ids
+            assert facts[0].id not in fact_ids
 
         # Step 10: workflow stopped at L4 PENDING.
         assert report.workflow_stopped_at.startswith("L4 approval PENDING")

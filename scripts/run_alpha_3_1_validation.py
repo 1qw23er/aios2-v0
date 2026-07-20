@@ -37,6 +37,7 @@ from sqlmodel import Session, select
 
 from aios.adapters.external import ExternalWorkstationAdapter, TaskPacket
 from aios.audit import AuditLog
+from aios.actor import resolve_owner_actor
 from aios.context_service import ContextService
 from aios.db import get_engine, run_migrations
 from aios.knowledge_service import KnowledgeService
@@ -290,24 +291,32 @@ def _manual_approve_and_review(
 
     service = KnowledgeService(session)
     approve_candidate = service.submit_candidate(
-        artifact.id, "Vendor A leads the AI e-commerce market", "project", "human_ceo"
+        artifact.id,
+        "Vendor A leads the AI e-commerce market",
+        project_id=None,
+        tags=None,
+        actor=resolve_owner_actor(),
     )
     reject_candidate = service.submit_candidate(
-        artifact.id, "Market grows 20% yearly without caveat", "project", "human_ceo"
+        artifact.id,
+        "Market grows 20% yearly without caveat",
+        project_id=None,
+        tags=None,
+        actor=resolve_owner_actor(),
     )
     approved = service.review_candidate(
         approve_candidate.id,
         KnowledgeReviewDecisionValue.APPROVE,
-        "human_ceo",
         "Verified against two independent sources",
+        actor=resolve_owner_actor(),
         series_id=FACT_SERIES,
         version=1,
     )
     service.review_candidate(
         reject_candidate.id,
         KnowledgeReviewDecisionValue.REJECT,
-        "human_ceo",
         "Overstates growth, missing caveats",
+        actor=resolve_owner_actor(),
     )
     report.manual_interventions.append(
         "Knowledge review: approved 1 candidate (series "
@@ -386,7 +395,10 @@ def run_validation(database_url: str) -> ValidationReport:
         plan_assignment = _route_task(session, PLANNING_ID, "route-planning", report)
         plan_context = ContextService(session).build_context(PLANNING_ID, plan_assignment.id)
         report.context_hashes[PLANNING_ID] = plan_context.context_hash
-        assert facts[0].id in {f["fact_id"] for f in plan_context.approved_facts}
+        # Least-privilege projection (#67): external agents do NOT receive
+        # injected knowledge facts. The approved fact exists (asserted above)
+        # but is intentionally excluded from the external planner's context.
+        assert facts[0].id not in {f["fact_id"] for f in plan_context.approved_facts}
 
         MockApiAgent(session).complete(
             PLANNING_ID, {"outline": ["Market", "Strategy", "Risks"]}, "mock-planning"
@@ -397,7 +409,9 @@ def run_validation(database_url: str) -> ValidationReport:
         write_assignment = _route_task(session, WRITING_ID, "route-writing", report)
         write_context = ContextService(session).build_context(WRITING_ID, write_assignment.id)
         report.context_hashes[WRITING_ID] = write_context.context_hash
-        assert facts[0].id in {f["fact_id"] for f in write_context.approved_facts}
+        # Least-privilege projection (#67): external agents do NOT receive
+        # injected knowledge facts.
+        assert facts[0].id not in {f["fact_id"] for f in write_context.approved_facts}
 
         MockApiAgent(session).complete(
             WRITING_ID, {"brief": "Go to market with vendor A"}, "mock-writing"
