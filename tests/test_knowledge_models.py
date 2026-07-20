@@ -136,7 +136,8 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
         assert "knowledge_fact" not in tables
     command.upgrade(config, "head")
     # Head advanced past the Alpha-3 knowledge layer by the Agent Interop
-    # Gateway work (#57 / #104 / #57-slices): 20260719_0001 + 20260719_0002 +
-    # 20260719_0003. The round-trip mechanics above already prove the knowledge
-    # migrations; this final step only confirms we can return to the current head.
-    assert revision() == "20260719_0003"
+    # Gateway work (#57 / #104 / #57-slices) and the Independent Review Protocol
+    # (#64): 20260719_0001 + 20260719_0002 + 20260719_0003 + 20260719_0004. The
+    # round-trip mechanics above already prove the knowledge migrations; this
+    # final step only confirms we can return to the current head.
+    assert revision() == "20260719_0004"

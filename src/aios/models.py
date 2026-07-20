@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Column, UniqueConstraint
+from sqlalchemy import JSON, Column, ForeignKey, String, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -86,6 +86,42 @@ class ArtifactReviewStatus(StrEnum):
     UNVERIFIED = "unverified"
     APPROVED = "approved"
     REJECTED = "rejected"
+    # Independent Review Protocol (#64): reviewer returned NEEDS_REVISION -> the
+    # producer re-runs the task (revision loop) producing a new Artifact.
+    NEEDS_REVISION = "needs_revision"
+
+
+# --- Independent Review Protocol (#64) ---
+class ReviewDimension(StrEnum):
+    """One axis a reviewer may evaluate an Artifact against."""
+
+    FACT_CORRECTNESS = "fact_correctness"
+    ACCEPTANCE_CRITERIA = "acceptance_criteria"
+    BRAND_STRATEGY = "brand_strategy"
+    RISK = "risk"
+
+
+class ReviewVerdict(StrEnum):
+    """Per-dimension verdict."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    NEEDS_REVISION = "needs_revision"
+
+
+class ReviewOverall(StrEnum):
+    """Aggregate outcome of a ReviewResult."""
+
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    NEEDS_REVISION = "needs_revision"
+
+
+class ReviewReviewerType(StrEnum):
+    """Who/what produced the review (decision #2: separate reviewer identity)."""
+
+    AGENT = "agent"
+    USER = "user"
 
 
 class ReviewedFactStatus(StrEnum):
@@ -288,6 +324,22 @@ class Artifact(SQLModel, table=True):
     uri: str
     checksum: str
     review_status: ArtifactReviewStatus = Field(default=ArtifactReviewStatus.UNVERIFIED, index=True)
+    # Independent Review Protocol (#64): revision lineage. revision_of points at
+    # the Artifact this one revises; revision_count is how many times the producer
+    # has re-run for this task (capped by ReviewPolicy.max_revisions).
+    # Physical self-referencing FK with ON DELETE SET NULL: if a parent artifact
+    # is removed, its children keep their rows but lose the lineage pointer
+    # (orphaned) rather than being cascade-deleted. The migration
+    # (20260719_0004) creates the matching constraint + index.
+    revision_count: int = Field(default=0)
+    revision_of: str | None = Field(
+        default=None,
+        sa_column=Column(
+            String,
+            ForeignKey("artifact.id", ondelete="SET NULL"),
+            index=True,
+        ),
+    )
     external_result_id: str | None = Field(default=None, unique=True, index=True)
     result_checksum: str | None = None
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column("metadata", JSON))
@@ -386,6 +438,80 @@ class ReviewedFact(SQLModel, table=True):
     status: ReviewedFactStatus = Field(default=ReviewedFactStatus.PENDING, index=True)
     reviewer: str
     reviewed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class ReviewPolicy(SQLModel, table=True):
+    """Configuration for the Independent Review Protocol (#64) on a task/scenario.
+
+    Decides which dimensions apply, the reviewer trust floor, optional capability
+    requirements, the brand Policy to check against, and the revision cap.
+    """
+
+    __tablename__ = "review_policy"
+
+    id: str = Field(default_factory=lambda: new_id("rp"), primary_key=True)
+    name: str
+    # Match key: task tag / scenario, e.g. "editorial". NULL/empty = global default.
+    applies_to: str = ""
+    # List of ReviewDimension values that apply to this policy.
+    dimensions: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    # Brand/strategy rule set (reuses existing Policy) checked for BRAND_STRATEGY.
+    brand_policy_id: str | None = Field(default=None, foreign_key="policy.id", index=True)
+    # Decision #3: trust floor for any reviewer (experimental agents blocked).
+    required_reviewer_trust: AgentTrustLevel = Field(default=AgentTrustLevel.VERIFIED_EXTERNAL)
+    # Decision #3: optional capability-based extension (e.g. ["fact_research"]).
+    required_capabilities: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    # Decision #4: revision cap (default 2), configurable per policy.
+    max_revisions: int = Field(default=2, ge=0)
+    # Required independent reviewers before the artifact may be aggregated to
+    # APPROVED. A single reviewer must never approve directly (trust boundary).
+    required_reviewers: int = Field(default=2, ge=1)
+    enabled: bool = True
+    project_id: str | None = Field(default=None, foreign_key="project.id", index=True)
+
+
+class ReviewResult(SQLModel, table=True):
+    """One independent review of an Artifact (#64).
+
+    Reviewer identity is split (decision #2): an AGENT reviewer carries
+    ``reviewer_agent_id`` (and ``user_id`` MUST be null); a USER (human)
+    reviewer carries ``user_id`` (and ``reviewer_agent_id`` MUST be null).
+
+    Policy traceability (trust boundary #1): every result records the exact
+    ``policy_id`` used and a ``policy_hash`` snapshot of that policy's meaningful
+    fields at submit time, so historical review meaning never changes when the
+    policy row is later edited.
+
+    Idempotency (trust boundary #3): ``idempotency_key`` is the identity hash
+    (artifact + reviewer + policy). An identical replay returns the original
+    result; a conflicting replay (same identity, different content) is rejected
+    with 409.
+    """
+
+    __tablename__ = "review_result"
+
+    id: str = Field(default_factory=lambda: new_id("rev"), primary_key=True)
+    artifact_id: str = Field(foreign_key="artifact.id", index=True)
+    reviewer_type: ReviewReviewerType
+    reviewer_agent_id: str | None = Field(default=None, foreign_key="agent.id", index=True)
+    user_id: str | None = None
+    # Policy traceability: which ReviewPolicy produced this verdict.
+    policy_id: str | None = Field(default=None, foreign_key="review_policy.id", index=True)
+    # Immutable snapshot hash of the policy's meaningful fields at submit time.
+    policy_hash: str | None = None
+    # Identity hash (artifact + reviewer + policy). Unique per reviewer verdict.
+    idempotency_key: str | None = Field(
+        default=None, unique=True, index=True
+    )
+    # Per-dimension verdicts: [{dim, verdict, evidence, score}].
+    dimensions: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    overall: ReviewOverall
+    # Quality score assigned to the artifact BY the reviewer (agent or human).
+    reviewer_score: float | None = None
+    # Human-in-the-loop usefulness feedback. Distinct from reviewer_score and
+    # ONLY meaningful for USER (human) reviews; agents must not set it.
+    usefulness: float | None = None
     created_at: datetime = Field(default_factory=now_utc)
 
 
