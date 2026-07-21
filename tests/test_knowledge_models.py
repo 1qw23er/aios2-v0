@@ -151,4 +151,4 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     # Phase A knowledge-tags slice (#67): 20260720_0005. The round-trip
     # mechanics above already prove the knowledge migrations; this final step
     # only confirms we can return to the current head.
-    assert revision() == "20260720_0005"
+    assert revision() == "20260720_0006"

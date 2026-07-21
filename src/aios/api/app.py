@@ -5,6 +5,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
+from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from aios.actor import resolve_owner_actor
@@ -14,6 +16,7 @@ from aios.agent_registry import (
     register_agent,
     set_agent_enabled,
 )
+from aios.audit import AuditLog
 from aios.campaign import CampaignLaunchResult, launch_campaign
 from aios.console import (
     build_board_view,
@@ -44,10 +47,18 @@ from aios.models import (
     KnowledgeCandidate,
     KnowledgeReviewDecisionValue,
     Project,
+    ReviewPolicy,
+    ReviewResult,
     Task,
     new_id,
 )
 from aios.orchestrator import Orchestrator, complete_task
+from aios.review import (
+    dispatch_reviews_for_artifact,
+    owner_approve_review,
+    request_review_revision,
+    submit_review_from_artifact,
+)
 from aios.schemas import (
     AgentEnabledUpdate,
     AgentRegister,
@@ -88,6 +99,66 @@ def _translate(error: ServiceError) -> HTTPException:
 
 def _key(value: str | None) -> str:
     return value or new_id("idem")
+
+
+# Fixed audit allowlist (req 2): only these scalar snapshot keys may surface in
+# the derived ``safe_delta``. Anything else -- Artifact body, KnowledgeFact
+# statement, prompt, LLM I/O, owner revision reason text -- is never returned.
+_AUDIT_SAFE_SNAPSHOT_KEYS = {
+    # status / outcome changes
+    "status",
+    "review_status",
+    "overall",
+    # review round / dimension / reviewer identity (IDs + scalar names)
+    "review_round",
+    "review_dimension",
+    "reviewer",
+    "reviewer_agent_id",
+    # capability / tag names (controlled vocabulary, not free text)
+    "capability",
+    "capabilities",
+    "tag",
+    "tags",
+    # fact / artifact counts
+    "fact_count",
+    "artifact_count",
+    # IDs that are themselves safe to expose (traceability, not content)
+    "review_target_artifact_id",
+    "review_policy_id",
+    "assigned_reviewer_agent_id",
+    "revision_of",
+    "revision_count",
+    "max_revisions",
+    "escalated",
+}
+
+
+def _audit_safe_delta(snapshot: object) -> dict[str, object]:
+    """Lift ONLY allowlisted scalar keys from a before/after snapshot.
+
+    Nested dicts/lists are dropped (they could hide arbitrary content such as an
+    Artifact body or a KnowledgeFact statement). The raw snapshot is never
+    returned -- only this curated, flat, allowlisted view.
+    """
+    if not isinstance(snapshot, dict):
+        return {}
+    out: dict[str, object] = {}
+    for key, value in snapshot.items():
+        if key in _AUDIT_SAFE_SNAPSHOT_KEYS and not isinstance(value, (dict, list)):
+            out[key] = value
+    return out
+
+
+class ReviewDispatchRequest(BaseModel):
+    """Owner-supplied dispatch request for the review protocol (#69 / C2).
+
+    Only ``policy_id`` is accepted from the client. The target artifact is the
+    URL path; reviewers, round, and bindings are all derived server-side and
+    never trusted from this payload (C2/C3).
+    """
+
+    policy_id: str
+    executor_agent_id: str | None = None
 
 
 def create_app() -> FastAPI:
@@ -270,6 +341,192 @@ def create_app() -> FastAPI:
             return request_revision(session, task_id, revision.feedback)
         except ServiceError as error:
             raise _translate(error) from error
+
+    # --- Review Protocol runtime wiring (#69 / C1-C6) ------------------------
+    # These endpoints connect the independent review protocol to the live runtime.
+    # Every identity (target artifact, reviewer agent, policy, round) is
+    # server-assigned and never trusted from the client (C2/C3). The owner final
+    # gate is the ONLY path that promotes a reviewed artifact to APPROVED (C1).
+    # The GET /audit endpoint is owner-only, strictly read-only, and never returns
+    # secrets or un-redacted payloads (C6).
+
+    @application.post(
+        "/artifacts/{artifact_id}/reviews/dispatch",
+        response_model=list[Task],
+        status_code=status.HTTP_200_OK,
+    )
+    def dispatch_reviews_endpoint(
+        artifact_id: str,
+        payload: ReviewDispatchRequest,
+        session: Session = Depends(get_session),
+    ) -> list[Task]:
+        """Server-dispatches the required number of Review Tasks for an artifact.
+
+        Reviewers are selected server-side from the policy's trust/capability pool
+        (never client-supplied). Each Review Task is bound (target artifact + policy
+        + round) via metadata. The artifact stays UNVERIFIED until reviews are
+        submitted and aggregated.
+        """
+        policy = session.get(ReviewPolicy, payload.policy_id)
+        if policy is None:
+            raise HTTPException(status_code=404, detail="Review policy not found")
+        try:
+            return dispatch_reviews_for_artifact(
+                session,
+                target_artifact_id=artifact_id,
+                policy=policy,
+                executor_agent_id=payload.executor_agent_id,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/tasks/{review_task_id}/review/submit",
+        response_model=ReviewResult,
+        status_code=status.HTTP_200_OK,
+    )
+    def submit_review_endpoint(
+        review_task_id: str,
+        session: Session = Depends(get_session),
+    ) -> ReviewResult:
+        """Map a completed Review Task's Artifact into a trusted ReviewResult (C3).
+
+        The reviewer agent identity is taken from the TRUSTED Task assignment
+        (``assigned_agent_id``), never the artifact output or the client. The
+        Review Artifact <-> ReviewResult source link is preserved. The caller must
+        have executed the review task first (so its Artifact exists).
+        """
+        actor = resolve_owner_actor()
+        try:
+            return submit_review_from_artifact(
+                session, review_task_id=review_task_id, actor=actor.kind
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/artifacts/{artifact_id}/reviews/approve",
+        response_model=Artifact,
+        status_code=status.HTTP_200_OK,
+    )
+    def owner_approve_review_endpoint(
+        artifact_id: str,
+        session: Session = Depends(get_session),
+    ) -> Artifact:
+        """Owner final gate (C1): the ONLY path that sets a reviewed artifact to
+        APPROVED. Requires ``REVIEW_PASSED`` (all required reviewers passed and the
+        review gate opened). AI reviewers can never reach this endpoint's effect.
+        """
+        actor = resolve_owner_actor()
+        try:
+            return owner_approve_review(session, artifact_id=artifact_id, actor=actor.kind)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/tasks/{task_id}/review/revision",
+        response_model=Task,
+        status_code=status.HTTP_200_OK,
+    )
+    def request_review_revision_endpoint(
+        task_id: str,
+        payload: RevisionRequest,
+        session: Session = Depends(get_session),
+    ) -> Task:
+        """Owner-requested revision -- PREPARE ONLY, never runs an LLM (req 4).
+
+        Records the owner's real feedback durably, idempotently prepares ONE READY
+        revision execution Task (the Content Agent runs it later via the existing
+        execute endpoint), invalidates the old pending review-gate Approval, and
+        returns. It must NOT synchronously call ``execute_task`` or a remote LLM.
+        """
+        actor = resolve_owner_actor()
+        try:
+            return request_review_revision(
+                session, task_id=task_id, feedback=payload.feedback, actor=actor.kind
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.get("/audit", response_model=dict)
+    def audit_log_endpoint(
+        action: str | None = Query(default=None),
+        resource_type: str | None = Query(default=None),
+        project_id: str | None = Query(default=None),
+        task_id: str | None = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=200),
+        cursor: str | None = Query(default=None),
+        session: Session = Depends(get_session),
+    ) -> dict:
+        """Owner-only, read-only audit trail query with a FIXED SAFE PROJECTION (C6).
+
+        Filters by ``action`` / ``resource_type`` / ``project_id`` / ``task_id``
+        (``task_id`` is an indexed column, not JSON). Reverse-chronological with a
+        STABLE cursor (``created_at`` + ``id``) so pagination never skips or
+        duplicates rows.
+
+        Security (req 2): the response is a fixed allowlist -- it can NEVER return
+        arbitrary snapshot bodies. Only the explicit safe columns are returned:
+
+          ALLOWED: id, actor, action, resource_type, resource_id, project_id,
+          task_id, created_at, and a derived ``safe_delta`` containing ONLY
+          allowlisted scalar keys lifted from before/after snapshots (status
+          changes, review_round, reviewer_agent_id, capability/tag names,
+          fact/artifact counts, IDs).
+
+          FORBIDDEN (never returned): Artifact body, KnowledgeFact statement,
+          prompt, LLM input/output, owner revision reason full text, and any
+          non-allowlisted snapshot field. ``redact_secrets`` is NOT a substitute
+          for this allowlist -- the raw snapshots are simply never serialized.
+        """
+        actor = resolve_owner_actor()
+        if actor.kind != "owner":
+            raise HTTPException(status_code=403, detail="仅 owner 可读取审计日志")
+        stmt = select(AuditLog)
+        if action is not None:
+            stmt = stmt.where(AuditLog.action == action)
+        if resource_type is not None:
+            stmt = stmt.where(AuditLog.resource_type == resource_type)
+        if project_id is not None:
+            stmt = stmt.where(AuditLog.project_id == project_id)
+        if task_id is not None:
+            stmt = stmt.where(AuditLog.task_id == task_id)
+        stmt = stmt.order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        if cursor:
+            cur = session.get(AuditLog, cursor)
+            if cur is not None:
+                stmt = stmt.where(
+                    or_(
+                        AuditLog.created_at < cur.created_at,
+                        (AuditLog.created_at == cur.created_at) & (AuditLog.id < cur.id),
+                    )
+                )
+        rows = session.exec(stmt.limit(limit + 1)).all()
+        has_more = len(rows) > limit
+        items = rows[:limit]
+        out = []
+        for row in items:
+            # Fixed safe projection: only allowlisted columns + a derived,
+            # allowlisted-only delta. The raw before/after snapshots are NEVER
+            # serialized, so Artifact bodies / KnowledgeFact statements / prompts /
+            # LLM I/O / owner reason text can never leak through this endpoint.
+            safe = {
+                "id": row.id,
+                "actor": row.actor,
+                "action": row.action,
+                "resource_type": row.resource_type,
+                "resource_id": row.resource_id,
+                "project_id": row.project_id,
+                "task_id": row.task_id,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "safe_delta": {
+                    "before": _audit_safe_delta(row.before_snapshot),
+                    "after": _audit_safe_delta(row.after_snapshot),
+                },
+            }
+            out.append(safe)
+        next_cursor = items[-1].id if (has_more and items) else None
+        return {"items": out, "next_cursor": next_cursor, "limit": limit}
 
     @application.post(
         "/orchestrator/process",

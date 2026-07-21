@@ -89,6 +89,11 @@ class ArtifactReviewStatus(StrEnum):
     # Independent Review Protocol (#64): reviewer returned NEEDS_REVISION -> the
     # producer re-runs the task (revision loop) producing a new Artifact.
     NEEDS_REVISION = "needs_revision"
+    # Owner-gate intermediate (#69/C1): all required reviewers PASSED, aggregation
+    # flipped the review gate to PASSED and left a pending Owner Approval. The
+    # artifact is NOT yet APPROVED -- only an explicit owner action may promote it
+    # to APPROVED. AI reviewers can never substitute for the owner final approval.
+    REVIEW_PASSED = "review_passed"
 
 
 # --- Independent Review Protocol (#64) ---
@@ -303,6 +308,12 @@ class Task(SQLModel, table=True):
     retry_count: int = 0
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
+    # Structured idempotency key (server-determined identity). Used for the
+    # Independent Review Protocol's owner-requested revision dedup (req 1):
+    # ``review-revision:{source_artifact_id}:{next_review_round}``. Never derived
+    # from title/description/prompt. UNIQUE so duplicate/concurrent requests
+    # converge to the same Task via the DB unique constraint (not by title match).
+    idempotency_key: str | None = Field(default=None, unique=True, index=True)
 
 
 class Artifact(SQLModel, table=True):
@@ -393,12 +404,35 @@ class Approval(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("apr"), primary_key=True)
     project_id: str = Field(foreign_key="project.id", index=True)
     task_id: str | None = Field(default=None, foreign_key="task.id", index=True)
+    # Review-gate binding (#69 C5): the exact target artifact + policy + round this
+    # Approval governs. An old Approval must never approve a new revision round.
+    target_artifact_id: str | None = Field(
+        default=None, foreign_key="artifact.id", index=True
+    )
+    review_policy_id: str | None = Field(
+        default=None, foreign_key="review_policy.id", index=True
+    )
+    review_round: int = Field(default=1)
     action_type: str
     risk_level: RiskLevel
     status: ApprovalStatus = Field(default=ApprovalStatus.PENDING, index=True)
     requested_at: datetime = Field(default_factory=now_utc)
     decided_at: datetime | None = None
     rationale: str | None = None
+    # Gate uniqueness (req 4/5): one review-gate Approval per
+    # (target, policy, round). An old Approval can never approve a new revision
+    # round. ``target_artifact_id``/``review_policy_id`` are nullable (non-gate
+    # approvals leave them NULL, which SQLite treats as distinct), so only
+    # review-gate rows are constrained.
+    __table_args__ = (
+        UniqueConstraint(
+            "target_artifact_id",
+            "review_policy_id",
+            "review_round",
+            "action_type",
+            name="uq_approval_gate_round",
+        ),
+    )
 
 
 class Event(SQLModel, table=True):
@@ -512,7 +546,75 @@ class ReviewResult(SQLModel, table=True):
     # Human-in-the-loop usefulness feedback. Distinct from reviewer_score and
     # ONLY meaningful for USER (human) reviews; agents must not set it.
     usefulness: float | None = None
+    # Binding provenance (#69 C1/C2/C6): which server-bound Review Task produced
+    # this verdict, in which round, and against which single assigned dimension.
+    # Anchored to the trusted ``review_task_id`` -- never derived from mutable
+    # artifact metadata or agent output (idempotency + trust boundary #3/#6).
+    # Unique so a Review Task maps to exactly one ReviewResult (1:1 durable link).
+    review_task_id: str | None = Field(
+        default=None, foreign_key="task.id", index=True, unique=True
+    )
+    # Provenance (Option A, req 3): the independent Review Artifact that produced
+    # this verdict. Persisted DIRECTLY on the result (never via the target
+    # Artifact's mutable ``metadata_json["review_result_id"]`` forward-link). The
+    # binding runtime path always sets it non-null; the column is UNIQUE so a
+    # Review Artifact maps to exactly one ReviewResult -- a durable, immutable,
+    # server-owned trace (trust boundary #3/#6).
+    review_artifact_id: str | None = Field(
+        default=None, foreign_key="artifact.id", index=True, unique=True
+    )
+    # Server-derived review round (target artifact revision_count + 1). Old-round
+    # results must never satisfy a new round (req 3).
+    review_round: int = Field(default=1)
+    # The single dimension this Review Task was server-bound to submit (req 2).
+    review_dimension: str | None = None
     created_at: datetime = Field(default_factory=now_utc)
+
+
+class ReviewAssignment(SQLModel, table=True):
+    """Immutable server-owned binding between a Review Task and its exact target (#69 C1/C2/C6).
+
+    One row per Review Task. This is the single source of truth for the review
+    binding -- it replaces the prior (rejected) approach of stashing the binding
+    in the target Artifact's mutable ``metadata_json["review_binding"]``.
+
+    Persists the exact:
+      * ``review_task_id``   -- the Review Task (PK, 1:1; never client-supplied)
+      * ``target_artifact_id`` -- the exact Artifact under review (NOT derived from
+        "content task -> latest artifact"; a content task may have many revisions)
+      * ``review_policy_id`` -- the policy that governs this review
+      * ``review_round``     -- server-derived round (target.revision_count + 1)
+      * ``reviewer_agent_id`` -- the trusted reviewer identity (from Task.assigned_agent_id)
+      * ``review_dimension``  -- exactly ONE dimension this Task may submit (req 2)
+
+    Because this table is append-only and server-owned, aggregation can verify the
+    exact expected Review Tasks / reviewer identities / dimensions / round without
+    trusting agent output or mutable metadata.
+    """
+
+    __tablename__ = "review_assignment"
+
+    review_task_id: str = Field(foreign_key="task.id", primary_key=True)
+    target_artifact_id: str = Field(foreign_key="artifact.id", index=True)
+    review_policy_id: str = Field(foreign_key="review_policy.id", index=True)
+    review_round: int = Field(default=1)
+    reviewer_agent_id: str = Field(foreign_key="agent.id", index=True)
+    review_dimension: str
+    created_at: datetime = Field(default_factory=now_utc)
+    # Binding uniqueness (req 4): identical (target, policy, round, reviewer,
+    # dimension) must never be dispatched twice. Enforced at the DB level so
+    # concurrent ``dispatch_reviews_for_artifact`` calls converge to the same
+    # immutable binding row (the 5-tuple is the durable send-side identity).
+    __table_args__ = (
+        UniqueConstraint(
+            "target_artifact_id",
+            "review_policy_id",
+            "review_round",
+            "reviewer_agent_id",
+            "review_dimension",
+            name="uq_review_assignment_binding",
+        ),
+    )
 
 
 class KnowledgeCandidate(SQLModel, table=True):
