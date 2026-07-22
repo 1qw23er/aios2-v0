@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func
 from sqlmodel import Session, select
 
+from aios.actor import ActorContext
 from aios.agent_registry import register_agent
 from aios.api.app import create_app
 from aios.campaign import V1_TASKS
@@ -59,6 +60,12 @@ from aios.review import (
 from aios.services import ServiceError
 from alembic import command
 
+# Owner-only review services (owner_approve_review / submit_review_from_artifact /
+# request_review_revision) now take a trusted ``ActorContext`` (#74) instead of a
+# bare ``"owner"`` string. This is the trusted owner an authenticated request
+# resolves to; ``owner_id="owner"`` keeps the audit ``actor`` value == "owner".
+_OWNER = ActorContext(kind="owner", owner_id="owner")
+
 
 def _sample_for_schema(schema: dict[str, object]) -> object:
     """Generate schema-valid placeholder data (no real/hardcoded content)."""
@@ -100,11 +107,13 @@ class ScriptedExecutionAdapter:
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch) -> TestClient:
+def client(trusted_owner_installer, tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setenv("AIOS_DATABASE_URL", f"sqlite:///{tmp_path / 'review.db'}")
     monkeypatch.delenv("AIOS_AGENT_API_KEY", raising=False)
     monkeypatch.delenv("AIOS_AGENT_BASE_URL", raising=False)
-    with TestClient(create_app(), follow_redirects=False) as test_client:
+    app = create_app()
+    trusted_owner_installer(app)
+    with TestClient(app, follow_redirects=False) as test_client:
         yield test_client
 
 
@@ -1048,10 +1057,10 @@ def _wire_review_flow(session: Session, *, with_approve: bool = False):
     assert len(tasks) == 2
     for rt in tasks:
         execute_task(session, rt.id, f"idem-review-{rt.id}", adapter=ScriptedReviewAdapter())
-        submit_review_from_artifact(session, review_task_id=rt.id, actor="owner")
+        submit_review_from_artifact(session, review_task_id=rt.id, actor=_OWNER)
     assert session.get(Artifact, draft.id).review_status == ArtifactReviewStatus.REVIEW_PASSED
     if with_approve:
-        owner_approve_review(session, artifact_id=draft.id, actor="owner")
+        owner_approve_review(session, artifact_id=draft.id, actor=_OWNER)
         assert session.get(Artifact, draft.id).review_status == ArtifactReviewStatus.APPROVED
     return draft, tasks
 
@@ -1097,7 +1106,7 @@ def test_runtime_owner_approve_requires_review_passed(client: TestClient) -> Non
         task = _t1(session)
         draft = execute_task(session, task.id, "idem-draft", adapter=ScriptedExecutionAdapter())
         with pytest.raises(ServiceError):
-            owner_approve_review(session, artifact_id=draft.id, actor="owner")
+            owner_approve_review(session, artifact_id=draft.id, actor=_OWNER)
 
 
 def test_runtime_submit_from_artifact_idempotent(client: TestClient) -> None:
@@ -1118,8 +1127,8 @@ def test_runtime_submit_from_artifact_idempotent(client: TestClient) -> None:
         )
         rt = tasks[0]
         execute_task(session, rt.id, f"idem-review-{rt.id}", adapter=ScriptedReviewAdapter())
-        first = submit_review_from_artifact(session, review_task_id=rt.id, actor="owner")
-        second = submit_review_from_artifact(session, review_task_id=rt.id, actor="owner")
+        first = submit_review_from_artifact(session, review_task_id=rt.id, actor=_OWNER)
+        second = submit_review_from_artifact(session, review_task_id=rt.id, actor=_OWNER)
         assert second.id == first.id
         count = session.exec(
             select(func.count(ReviewResult.id)).where(
@@ -1148,7 +1157,7 @@ def test_runtime_request_revision_prepares_only_no_llm(client: TestClient) -> No
         )
         for rt in tasks:
             execute_task(session, rt.id, f"idem-review-{rt.id}", adapter=ScriptedReviewAdapter())
-            submit_review_from_artifact(session, review_task_id=rt.id, actor="owner")
+            submit_review_from_artifact(session, review_task_id=rt.id, actor=_OWNER)
         assert session.get(Artifact, draft.id).review_status == ArtifactReviewStatus.REVIEW_PASSED
         # Sanity: a pending review_gate Approval exists for the old round.
         old_gate = session.exec(
@@ -1164,7 +1173,7 @@ def test_runtime_request_revision_prepares_only_no_llm(client: TestClient) -> No
 
         # The owner requests a revision. This must NOT run the LLM synchronously.
         rev_task = request_review_revision(
-            session, task_id=task.id, feedback="需要更精确的数据", actor="owner"
+            session, task_id=task.id, feedback="需要更精确的数据", actor=_OWNER
         )
         # No new artifact was produced by this call (no execution happened).
         after_artifacts = session.exec(select(func.count(Artifact.id))).first()
@@ -1246,7 +1255,7 @@ def test_exact_target_artifact_resolution_via_assignment(client: TestClient) -> 
         )
         rt = tasks[0]
         execute_task(session, rt.id, f"idem-review-{rt.id}", adapter=ScriptedReviewAdapter())
-        result = submit_review_from_artifact(session, review_task_id=rt.id, actor="owner")
+        result = submit_review_from_artifact(session, review_task_id=rt.id, actor=_OWNER)
         # The ReviewResult is recorded against the EXACT target artifact A.
         assert result.artifact_id == a.id
         assert result.review_task_id == rt.id
@@ -1299,7 +1308,7 @@ def test_dimension_binding_cannot_be_forged(client: TestClient) -> None:
 
         execute_task(session, rt.id, f"idem-forged-{rt.id}", adapter=ForgedDimAdapter())
         with pytest.raises(ServiceError):
-            submit_review_from_artifact(session, review_task_id=rt.id, actor="owner")
+            submit_review_from_artifact(session, review_task_id=rt.id, actor=_OWNER)
 
 
 def test_old_round_results_excluded_from_aggregation(client: TestClient) -> None:
@@ -1323,7 +1332,7 @@ def test_old_round_results_excluded_from_aggregation(client: TestClient) -> None
         )
         for rt in tasks:
             execute_task(session, rt.id, f"idem-r1-{rt.id}", adapter=ScriptedReviewAdapter())
-            submit_review_from_artifact(session, review_task_id=rt.id, actor="owner")
+            submit_review_from_artifact(session, review_task_id=rt.id, actor=_OWNER)
         assert session.get(Artifact, a.id).review_status == ArtifactReviewStatus.REVIEW_PASSED
         # Advance to round 2: new assignments without any results.
         a.revision_count = 1
@@ -1359,7 +1368,7 @@ def test_owner_approval_bound_to_exact_round(client: TestClient) -> None:
         )
         for rt in tasks_a:
             execute_task(session, rt.id, f"idem-a-{rt.id}", adapter=ScriptedReviewAdapter())
-            submit_review_from_artifact(session, review_task_id=rt.id, actor="owner")
+            submit_review_from_artifact(session, review_task_id=rt.id, actor=_OWNER)
         gate_a = session.exec(
             select(Approval).where(
                 Approval.target_artifact_id == a.id,
@@ -1370,7 +1379,7 @@ def test_owner_approval_bound_to_exact_round(client: TestClient) -> None:
         assert gate_a is not None
         assert gate_a.review_round == 1
         # Owner approves round 1.
-        owner_approve_review(session, artifact_id=a.id, actor="owner")
+        owner_approve_review(session, artifact_id=a.id, actor=_OWNER)
         session.refresh(gate_a)
         assert gate_a.status.value == "approved"
         assert session.get(Artifact, a.id).review_status == ArtifactReviewStatus.APPROVED
@@ -1389,7 +1398,7 @@ def test_owner_approval_bound_to_exact_round(client: TestClient) -> None:
         )
         for rt in tasks_b:
             execute_task(session, rt.id, f"idem-b-{rt.id}", adapter=ScriptedReviewAdapter())
-            submit_review_from_artifact(session, review_task_id=rt.id, actor="owner")
+            submit_review_from_artifact(session, review_task_id=rt.id, actor=_OWNER)
         gate_b = session.exec(
             select(Approval).where(
                 Approval.target_artifact_id == b.id,
@@ -1401,7 +1410,7 @@ def test_owner_approval_bound_to_exact_round(client: TestClient) -> None:
         assert gate_b.review_round == 2
         # Owner approves round 2 via B's gate. gate_a must be untouched (still
         # approved for A, never reused for B).
-        owner_approve_review(session, artifact_id=b.id, actor="owner")
+        owner_approve_review(session, artifact_id=b.id, actor=_OWNER)
         session.refresh(gate_a)
         session.refresh(gate_b)
         assert gate_a.status.value == "approved"  # unchanged
@@ -1457,8 +1466,8 @@ def test_duplicate_review_submission_idempotent(client: TestClient) -> None:
         )
         rt = tasks[0]
         execute_task(session, rt.id, f"idem-sub-{rt.id}", adapter=ScriptedReviewAdapter())
-        first = submit_review_from_artifact(session, review_task_id=rt.id, actor="owner")
-        second = submit_review_from_artifact(session, review_task_id=rt.id, actor="owner")
+        first = submit_review_from_artifact(session, review_task_id=rt.id, actor=_OWNER)
+        second = submit_review_from_artifact(session, review_task_id=rt.id, actor=_OWNER)
         assert second.id == first.id
         # Exactly one ReviewResult for this Review Task (unique review_task_id).
         count = session.exec(
@@ -1485,8 +1494,8 @@ def test_duplicate_revision_request_idempotent(client: TestClient) -> None:
         dispatch_reviews_for_artifact(
             session, target_artifact_id=a.id, policy=policy, executor_agent_id=None
         )
-        first = request_review_revision(session, task_id=task.id, feedback="v1", actor="owner")
-        second = request_review_revision(session, task_id=task.id, feedback="v2", actor="owner")
+        first = request_review_revision(session, task_id=task.id, feedback="v1", actor=_OWNER)
+        second = request_review_revision(session, task_id=task.id, feedback="v2", actor=_OWNER)
         # Same prepared revision Task (idempotent).
         assert second.id == first.id
         assert second.status.value == "ready"
@@ -1622,18 +1631,22 @@ def test_endpoint_owner_approve_and_audit_query(client: TestClient) -> None:
     assert len(audit2.json()["items"]) == len(items)
 
 
-def test_endpoint_audit_non_owner_rejected(client: TestClient) -> None:
-    """GET /audit rejects a non-owner actor context with 403 (C6)."""
-    import aios.api.app as app_module
-    from aios.actor import ActorContext
+def test_endpoint_audit_requires_owner_auth(client: TestClient, monkeypatch) -> None:
+    """GET /audit requires owner authentication (#74).
 
-    original = app_module.resolve_owner_actor
-    app_module.resolve_owner_actor = lambda *a, **k: ActorContext(kind="agent", agent_id="x")
-    try:
-        resp = client.get("/audit")
-        assert resp.status_code == 403
-    finally:
-        app_module.resolve_owner_actor = original
+    Before #74 the route manufactured an owner via ``resolve_owner_actor`` and its
+    403 branch was dead code. Now it depends on ``authenticate_owner``. With the
+    test override removed and owner auth configured, a request WITHOUT credentials
+    is rejected with 401 and a Basic-auth challenge.
+    """
+    from aios.api.security import authenticate_owner
+
+    client.app.dependency_overrides.pop(authenticate_owner, None)
+    monkeypatch.setenv("AIOS_OWNER_ID", "owner")
+    monkeypatch.setenv("AIOS_OWNER_API_KEY", "x" * 32)
+    resp = client.get("/audit")
+    assert resp.status_code == 401
+    assert resp.headers["WWW-Authenticate"] == 'Basic realm="aios-owner"'
 
 
 def test_endpoint_audit_never_exposes_secrets(client: TestClient) -> None:
@@ -1684,13 +1697,13 @@ def test_revision_idempotency_independent_of_title(client: TestClient) -> None:
         a = execute_task(session, task.id, "idem-rev", adapter=ScriptedExecutionAdapter())
         dispatch_reviews_for_artifact(session, target_artifact_id=a.id, policy=policy,
                                       executor_agent_id=None)
-        first = request_review_revision(session, task_id=task.id, feedback="v1", actor="owner")
+        first = request_review_revision(session, task_id=task.id, feedback="v1", actor=_OWNER)
         # Simulate a console-side display rename -- must NOT affect identity.
         first.title = "Renamed revision task (round 1)"
         session.add(first)
         session.commit()
         session.refresh(first)
-        second = request_review_revision(session, task_id=task.id, feedback="v2", actor="owner")
+        second = request_review_revision(session, task_id=task.id, feedback="v2", actor=_OWNER)
         assert second.id == first.id
         assert second.title == "Renamed revision task (round 1)"  # unchanged by dedup
         assert second.idempotency_key == f"review-revision:{a.id}:1"
@@ -1712,9 +1725,9 @@ def test_two_revision_requests_prepare_single_task(client: TestClient) -> None:
         dispatch_reviews_for_artifact(session, target_artifact_id=a.id, policy=policy,
                                       executor_agent_id=None)
         first = request_review_revision(session, task_id=task.id, feedback="first reason",
-                                         actor="owner")
+                                         actor=_OWNER)
         second = request_review_revision(session, task_id=task.id, feedback="second reason",
-                                          actor="owner")
+                                          actor=_OWNER)
         assert second.id == first.id
         # The owner reason is persisted into the revision input (description) but
         # is NOT part of the dedup identity (a second reason does not fork a new task).
@@ -1842,7 +1855,7 @@ def test_old_gate_invalidated_after_owner_revision(client: TestClient) -> None:
         ).first()
         assert gate is not None
         rev_task = request_review_revision(session, task_id=draft.task_id,
-                                            feedback="请修订", actor="owner")
+                                            feedback="请修订", actor=_OWNER)
         assert rev_task.status.value == "ready"
         # Source is now a terminal NEEDS_REVISION (not a meaningless UNVERIFIED).
         assert session.get(Artifact, draft.id).review_status == (
@@ -1854,7 +1867,7 @@ def test_old_gate_invalidated_after_owner_revision(client: TestClient) -> None:
         # Re-using the (now rejected) gate to approve the same round is refused and
         # the artifact stays NEEDS_REVISION.
         with pytest.raises(ServiceError):
-            owner_approve_review(session, artifact_id=draft.id, actor="owner")
+            owner_approve_review(session, artifact_id=draft.id, actor=_OWNER)
         assert session.get(Artifact, draft.id).review_status == (
             ArtifactReviewStatus.NEEDS_REVISION
         )

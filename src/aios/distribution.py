@@ -22,6 +22,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
+from aios.actor import ActorContext, _assert_owner_actor, resolve_owner_actor
 from aios.audit import append_audit
 from aios.models import (
     Approval,
@@ -278,6 +279,8 @@ def decide_publish_gate(
     project_id: str,
     decision: ApprovalStatus,
     rationale: str | None = None,
+    *,
+    actor: ActorContext | None = None,
 ) -> Approval:
     """Owner decision on the L3 publish gate (single approve/reject button).
 
@@ -287,7 +290,14 @@ def decide_publish_gate(
     UNVERIFIED (not ready). Publishing without an assembled package or a PENDING L3
     approval is rejected (409) -- there is no path that marks the package ready
     without an APPROVED L3 gate, and NO ``external.publish`` event is ever emitted.
+
+    Owner-only (#74): the ``actor`` must be a trusted owner ``ActorContext``
+    produced by ``authenticate_owner``.
     """
+    if actor is None:
+        actor = resolve_owner_actor()
+    _assert_owner_actor(actor)
+    audit_actor = actor.owner_id or "owner"
     if decision not in (ApprovalStatus.APPROVED, ApprovalStatus.REJECTED):
         raise ServiceError(400, "发布决策只能是批准或驳回。")
 
@@ -307,7 +317,7 @@ def decide_publish_gate(
         session.add(approval)
         append_audit(
             session,
-            actor="owner",
+            actor=audit_actor,
             action="approval.decided",
             resource_type="approval",
             resource_id=approval.id,
@@ -336,7 +346,7 @@ def decide_publish_gate(
             )
             append_audit(
                 session,
-                actor="owner",
+                actor=audit_actor,
                 action="task.completed",
                 resource_type="task",
                 resource_id=gate_task.id,
@@ -352,7 +362,7 @@ def decide_publish_gate(
             session.add(package)
             append_audit(
                 session,
-                actor="owner",
+                actor=audit_actor,
                 action="artifact.review_status",
                 resource_type="artifact",
                 resource_id=package.id,
@@ -369,7 +379,7 @@ def decide_publish_gate(
             session.add(gate_task)
             append_audit(
                 session,
-                actor="owner",
+                actor=audit_actor,
                 action="task.returned",
                 resource_type="task",
                 resource_id=gate_task.id,

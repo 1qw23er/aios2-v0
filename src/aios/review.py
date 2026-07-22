@@ -35,6 +35,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from aios.actor import ActorContext, _assert_owner_actor, resolve_owner_actor
 from aios.audit import append_audit
 from aios.execution import execute_task
 from aios.models import (
@@ -821,14 +822,22 @@ def _ensure_review_gate_approval(
 
 
 def owner_approve_review(
-    session: Session, *, artifact_id: str, actor: str = "owner"
+    session: Session, *, artifact_id: str, actor: ActorContext | None = None
 ) -> Artifact:
     """Owner final gate (C1): the ONLY path that sets a reviewed artifact to APPROVED.
 
     Requires the artifact to be in ``REVIEW_PASSED`` (all required reviewers
     passed and the gate opened). The corresponding pending ``review_gate``
     Approval is marked APPROVED. AI reviewers can never reach this function.
+
+    ``actor`` MUST be a trusted owner ``ActorContext`` (produced by
+    ``authenticate_owner``); a non-owner actor is rejected with 403 (#74). The
+    audit trail records the real ``owner_id``.
     """
+    if actor is None:
+        actor = resolve_owner_actor()
+    _assert_owner_actor(actor)
+    audit_actor = actor.owner_id or "owner"
     artifact = session.get(Artifact, artifact_id)
     if artifact is None:
         raise ServiceError(404, "Artifact not found")
@@ -869,7 +878,7 @@ def owner_approve_review(
     session.add(artifact)
     append_audit(
         session,
-        actor=actor,
+        actor=audit_actor,
         action="review.owner_approved",
         resource_type="artifact",
         resource_id=artifact.id,
@@ -1110,9 +1119,17 @@ def submit_review_from_artifact(
     session: Session,
     *,
     review_task_id: str,
-    actor: str = "owner",
+    actor: ActorContext | None = None,
 ) -> ReviewResult:
     """Map a completed Review Task's Artifact into a trusted ReviewResult (C3).
+
+    Per #74 locked decision 1 this is an OWNER-AUTHENTICATED ORCHESTRATION
+    command: the caller is the owner (who triggers the system to read the
+    reviewer's completed Review Artifact), so ``actor`` MUST be a trusted owner
+    ``ActorContext`` and the AuditLog records the real ``owner_id``. Crucially,
+    the owner is NEVER recorded as the reviewer: ``reviewer_agent_id`` is taken
+    only from the TRUSTED task assignment below, and the owner cannot supply the
+    reviewer / target / round / dimension.
 
     The reviewer agent executed via the existing ``execute_task`` and produced an
     independent Review Artifact. This server-side step:
@@ -1126,6 +1143,10 @@ def submit_review_from_artifact(
     It rejects any Review Task that is not server-bound (no client-supplied
     reviewer/target identity is ever accepted).
     """
+    if actor is None:
+        actor = resolve_owner_actor()
+    _assert_owner_actor(actor)
+    audit_actor = actor.owner_id or "owner"
     review_task = session.get(Task, review_task_id)
     if review_task is None:
         raise ServiceError(404, "Review task not found")
@@ -1191,7 +1212,7 @@ def submit_review_from_artifact(
         review_task_id=review_task_id,
         review_dimension=review_dimension,
         review_artifact_id=review_artifact.id,
-        actor=actor,
+        actor=audit_actor,
     )
 
 
@@ -1254,10 +1275,14 @@ def request_review_revision(
     *,
     task_id: str,
     feedback: str,
-    actor: str = "owner",
+    actor: ActorContext | None = None,
     adapter: Any | None = None,
 ) -> Task:
     """Owner-requested revision -- PREPARE ONLY, never executes an LLM (req 4).
+
+    ``actor`` MUST be a trusted owner ``ActorContext`` (produced by
+    ``authenticate_owner``); a non-owner actor is rejected with 403 (#74). The
+    audit trail records the real ``owner_id``.
 
     This endpoint must NOT synchronously call ``execute_task`` or a remote LLM.
     It only:
@@ -1271,6 +1296,10 @@ def request_review_revision(
     ``revision_count`` is server-derived (never taken from the client); concurrent
     or repeated calls do not create multiple revision Tasks/Artifacts/Approvals.
     """
+    if actor is None:
+        actor = resolve_owner_actor()
+    _assert_owner_actor(actor)
+    audit_actor = actor.owner_id or "owner"
     task = session.get(Task, task_id)
     if task is None:
         raise ServiceError(404, "Task not found")
@@ -1307,7 +1336,7 @@ def request_review_revision(
     )
     append_audit(
         session,
-        actor=actor,
+        actor=audit_actor,
         action="task.revision_requested",
         resource_type="task",
         resource_id=task.id,
@@ -1322,7 +1351,7 @@ def request_review_revision(
     #    Intentionally NOT a meaningless UNVERIFIED reset: the source artifact is
     #    now in a terminal "revision requested" state until the Content Agent
     #    produces the next revision. The audit records gate invalidation below.
-    _invalidate_review_gate(session, source, actor=actor)
+    _invalidate_review_gate(session, source, actor=audit_actor)
     if source.review_status != ArtifactReviewStatus.NEEDS_REVISION:
         source.review_status = ArtifactReviewStatus.NEEDS_REVISION
         session.add(source)
@@ -1359,7 +1388,7 @@ def request_review_revision(
             )
             append_audit(
                 session,
-                actor=actor,
+                actor=audit_actor,
                 action="revision.escalated",
                 resource_type="artifact",
                 resource_id=source.id,
@@ -1412,7 +1441,7 @@ def request_review_revision(
     session.add(rev_task)
     append_audit(
         session,
-        actor=actor,
+        actor=audit_actor,
         action="revision.prepared",
         resource_type="artifact",
         resource_id=source.id,

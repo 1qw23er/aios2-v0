@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from aios.actor import ActorContext, _assert_owner_actor, resolve_owner_actor
 from aios.audit import append_audit
 from aios.models import (
     AdapterType,
@@ -87,14 +88,21 @@ def register_agent(
     config_ref: str | None = None,
     limitations: list[str] | None = None,
     enabled: bool = True,
-    actor: str = "owner",
+    actor: ActorContext | None = None,
 ) -> Agent:
     """Register a new agent in the DB-backed registry.
 
     Accepts only opaque ``secret_ref`` handles — never a raw secret value. The
     ``delegation_mode`` is required for externally-reachable agents (API / EXTERNAL
     adapter types) and must be omitted for in-process adapters (MODEL / CLI).
+
+    Owner-only (#74): the ``actor`` must be a trusted owner ``ActorContext``
+    produced by ``authenticate_owner``.
     """
+    if actor is None:
+        actor = resolve_owner_actor()
+    _assert_owner_actor(actor)
+    audit_actor = actor.owner_id or "owner"
     if not name or not name.strip():
         raise ServiceError(400, "agent 名称不能为空")
     if not role or not role.strip():
@@ -135,7 +143,7 @@ def register_agent(
 
     append_audit(
         session,
-        actor=actor,
+        actor=audit_actor,
         action="agent.registered",
         resource_type="agent",
         resource_id=agent.id,
@@ -160,14 +168,21 @@ def set_agent_enabled(
     agent_id: str,
     enabled: bool,
     *,
-    actor: str = "owner",
+    actor: ActorContext | None = None,
 ) -> Agent:
     """Enable or disable an agent.
 
     Disabling sets ``status=UNAVAILABLE`` (a hard stop — the orchestrator will not
     route work to it); enabling restores ``status=AVAILABLE`` (unless it was in
     MAINTENANCE, which the owner must clear explicitly elsewhere).
+
+    Owner-only (#74): the ``actor`` must be a trusted owner ``ActorContext``
+    produced by ``authenticate_owner``.
     """
+    if actor is None:
+        actor = resolve_owner_actor()
+    _assert_owner_actor(actor)
+    audit_actor = actor.owner_id or "owner"
     agent = get_agent(session, agent_id)
     before = {"enabled": agent.enabled, "status": agent.status.value}
     agent.enabled = enabled
@@ -178,7 +193,7 @@ def set_agent_enabled(
 
     append_audit(
         session,
-        actor=actor,
+        actor=audit_actor,
         action="agent.enabled_changed",
         resource_type="agent",
         resource_id=agent.id,

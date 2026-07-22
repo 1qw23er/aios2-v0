@@ -38,12 +38,14 @@ from aios.schemas import KnowledgeClassifyRequest
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch) -> TestClient:
+def client(trusted_owner_installer, tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setenv("AIOS_DATABASE_URL", f"sqlite:///{tmp_path / 'kp_proj.db'}")
     monkeypatch.setenv("KNOWLEDGE_LEAST_PRIVILEGE_ENABLED", "1")
     monkeypatch.delenv("AIOS_AGENT_API_KEY", raising=False)
     monkeypatch.delenv("AIOS_AGENT_BASE_URL", raising=False)
-    with TestClient(create_app(), follow_redirects=False) as test_client:
+    app = create_app()
+    trusted_owner_installer(app)
+    with TestClient(app, follow_redirects=False) as test_client:
         yield test_client
 
 

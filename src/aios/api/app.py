@@ -9,13 +9,14 @@ from pydantic import BaseModel
 from sqlalchemy import or_
 from sqlmodel import Session, select
 
-from aios.actor import resolve_owner_actor
+from aios.actor import ActorContext
 from aios.agent_registry import (
     get_agent,
     list_agents,
     register_agent,
     set_agent_enabled,
 )
+from aios.api.security import authenticate_owner
 from aios.audit import AuditLog
 from aios.campaign import CampaignLaunchResult, launch_campaign
 from aios.console import (
@@ -64,7 +65,6 @@ from aios.schemas import (
     AgentRegister,
     ApprovalCreate,
     ApprovalDecision,
-    ArtifactReviewUpdate,
     BoardRead,
     KnowledgeCandidateCreate,
     KnowledgeClassifyRequest,
@@ -79,7 +79,6 @@ from aios.services import (
     decide_approval,
     ensure_pending_approval,
     request_revision,
-    set_artifact_review_status,
 )
 from aios.services import create_approval as create_approval_service
 from aios.services import create_project as create_project_service
@@ -221,26 +220,38 @@ def create_app() -> FastAPI:
         approval_id: str,
         decision: ApprovalDecision,
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> Approval:
         try:
-            return decide_approval(session, approval_id, decision.decision, decision.rationale)
+            return decide_approval(
+                session, approval_id, decision.decision, decision.rationale, actor=actor
+            )
         except ServiceError as error:
             raise _translate(error) from error
 
-    @application.post(
+    @application.api_route(
         "/artifacts/{artifact_id}/review-status",
-        response_model=Artifact,
-        status_code=status.HTTP_200_OK,
+        methods=["POST", "PUT", "PATCH"],
+        status_code=status.HTTP_410_GONE,
     )
-    def set_artifact_review_status_endpoint(
-        artifact_id: str,
-        update: ArtifactReviewUpdate,
-        session: Session = Depends(get_session),
-    ) -> Artifact:
-        try:
-            return set_artifact_review_status(session, artifact_id, update.review_status)
-        except ServiceError as error:
-            raise _translate(error) from error
+    def set_artifact_review_status_endpoint(artifact_id: str) -> None:
+        """Permanently removed (#74, decision 2).
+
+        This route was a direct write to ``Artifact.review_status`` that bypassed
+        BOTH the dual-reviewer aggregation AND the owner final gate -- an artifact
+        could be forced to APPROVED without any review at all. It is now 410 Gone
+        (not merely owner-authenticated): there is intentionally NO owner-only
+        version of this shortcut. The only sanctioned path to APPROVED is
+        ``POST /tasks/{id}/review/submit`` (dual reviewers aggregate) followed by
+        ``POST /artifacts/{id}/reviews/approve`` (owner final gate).
+        """
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=(
+                "该直改审阅状态的后门已永久移除；请走双评审聚合 + owner 终审门 "
+                "(/tasks/{id}/review/submit 后 /artifacts/{id}/reviews/approve)。"
+            ),
+        )
 
     @application.post(
         "/tasks/{task_id}/complete", response_model=Task, status_code=status.HTTP_200_OK
@@ -315,6 +326,7 @@ def create_app() -> FastAPI:
         task_id: str,
         decision: ApprovalDecision,
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> Approval:
         """Decide the L3 publish gate. APPROVED marks the package ready (owner posts by
         hand); REJECTED keeps it not ready. Rejected when no package / L3 approval
@@ -326,7 +338,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="该任务不是发布闸门。")
         try:
             return decide_publish_gate(
-                session, task.project_id, decision.decision, decision.rationale
+                session, task.project_id, decision.decision, decision.rationale, actor=actor
             )
         except ServiceError as error:
             raise _translate(error) from error
@@ -336,9 +348,10 @@ def create_app() -> FastAPI:
         task_id: str,
         revision: RevisionRequest,
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> Task:
         try:
-            return request_revision(session, task_id, revision.feedback)
+            return request_revision(session, task_id, revision.feedback, actor=actor)
         except ServiceError as error:
             raise _translate(error) from error
 
@@ -388,18 +401,21 @@ def create_app() -> FastAPI:
     def submit_review_endpoint(
         review_task_id: str,
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> ReviewResult:
         """Map a completed Review Task's Artifact into a trusted ReviewResult (C3).
 
-        The reviewer agent identity is taken from the TRUSTED Task assignment
-        (``assigned_agent_id``), never the artifact output or the client. The
-        Review Artifact <-> ReviewResult source link is preserved. The caller must
-        have executed the review task first (so its Artifact exists).
+        Owner-authenticated orchestration command (#74, decision 1): the owner
+        TRIGGERS the mapping but is NEVER recorded as the reviewer. The reviewer
+        agent identity is taken from the TRUSTED Task assignment
+        (``assigned_agent_id``), never the artifact output, the client, or the
+        owner. The AuditLog actor is the real ``owner_id``. The owner cannot set
+        the reviewer / target / round / dimension. The caller must have executed
+        the review task first (so its Artifact exists).
         """
-        actor = resolve_owner_actor()
         try:
             return submit_review_from_artifact(
-                session, review_task_id=review_task_id, actor=actor.kind
+                session, review_task_id=review_task_id, actor=actor
             )
         except ServiceError as error:
             raise _translate(error) from error
@@ -412,14 +428,14 @@ def create_app() -> FastAPI:
     def owner_approve_review_endpoint(
         artifact_id: str,
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> Artifact:
         """Owner final gate (C1): the ONLY path that sets a reviewed artifact to
         APPROVED. Requires ``REVIEW_PASSED`` (all required reviewers passed and the
         review gate opened). AI reviewers can never reach this endpoint's effect.
         """
-        actor = resolve_owner_actor()
         try:
-            return owner_approve_review(session, artifact_id=artifact_id, actor=actor.kind)
+            return owner_approve_review(session, artifact_id=artifact_id, actor=actor)
         except ServiceError as error:
             raise _translate(error) from error
 
@@ -432,6 +448,7 @@ def create_app() -> FastAPI:
         task_id: str,
         payload: RevisionRequest,
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> Task:
         """Owner-requested revision -- PREPARE ONLY, never runs an LLM (req 4).
 
@@ -440,10 +457,9 @@ def create_app() -> FastAPI:
         execute endpoint), invalidates the old pending review-gate Approval, and
         returns. It must NOT synchronously call ``execute_task`` or a remote LLM.
         """
-        actor = resolve_owner_actor()
         try:
             return request_review_revision(
-                session, task_id=task_id, feedback=payload.feedback, actor=actor.kind
+                session, task_id=task_id, feedback=payload.feedback, actor=actor
             )
         except ServiceError as error:
             raise _translate(error) from error
@@ -457,6 +473,7 @@ def create_app() -> FastAPI:
         limit: int = Query(default=50, ge=1, le=200),
         cursor: str | None = Query(default=None),
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> dict:
         """Owner-only, read-only audit trail query with a FIXED SAFE PROJECTION (C6).
 
@@ -478,10 +495,10 @@ def create_app() -> FastAPI:
           prompt, LLM input/output, owner revision reason full text, and any
           non-allowlisted snapshot field. ``redact_secrets`` is NOT a substitute
           for this allowlist -- the raw snapshots are simply never serialized.
+
+        Owner authentication is enforced by the ``authenticate_owner`` dependency
+        (#74): an unauthenticated request never reaches this body.
         """
-        actor = resolve_owner_actor()
-        if actor.kind != "owner":
-            raise HTTPException(status_code=403, detail="仅 owner 可读取审计日志")
         stmt = select(AuditLog)
         if action is not None:
             stmt = stmt.where(AuditLog.action == action)
@@ -542,8 +559,13 @@ def create_app() -> FastAPI:
             "invocation (1..100). Out-of-range or non-integer values are rejected with 422.",
         ),
         session: Session = Depends(get_session),
+        _owner: ActorContext = Depends(authenticate_owner),
     ) -> OrchestratorProcessResult:
         """Drive the orchestrator for pending completion events.
+
+        Owner-only for now (#74, decision 3): protected by ``authenticate_owner``.
+        There is intentionally NO separate internal-service credential and the
+        outbound ``AIOS_AGENT_API_KEY`` is NOT reused for inbound authentication.
 
         ``activated_task_ids`` is strict and invocation-scoped. It is taken
         directly from ``Orchestrator.process_pending(return_detailed=True)``, which
@@ -573,6 +595,7 @@ def create_app() -> FastAPI:
         payload: KnowledgeCandidateCreate,
         session: Session = Depends(get_session),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> dict:
         """Owner submits a reusable knowledge candidate from an APPROVED artifact.
 
@@ -592,7 +615,7 @@ def create_app() -> FastAPI:
                 payload.statement,
                 project_id=project_id,
                 tags=payload.tags,
-                actor=resolve_owner_actor(),
+                actor=actor,
             )
             return {
                 "id": candidate.id,
@@ -616,6 +639,7 @@ def create_app() -> FastAPI:
         candidate_id: str,
         payload: KnowledgeReviewRequest,
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> dict:
         """Owner reviews a knowledge candidate into a versioned KnowledgeFact.
 
@@ -645,7 +669,7 @@ def create_app() -> FastAPI:
                 candidate_id,
                 decision_value,
                 payload.rationale,
-                actor=resolve_owner_actor(),
+                actor=actor,
                 series_id=payload.series_id,
                 version=version,
                 supersedes_fact_id=supersedes,
@@ -665,13 +689,14 @@ def create_app() -> FastAPI:
         candidate_id: str,
         payload: KnowledgeClassifyRequest,
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> dict:
         """Owner-only: promote a legacy DRAFT sentinel candidate to canonical tags once."""
         try:
             candidate = KnowledgeService(session).classify_candidate_tags(
                 candidate_id,
                 payload.tags,
-                actor=resolve_owner_actor(),
+                actor=actor,
             )
             return {
                 "id": candidate.id,
@@ -689,13 +714,14 @@ def create_app() -> FastAPI:
         fact_id: str,
         payload: KnowledgeClassifyRequest,
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> dict:
         """Owner-only: promote a legacy sentinel fact to canonical tags once."""
         try:
             fact = KnowledgeService(session).classify_knowledge(
                 fact_id,
                 payload.tags,
-                actor=resolve_owner_actor(),
+                actor=actor,
             )
             return {
                 "id": fact.id,
@@ -713,13 +739,14 @@ def create_app() -> FastAPI:
         fact_id: str,
         payload: RevisionRequest,
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> dict:
         """Owner-only: deactivate an approved knowledge fact (owner gate)."""
         try:
             fact = KnowledgeService(session).deactivate_fact(
                 fact_id,
                 payload.feedback,
-                actor=resolve_owner_actor(),
+                actor=actor,
             )
             return {"id": fact.id, "status": fact.status.value}
         except ServiceError as error:
@@ -731,6 +758,7 @@ def create_app() -> FastAPI:
     )
     def list_unclassified_knowledge(
         session: Session = Depends(get_session),
+        _owner: ActorContext = Depends(authenticate_owner),
     ) -> list[dict]:
         """Owner-visible report of approved facts still carrying the legacy sentinel."""
         return report_unclassified_knowledge(session)
@@ -744,6 +772,7 @@ def create_app() -> FastAPI:
         request: ProjectCreate,
         session: Session = Depends(get_session),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        _owner: ActorContext = Depends(authenticate_owner),
     ) -> CampaignLaunchResult:
         """Owner entry point: submit a real campaign goal and launch the V1 workflow.
 
@@ -759,7 +788,9 @@ def create_app() -> FastAPI:
 
     @application.get("/owner/campaigns/{project_id}", response_model=BoardRead)
     def owner_campaign_board(
-        project_id: str, session: Session = Depends(get_session)
+        project_id: str,
+        session: Session = Depends(get_session),
+        _owner: ActorContext = Depends(authenticate_owner),
     ) -> dict:
         """Owner view: the live board for a launched campaign (reuses get_board)."""
         try:
@@ -769,7 +800,9 @@ def create_app() -> FastAPI:
 
     @application.get("/owner/campaigns/{project_id}/measurement")
     def owner_campaign_measurement(
-        project_id: str, session: Session = Depends(get_session)
+        project_id: str,
+        session: Session = Depends(get_session),
+        _owner: ActorContext = Depends(authenticate_owner),
     ) -> dict:
         """Read-only per-campaign V1-I6 metrics (Issue #40). No writes."""
         try:
@@ -781,7 +814,9 @@ def create_app() -> FastAPI:
 
     @application.get("/owner/measurement", response_class=HTMLResponse)
     def owner_measurement(
-        request: Request, session: Session = Depends(get_session)
+        request: Request,
+        session: Session = Depends(get_session),
+        _owner: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse:
         """Read-only V1-I6 measurement report across all campaigns (Issue #40)."""
         report = MeasurementService(session).build_report().model_dump(mode="json")
@@ -802,6 +837,7 @@ def create_app() -> FastAPI:
     def create_agent(
         request: AgentRegister,
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> Agent:
         try:
             return register_agent(
@@ -820,6 +856,7 @@ def create_app() -> FastAPI:
                 config_ref=request.config_ref,
                 limitations=request.limitations,
                 enabled=request.enabled,
+                actor=actor,
             )
         except ServiceError as error:
             raise _translate(error) from error
@@ -839,9 +876,10 @@ def create_app() -> FastAPI:
         agent_id: str,
         request: AgentEnabledUpdate,
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> Agent:
         try:
-            return set_agent_enabled(session, agent_id, request.enabled)
+            return set_agent_enabled(session, agent_id, request.enabled, actor=actor)
         except ServiceError as error:
             raise _translate(error) from error
 
@@ -852,7 +890,11 @@ def create_app() -> FastAPI:
     # No campaign-launch domain logic is duplicated in this UI layer.
 
     @application.get("/owner", response_class=HTMLResponse)
-    def owner_home(request: Request, session: Session = Depends(get_session)) -> HTMLResponse:
+    def owner_home(
+        request: Request,
+        session: Session = Depends(get_session),
+        _owner: ActorContext = Depends(authenticate_owner),
+    ) -> HTMLResponse:
         """Launch form. A fresh idempotency key is embedded so a double-click or
         retry reuses the same key and never creates a duplicate campaign."""
         last_campaign_id = request.cookies.get("aios_last_campaign")
@@ -860,7 +902,9 @@ def create_app() -> FastAPI:
 
     @application.get("/owner/agents", response_class=HTMLResponse)
     def owner_agents(
-        request: Request, session: Session = Depends(get_session)
+        request: Request,
+        session: Session = Depends(get_session),
+        _owner: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse:
         """Agent registry console: list + registration form (#57, #61)."""
         agents = list_agents(session)
@@ -883,6 +927,7 @@ def create_app() -> FastAPI:
         limitations: str | None = Form(None),
         enabled: str | None = Form(None),
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse | RedirectResponse:
         def _show_error(msg: str) -> HTMLResponse:
             return HTMLResponse(
@@ -916,6 +961,7 @@ def create_app() -> FastAPI:
                 max_retries=mr,
                 limitations=lims,
                 enabled=enabled is not None,
+                actor=actor,
             )
         except ServiceError as error:
             return _show_error(error.detail)
@@ -929,9 +975,10 @@ def create_app() -> FastAPI:
         request: Request,
         enabled: str | None = Form(None),
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse | RedirectResponse:
         try:
-            set_agent_enabled(session, agent_id, enabled is not None)
+            set_agent_enabled(session, agent_id, enabled is not None, actor=actor)
         except ServiceError as error:
             return HTMLResponse(
                 owner_agents_html(list_agents(session), error=error.detail), status_code=400
@@ -945,6 +992,7 @@ def create_app() -> FastAPI:
         objective: str | None = Form(None),
         idem: str | None = Form(None),
         session: Session = Depends(get_session),
+        _owner: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse | RedirectResponse:
         idem_key = idem or new_id("idem")
         if not name or not name.strip() or not objective or not objective.strip():
@@ -993,6 +1041,7 @@ def create_app() -> FastAPI:
         project_id: str,
         request: Request,
         session: Session = Depends(get_session),
+        _owner: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse:
         """Read-only board for a launched campaign (reuses get_board_service)."""
         last_campaign_id = request.cookies.get("aios_last_campaign")
@@ -1026,6 +1075,7 @@ def create_app() -> FastAPI:
         decision: str | None = Form(None),
         rationale: str | None = Form(None),
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse | RedirectResponse:
         """Owner approves or rejects a gated task (T6 / T8) from the board.
 
@@ -1061,7 +1111,9 @@ def create_app() -> FastAPI:
             # distribution package is marked ready atomically -- never via the generic
             # L2 owner-gate decision (which would not flip the package).
             if is_publish_gate_task(session, task_id):
-                decide_publish_gate(session, task.project_id, decision_enum, rationale)
+                decide_publish_gate(
+                    session, task.project_id, decision_enum, rationale, actor=actor
+                )
             else:
                 approval = ensure_pending_approval(
                     session,
@@ -1069,7 +1121,7 @@ def create_app() -> FastAPI:
                     task_id=task_id,
                     action_type="owner_gate",
                 )
-                decide_approval(session, approval.id, decision_enum, rationale)
+                decide_approval(session, approval.id, decision_enum, rationale, actor=actor)
         except ServiceError as error:
             return HTMLResponse(
                 owner_error_html(message=error.detail, last_campaign_id=last_campaign_id),
@@ -1093,6 +1145,7 @@ def create_app() -> FastAPI:
         request: Request,
         feedback: str | None = Form(None),
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse | RedirectResponse:
         """Owner requests revision of a returned task; feedback is durably recorded."""
         last_campaign_id = request.cookies.get("aios_last_campaign")
@@ -1117,7 +1170,7 @@ def create_app() -> FastAPI:
                 status_code=400,
             )
         try:
-            request_revision(session, task_id, feedback)
+            request_revision(session, task_id, feedback, actor=actor)
         except ServiceError as error:
             return HTMLResponse(
                 owner_error_html(message=error.detail, last_campaign_id=last_campaign_id),
@@ -1140,6 +1193,7 @@ def create_app() -> FastAPI:
         task_id: str,
         request: Request,
         session: Session = Depends(get_session),
+        _owner: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse | RedirectResponse:
         """Owner triggers a department agent to run a READY task from the board.
 
@@ -1195,6 +1249,7 @@ def create_app() -> FastAPI:
         task_id: str,
         request: Request,
         session: Session = Depends(get_session),
+        _owner: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse | RedirectResponse:
         """Owner assembles the distribution package from the T3/T4/T5 outputs.
 
@@ -1247,6 +1302,7 @@ def create_app() -> FastAPI:
         decision: str | None = Form(None),
         rationale: str | None = Form(None),
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse | RedirectResponse:
         """Owner decides the L3 publish gate: approve marks the package ready.
 
@@ -1285,7 +1341,7 @@ def create_app() -> FastAPI:
             ApprovalStatus.APPROVED if decision == "approve" else ApprovalStatus.REJECTED
         )
         try:
-            decide_publish_gate(session, task.project_id, decision_enum, rationale)
+            decide_publish_gate(session, task.project_id, decision_enum, rationale, actor=actor)
         except ServiceError as error:
             return HTMLResponse(
                 owner_error_html(message=error.detail, last_campaign_id=last_campaign_id),
@@ -1311,6 +1367,7 @@ def create_app() -> FastAPI:
         statement: str | None = Form(None),
         scope: str | None = Form(None),
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse | RedirectResponse:
         """Owner preserves knowledge from an APPROVED source artifact (T9 action).
 
@@ -1379,7 +1436,7 @@ def create_app() -> FastAPI:
                 statement.strip(),
                 project_id=project_id,
                 tags=None,
-                actor=resolve_owner_actor(),
+                actor=actor,
             )
         except ServiceError as error:
             return HTMLResponse(
@@ -1409,6 +1466,7 @@ def create_app() -> FastAPI:
         series_id: str | None = Form(None),
         version: str | None = Form(None),
         session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse | RedirectResponse:
         """Owner reviews a knowledge candidate -> versioned KnowledgeFact.
 
@@ -1487,7 +1545,7 @@ def create_app() -> FastAPI:
                 candidate.id,
                 decision_value,
                 rationale.strip(),
-                actor=resolve_owner_actor(),
+                actor=actor,
                 series_id=series,
                 version=parsed_version,
                 supersedes_fact_id=supersedes,

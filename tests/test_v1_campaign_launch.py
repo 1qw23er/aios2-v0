@@ -18,10 +18,12 @@ from aios.services import ServiceError
 
 
 @pytest.fixture
-def client(tmp_path: Path, monkeypatch) -> TestClient:
+def client(trusted_owner_installer, tmp_path: Path, monkeypatch) -> TestClient:
     database_path = tmp_path / "v1_launch.db"
     monkeypatch.setenv("AIOS_DATABASE_URL", f"sqlite:///{database_path.as_posix()}")
-    with TestClient(create_app()) as test_client:
+    app = create_app()
+    trusted_owner_installer(app)
+    with TestClient(app) as test_client:
         yield test_client
 
 

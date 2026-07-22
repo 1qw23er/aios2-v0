@@ -48,13 +48,15 @@ from aios.services import ServiceError, decide_approval, ensure_pending_approval
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch) -> TestClient:
+def client(trusted_owner_installer, tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setenv("AIOS_DATABASE_URL", f"sqlite:///{tmp_path / 'dist.db'}")
     # Force the production model adapter to be unconfigured (execute endpoint -> 503);
     # the package/publish-gate paths are deterministic and need no model creds.
     monkeypatch.delenv("AIOS_AGENT_API_KEY", raising=False)
     monkeypatch.delenv("AIOS_AGENT_BASE_URL", raising=False)
-    with TestClient(create_app(), follow_redirects=False) as test_client:
+    app = create_app()
+    trusted_owner_installer(app)
+    with TestClient(app, follow_redirects=False) as test_client:
         yield test_client
 
 

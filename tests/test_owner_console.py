@@ -15,10 +15,12 @@ from aios.models import Task as TaskModel
 
 
 @pytest.fixture
-def client(tmp_path: Path, monkeypatch) -> TestClient:
+def client(trusted_owner_installer, tmp_path: Path, monkeypatch) -> TestClient:
     database_path = tmp_path / "owner_console.db"
     monkeypatch.setenv("AIOS_DATABASE_URL", f"sqlite:///{database_path.as_posix()}")
-    with TestClient(create_app(), follow_redirects=False) as test_client:
+    app = create_app()
+    trusted_owner_installer(app)
+    with TestClient(app, follow_redirects=False) as test_client:
         yield test_client
 
 

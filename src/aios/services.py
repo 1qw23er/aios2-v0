@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel
 from sqlmodel import Session, SQLModel, select
 
+from aios.actor import ActorContext, _assert_owner_actor, resolve_owner_actor
 from aios.audit import append_audit
 from aios.models import (
     Agent,
@@ -306,13 +307,23 @@ def decide_approval(
     approval_id: str,
     decision: ApprovalStatus,
     rationale: str | None = None,
+    *,
+    actor: ActorContext | None = None,
 ) -> Approval:
     """Owner decision on a pending approval.
 
     On APPROVED for a gated task, marks the task DONE and unlocks downstream tasks
     (e.g. T6 done -> T7 / T9 READY) via the orchestrator. Every decision is recorded
     in the AuditLog (bypassing it is an invalid state per the Issue stop condition).
+
+    Owner-only (#74): the ``actor`` must be a trusted owner ``ActorContext``
+    produced by ``authenticate_owner``. The AuditLog ``actor`` is the real
+    ``owner_id`` (falling back to the canonical ``"owner"`` string).
     """
+    if actor is None:
+        actor = resolve_owner_actor()
+    _assert_owner_actor(actor)
+    audit_actor = actor.owner_id or "owner"
     approval = session.get(Approval, approval_id)
     if approval is None:
         raise ServiceError(404, "Approval not found")
@@ -330,7 +341,7 @@ def decide_approval(
         session.add(approval)
         append_audit(
             session,
-            actor="owner",
+            actor=audit_actor,
             action="approval.decided",
             resource_type="approval",
             resource_id=approval.id,
@@ -362,7 +373,7 @@ def decide_approval(
                     )
                     append_audit(
                         session,
-                        actor="owner",
+                        actor=audit_actor,
                         action="task.completed",
                         resource_type="task",
                         resource_id=task.id,
@@ -384,7 +395,7 @@ def decide_approval(
                     session.add(task)
                     append_audit(
                         session,
-                        actor="owner",
+                        actor=audit_actor,
                         action="task.returned",
                         resource_type="task",
                         resource_id=task.id,
@@ -402,13 +413,26 @@ def decide_approval(
     return approval
 
 
-def request_revision(session: Session, task_id: str, feedback: str) -> Task:
+def request_revision(
+    session: Session,
+    task_id: str,
+    feedback: str,
+    *,
+    actor: ActorContext | None = None,
+) -> Task:
     """Re-open a returned task to REVIEW and durably record the feedback.
 
     The feedback is recorded via Event + AuditLog. Real re-export through
     ExternalWorkstationAdapter is deferred to the agent-execution stage (V1 real
     execution is out of scope); the durable record here is what #37 requires.
+
+    Owner-only (#74): the ``actor`` must be a trusted owner ``ActorContext``
+    produced by ``authenticate_owner``.
     """
+    if actor is None:
+        actor = resolve_owner_actor()
+    _assert_owner_actor(actor)
+    audit_actor = actor.owner_id or "owner"
     task = session.get(Task, task_id)
     if task is None:
         raise ServiceError(404, "Task not found")
@@ -429,7 +453,7 @@ def request_revision(session: Session, task_id: str, feedback: str) -> Task:
         )
         append_audit(
             session,
-            actor="owner",
+            actor=audit_actor,
             action="task.revision",
             resource_type="task",
             resource_id=task.id,

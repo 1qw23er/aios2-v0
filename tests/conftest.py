@@ -43,7 +43,12 @@ import alembic.command
 import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy.engine import make_url
+
+from aios.actor import ActorContext
+from aios.api.security import authenticate_owner
 
 # Populated in ``pytest_sessionstart``; consulted by the upgrade shim.
 TEMPLATE_DB_PATH: Path | None = None
@@ -229,3 +234,83 @@ def template_db_path() -> Path:
     """Path of the migrated template DB (used for stability assertions)."""
     assert TEMPLATE_DB_PATH is not None
     return TEMPLATE_DB_PATH
+
+
+def _trusted_owner_actor() -> ActorContext:
+    """Test-only substitute for an authenticated owner.
+
+    Never installed by production code. Tests install it via
+    ``app.dependency_overrides[authenticate_owner]`` on the *specific* app they
+    build, so the override cannot leak to other apps or other tests.
+    """
+    return ActorContext(kind="owner", owner_id="owner")
+
+
+@pytest.fixture
+def trusted_owner_installer():
+    """Install the test-only trusted-owner override on a caller-built app.
+
+    Old business tests build their own app inline (after setting
+    ``AIOS_DATABASE_URL`` and friends), so they call this to make *that* app accept
+    a trusted owner. The override is set only on the app object passed in -- it
+    never touches the production ``authenticate_owner`` function and never rebinds
+    any imported reference. The app is discarded at test end, so the override dies
+    with it; callers may also ``pop`` it themselves for explicit teardown.
+    """
+    def _install(app: FastAPI) -> None:
+        app.dependency_overrides[authenticate_owner] = _trusted_owner_actor
+
+    return _install
+
+
+@pytest.fixture
+def authenticated_app(tmp_path: Path, monkeypatch) -> FastAPI:
+    """An app whose ``authenticate_owner`` dependency yields a trusted owner.
+
+    For non-auth tests that merely need an authenticated owner context. The
+    override lives only on this app object and is cleared on teardown.
+    """
+    monkeypatch.setenv(
+        "AIOS_DATABASE_URL",
+        f"sqlite:///{(tmp_path / 'authenticated_app.db').as_posix()}",
+    )
+    monkeypatch.delenv("AIOS_AGENT_API_KEY", raising=False)
+    from aios.api.app import create_app
+
+    app = create_app()
+    app.dependency_overrides[authenticate_owner] = _trusted_owner_actor
+    yield app
+    app.dependency_overrides.pop(authenticate_owner, None)
+
+
+@pytest.fixture
+def authenticated_client(authenticated_app: FastAPI) -> TestClient:
+    with TestClient(authenticated_app, follow_redirects=False) as client:
+        yield client
+
+
+@pytest.fixture
+def owner_auth_app(tmp_path: Path, monkeypatch) -> FastAPI:
+    """An app exercising the REAL ``authenticate_owner`` dependency (no override).
+
+    Used by the owner-auth contract suite so misconfigured / unauthenticated calls
+    are rejected exactly as in production, and so the owner-surface inventory test
+    fails loudly if any route forgets ``authenticate_owner``.
+    """
+    monkeypatch.setenv(
+        "AIOS_DATABASE_URL",
+        f"sqlite:///{(tmp_path / 'owner_auth_app.db').as_posix()}",
+    )
+    monkeypatch.delenv("AIOS_AGENT_API_KEY", raising=False)
+    from aios.api.app import create_app
+
+    app = create_app()
+    app.dependency_overrides.pop(authenticate_owner, None)
+    yield app
+    app.dependency_overrides.pop(authenticate_owner, None)
+
+
+@pytest.fixture
+def owner_auth_client(owner_auth_app: FastAPI) -> TestClient:
+    with TestClient(owner_auth_app, follow_redirects=False) as client:
+        yield client

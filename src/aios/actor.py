@@ -62,3 +62,23 @@ def resolve_agent_actor(agent_id: str) -> ActorContext:
     ``"agent"`` so an external agent can never escalate to owner/system.
     """
     return ActorContext(kind="agent", agent_id=agent_id)
+
+
+def _assert_owner_actor(actor: ActorContext) -> None:
+    """Owner-only service guard shared across owner-gated services.
+
+    This mirrors ``knowledge_service._assert_knowledge_owner_actor`` so that all
+    owner-only service functions enforce the same invariant: only a trusted
+    ``ActorContext`` produced by ``authenticate_owner`` (kind=="owner" with a
+    non-empty ``owner_id``) may proceed. A ``system`` or ``agent`` actor -- or an
+    owner context missing its ``owner_id`` -- receives 403. Routes MUST NOT
+    manufacture an owner ActorContext at the call site; the only trusted source
+    is the ``authenticate_owner`` FastAPI dependency (see ``aios.api.security``).
+
+    ``ServiceError`` is imported lazily to avoid a module-level import cycle
+    (``services`` -> ... -> ``actor``).
+    """
+    from aios.services import ServiceError
+
+    if actor.kind != "owner" or not actor.owner_id:
+        raise ServiceError(403, "this action requires owner identity")
