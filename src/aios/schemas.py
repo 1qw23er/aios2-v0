@@ -169,3 +169,28 @@ class AgentRegister(BaseModel):
 class AgentEnabledUpdate(BaseModel):
     enabled: bool
 
+
+class ReviewPolicyCreate(BaseModel):
+    """Creation payload for a ReviewPolicy (D3 scaffolding, #72).
+
+    Reuses the existing ReviewPolicy model; no new migration. Server-side
+    validation (in ``aios.review.create_review_policy``) enforces the meaningful
+    fields.     Equivalent duplicate requests are idempotent (return the existing
+    policy); conflicting configs return 409.
+
+    NOTE: no field here carries an owner credential. The endpoint is
+    owner-authenticated at the route level via ``authenticate_owner``; this
+    payload is never an access-control boundary.
+    """
+
+    name: str
+    applies_to: str = ""
+    dimensions: list[str] = Field(default_factory=list)
+    brand_policy_id: str | None = None
+    required_reviewer_trust: str = "verified_external"
+    required_capabilities: list[str] = Field(default_factory=list)
+    max_revisions: int = 2
+    required_reviewers: int = 2
+    enabled: bool = True
+    project_id: str | None = None
+

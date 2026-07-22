@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func
@@ -71,6 +72,273 @@ _TRUST_RANK: dict[AgentTrustLevel, int] = {
     AgentTrustLevel.VERIFIED_EXTERNAL: 1,
     AgentTrustLevel.INTERNAL: 2,
 }
+
+
+@dataclass(frozen=True)
+class ReviewPolicyConfig:
+    """Canonical, order-independent representation of a ReviewPolicy's meaningful
+    configuration. Two configs compare equal iff every meaningful field matches,
+    regardless of list element order (set-like fields are pre-sorted).
+    """
+
+    name: str
+    applies_to: str
+    dimensions: tuple[str, ...]  # canonical (sorted) ReviewDimension values
+    brand_policy_id: str | None
+    required_reviewer_trust: AgentTrustLevel
+    required_capabilities: tuple[str, ...]  # canonical (sorted)
+    max_revisions: int
+    required_reviewers: int
+    enabled: bool
+    project_id: str | None
+
+
+def _sort_dimensions_by_enum(dims: list[str]) -> tuple[str, ...]:
+    """Deterministically order dimensions by their definition order in
+    :class:`ReviewDimension` (NOT alphabetically), so the canonical form is
+    stable regardless of request order (D3, locked design #4)."""
+    order = {member: idx for idx, member in enumerate(ReviewDimension)}
+    return tuple(sorted(dims, key=lambda d: order[ReviewDimension(d)]))
+
+
+def validate_review_policy_invariants(
+    *,
+    name: str,
+    applies_to: str = "",
+    dimensions: list[str] | None = None,
+    brand_policy_id: str | None = None,
+    required_reviewer_trust: str = "verified_external",
+    required_capabilities: list[str] | None = None,
+    max_revisions: int = 2,
+    required_reviewers: int = 2,
+    enabled: bool = True,
+    project_id: str | None = None,
+    stored: bool = False,
+) -> ReviewPolicyConfig:
+    """Single source of truth for ReviewPolicy invariants (D3, #72 / #74).
+
+    No HTTP dependency. Canonicalizes and validates the meaningful fields:
+      * name: non-empty after strip (case-sensitive; no unicode / case folding);
+      * dimensions: non-empty list of valid ``ReviewDimension`` values, no
+        duplicates, canonicalized to a deterministically sorted tuple;
+      * one-review-task-one-dimension: ``required_reviewers`` MUST equal
+        ``len(dimensions)``;
+      * ``max_revisions >= 0``;
+      * ``required_reviewer_trust`` MUST be a valid ``AgentTrustLevel``.
+
+    Returns the canonical :class:`ReviewPolicyConfig`. Raises ``ServiceError(400)``
+    on any violation -- a domain error, not an ``HTTPException``.
+
+    Shared by ``create_review_policy`` (invalid request -> 400) and
+    ``dispatch_reviews_for_artifact`` (illegal stored/legacy policy -> mapped to
+    422 by the caller). Do NOT maintain a second, divergent rule set elsewhere.
+
+    ``stored``: when True the caller is validating an ALREADY-PERSISTED policy
+    (the dispatch path). The stored ``name`` column MUST already be canonical
+    (no leading/trailing whitespace), because migration 0007 guaranteed all
+    legacy names were canonical before adding UNIQUE(name), and the create path
+    always persists a stripped name. A non-canonical stored name is data
+    corruption that escaped the migration and must be rejected fail-closed
+    (never silently re-canonicalized). The create path passes ``stored=False`` so
+    user-supplied whitespace is still accepted and stripped before persistence.
+    """
+    raw = name or ""
+    if stored and raw != raw.strip():
+        raise ServiceError(
+            400,
+            "stored ReviewPolicy.name must already be canonical "
+            "(no leading/trailing whitespace); found non-canonical value",
+        )
+    canonical_name = raw.strip()
+    if not canonical_name:
+        raise ServiceError(400, "ReviewPolicy name must be non-empty")
+
+    raw_dims = [d for d in (dimensions or [])]
+    if not raw_dims:
+        raise ServiceError(400, "dimensions must be a non-empty list")
+    valid_dims = {d.value for d in ReviewDimension}
+    invalid = [d for d in raw_dims if d not in valid_dims]
+    if invalid:
+        raise ServiceError(400, f"invalid dimensions: {invalid}")
+    # Duplicate dimensions are explicitly rejected (never silently de-duplicated).
+    if len(set(raw_dims)) != len(raw_dims):
+        dupes = sorted({d for d in raw_dims if raw_dims.count(d) > 1})
+        raise ServiceError(400, f"duplicate dimensions are not allowed: {dupes}")
+    # Canonical storage: deterministically sorted by enum definition order.
+    canonical_dims = _sort_dimensions_by_enum(raw_dims)
+
+    try:
+        trust = AgentTrustLevel(required_reviewer_trust)
+    except ValueError as error:
+        raise ServiceError(
+            400, f"invalid required_reviewer_trust: {required_reviewer_trust!r}"
+        ) from error
+
+    if required_reviewers < 1:
+        raise ServiceError(400, "required_reviewers must be >= 1")
+    # One review task per dimension: every dimension needs exactly one reviewer.
+    if required_reviewers != len(raw_dims):
+        raise ServiceError(
+            400,
+            f"required_reviewers ({required_reviewers}) must equal the number of "
+            f"dimensions ({len(raw_dims)})",
+        )
+
+    if max_revisions < 0:
+        raise ServiceError(400, "max_revisions must be >= 0")
+
+    canonical_caps = tuple(sorted(required_capabilities or []))
+
+    return ReviewPolicyConfig(
+        name=canonical_name,
+        applies_to=applies_to or "",
+        dimensions=canonical_dims,
+        brand_policy_id=brand_policy_id,
+        required_reviewer_trust=trust,
+        required_capabilities=canonical_caps,
+        max_revisions=max_revisions,
+        required_reviewers=required_reviewers,
+        enabled=enabled,
+        project_id=project_id,
+    )
+
+
+def _config_from_policy(policy: ReviewPolicy) -> ReviewPolicyConfig:
+    """Build the canonical config for an existing (stored) ReviewPolicy row."""
+    return ReviewPolicyConfig(
+        name=policy.name,
+        applies_to=policy.applies_to,
+        dimensions=_sort_dimensions_by_enum(policy.dimensions or []),
+        brand_policy_id=policy.brand_policy_id,
+        required_reviewer_trust=policy.required_reviewer_trust,
+        required_capabilities=tuple(sorted(policy.required_capabilities or [])),
+        max_revisions=policy.max_revisions,
+        required_reviewers=policy.required_reviewers,
+        enabled=policy.enabled,
+        project_id=policy.project_id,
+    )
+
+
+def create_review_policy(
+    session: Session,
+    *,
+    actor: ActorContext,
+    name: str,
+    applies_to: str = "",
+    dimensions: list[str] | None = None,
+    brand_policy_id: str | None = None,
+    required_reviewer_trust: str = "verified_external",
+    required_capabilities: list[str] | None = None,
+    max_revisions: int = 2,
+    required_reviewers: int = 2,
+    enabled: bool = True,
+    project_id: str | None = None,
+) -> tuple[ReviewPolicy, bool]:
+    """Create a ReviewPolicy (D3 hardening, #72 / #74).
+
+    Reuses the existing ReviewPolicy model. Invariants are enforced centrally by
+    :func:`validate_review_policy_invariants` (the single source of truth, shared
+    with ``dispatch_reviews_for_artifact``).
+
+    Idempotency / conflict: if a policy with the same ``name`` already exists and
+    its canonical config matches the request, the existing policy is returned
+    (``created=False``) -- no duplicate row, no duplicate audit. If a same-name
+    policy exists with a *different* config, a 409 conflict is raised.
+
+    Concurrency safety: ``review_policy.name`` carries a DB-level UNIQUE index
+    (migration 20260722_0007). The create path uses check-then-insert as a fast
+    path, but the UNIQUE index is the final source of truth. A lost race (a
+    concurrent insert won the index) is caught via a SAVEPOINT, the flush is
+    rolled back to the savepoint (the OUTER transaction is preserved), and we
+    converge to the existing row (idempotent 200) or raise 409 for a genuine
+    config conflict -- so two racing "create same name" requests can never
+    produce two rows or two ``review_policy.created`` audits.
+
+    This is the ONLY production path that writes a ReviewPolicy row. dispatch,
+    startup, and execute never create one (no seed, no lazy ensure).
+
+    ``actor`` is the authenticated owner resolved by the ``authenticate_owner``
+    dependency at the route; its ``owner_id`` is recorded in the audit log.
+    """
+    cfg = validate_review_policy_invariants(
+        name=name,
+        applies_to=applies_to,
+        dimensions=dimensions,
+        brand_policy_id=brand_policy_id,
+        required_reviewer_trust=required_reviewer_trust,
+        required_capabilities=required_capabilities,
+        max_revisions=max_revisions,
+        required_reviewers=required_reviewers,
+        enabled=enabled,
+        project_id=project_id,
+    )
+
+    existing = session.exec(
+        select(ReviewPolicy).where(ReviewPolicy.name == cfg.name)
+    ).first()
+    if existing is not None:
+        if _config_from_policy(existing) == cfg:
+            return existing, False
+        raise ServiceError(
+            409,
+            f"a ReviewPolicy named {cfg.name!r} already exists with a different configuration",
+        )
+
+    policy = ReviewPolicy(
+        name=cfg.name,
+        applies_to=cfg.applies_to,
+        dimensions=list(cfg.dimensions),
+        brand_policy_id=cfg.brand_policy_id,
+        required_reviewer_trust=cfg.required_reviewer_trust,
+        required_capabilities=list(cfg.required_capabilities),
+        max_revisions=cfg.max_revisions,
+        required_reviewers=cfg.required_reviewers,
+        enabled=cfg.enabled,
+        project_id=cfg.project_id,
+    )
+    try:
+        # SAVEPOINT: a concurrent insert of the same name may win the UNIQUE
+        # index between our check above and this flush. Roll back ONLY to the
+        # savepoint (the outer transaction survives) and converge below.
+        with session.begin_nested():
+            session.add(policy)
+            session.flush()  # assign policy.id; UNIQUE(name) enforced here
+    except IntegrityError:
+        existing = session.exec(
+            select(ReviewPolicy).where(ReviewPolicy.name == cfg.name)
+        ).first()
+        if existing is not None and _config_from_policy(existing) == cfg:
+            return existing, False
+        raise ServiceError(
+            409,
+            f"a ReviewPolicy named {cfg.name!r} already exists with a different configuration",
+        ) from None
+
+    append_audit(
+        session,
+        actor=actor.owner_id,
+        action="review_policy.created",
+        resource_type="review_policy",
+        resource_id=policy.id,
+        project_id=cfg.project_id,
+        task_id=None,
+        before={},
+        after={
+            "name": policy.name,
+            "applies_to": policy.applies_to,
+            "dimensions": policy.dimensions,
+            "required_reviewer_trust": policy.required_reviewer_trust.value,
+            "required_capabilities": policy.required_capabilities,
+            "max_revisions": policy.max_revisions,
+            "required_reviewers": policy.required_reviewers,
+            "enabled": policy.enabled,
+            "project_id": policy.project_id,
+        },
+        idempotency_key=f"audit:review_policy:created:{policy.id}:{new_id('k')}",
+    )
+    session.commit()
+    session.refresh(policy)  # reload so the returned instance is populated
+    return policy, True
 
 
 class ReviewError(ServiceError):
@@ -1025,6 +1293,28 @@ def dispatch_reviews_for_artifact(
     target = session.get(Artifact, target_artifact_id)
     if target is None:
         raise ServiceError(404, "Target artifact not found")
+    # Fail-closed: a stored/legacy policy that violates the invariant contract
+    # must never be dispatched. The shared validator raises the domain 400;
+    # for an already-persisted illegal policy we map it to 422 (the caller
+    # cannot fix it via the request -- the data itself is malformed). ``stored=True``
+    # additionally rejects a non-canonical (whitespace) stored name rather than
+    # silently re-canonicalizing it.
+    try:
+        validate_review_policy_invariants(
+            name=policy.name,
+            applies_to=policy.applies_to,
+            dimensions=list(policy.dimensions or []),
+            brand_policy_id=policy.brand_policy_id,
+            required_reviewer_trust=policy.required_reviewer_trust.value,
+            required_capabilities=list(policy.required_capabilities or []),
+            max_revisions=policy.max_revisions,
+            required_reviewers=policy.required_reviewers,
+            enabled=policy.enabled,
+            project_id=policy.project_id,
+            stored=True,
+        )
+    except ServiceError as error:
+        raise ServiceError(422, error.detail) from error
     if review_round is None:
         review_round = target.revision_count + 1
     # Idempotent guard: if bindings already exist for this target + round, return

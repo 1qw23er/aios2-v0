@@ -13,11 +13,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, text
+from sqlmodel import Session, select, text
 
 from aios.db import get_engine
 from aios.models import (
@@ -25,6 +26,7 @@ from aios.models import (
     ApprovalStatus,
     ReviewAssignment,
     ReviewOverall,
+    ReviewPolicy,
     ReviewResult,
     ReviewReviewerType,
     RiskLevel,
@@ -33,7 +35,7 @@ from aios.models import (
 )
 from alembic import command
 
-HEAD = "20260720_0006"
+HEAD = "20260722_0007"
 BASE = "20260720_0005"
 
 
@@ -97,6 +99,7 @@ def test_migration_round_trip_0005_0006_0005_0006(tmp_path) -> None:
         assert "uq_review_result_review_artifact_id" in idx
         assert "uq_approval_gate_round" in idx
         assert "ix_task_idempotency_key" in idx
+        assert "uq_review_policy_name" in idx  # 0007 identity constraint
         assert "review_artifact_id" in _columns(session, "review_result")
         assert "idempotency_key" in _columns(session, "task")
         # knowledge triggers still present (0006 must not break them).
@@ -104,7 +107,7 @@ def test_migration_round_trip_0005_0006_0005_0006(tmp_path) -> None:
         assert "knowledge_candidate_validate_insert" in triggers
         assert "knowledge_review_validate_insert" in triggers
 
-    # Downgrade back to 0005: everything 0006 added is gone.
+    # Downgrade back to 0005: everything 0006/0007 added is gone.
     command.downgrade(cfg, BASE)
     with Session(engine) as session:
         assert "review_assignment" not in _tables(session)
@@ -113,6 +116,7 @@ def test_migration_round_trip_0005_0006_0005_0006(tmp_path) -> None:
         assert "uq_review_result_review_artifact_id" not in idx
         assert "uq_approval_gate_round" not in idx
         assert "ix_task_idempotency_key" not in idx
+        assert "uq_review_policy_name" not in idx
         assert "review_artifact_id" not in _columns(session, "review_result")
         assert "idempotency_key" not in _columns(session, "task")
         triggers = _triggers(session)
@@ -195,3 +199,145 @@ def test_db_unique_constraints_reject_duplicates(tmp_path) -> None:
             raise AssertionError("duplicate review_gate Approval was NOT rejected")
         except IntegrityError:
             session.rollback()
+
+
+def test_review_policy_name_unique_rejects_duplicates(tmp_path: Path) -> None:
+    """D3 hardening (#72/#74): the uq_review_policy_name index physically rejects
+    a concurrent duplicate-name insert at the DB level."""
+    url = f"sqlite:///{(tmp_path / 'rp_uniq.db').as_posix()}"
+    cfg = _config(url)
+    command.upgrade(cfg, "heads")
+    engine = get_engine(url)
+    event.listen(engine, "connect", lambda conn, _: conn.execute("PRAGMA foreign_keys=OFF"))
+
+    with Session(engine) as session:
+        session.add(ReviewPolicy(name="editorial-v1"))
+        session.commit()
+        session.add(ReviewPolicy(name="editorial-v1"))
+        try:
+            session.commit()
+            raise AssertionError("duplicate review_policy.name was NOT rejected")
+        except IntegrityError:
+            session.rollback()
+
+
+def test_review_policy_identity_migration_fail_closed_on_duplicate_names(
+    tmp_path: Path,
+) -> None:
+    """The 0007 migration refuses to add the UNIQUE index when duplicate
+    review_policy.name rows already exist (fail-closed preflight)."""
+    url = f"sqlite:///{(tmp_path / 'rp_preflight.db').as_posix()}"
+    cfg = _config(url)
+    # Land at 0006 (pre-identity), then seed duplicate names.
+    command.upgrade(cfg, "20260720_0006")
+    engine = get_engine(url)
+    with Session(engine) as session:
+        session.add(ReviewPolicy(name="dup-a"))
+        session.add(ReviewPolicy(name="dup-a"))
+        session.commit()
+
+    # Upgrading into 0007 must abort rather than silently pick a winner.
+    with pytest.raises(RuntimeError):
+        command.upgrade(cfg, "20260722_0007")
+
+
+# --- 0007 canonical-consistency preflight (architecture review fix) -----------
+
+
+def test_migration_0007_rejects_canonical_duplicate_names(tmp_path: Path) -> None:
+    """Two distinct raw names that collapse to the SAME trimmed identity
+    ('editorial-v1' and ' editorial-v1 ') must abort the migration fail-closed.
+    After the failure the DB must still be at 0006, the uq_review_policy_name
+    index must NOT exist, and the original rows must be unchanged."""
+    url = f"sqlite:///{(tmp_path / 'rp_canon_dup.db').as_posix()}"
+    cfg = _config(url)
+    command.upgrade(cfg, "20260720_0006")
+    engine = get_engine(url)
+    with Session(engine) as session:
+        session.add(ReviewPolicy(name="editorial-v1"))
+        session.add(ReviewPolicy(name=" editorial-v1 "))  # raw differs, canonical == editorial-v1
+        session.commit()
+
+    with pytest.raises(RuntimeError):
+        command.upgrade(cfg, "20260722_0007")
+
+    # DB still at 0006; index never created; original data intact.
+    with Session(engine) as session:
+        assert (
+            session.exec(text("SELECT version_num FROM alembic_version")).first()[0]
+            == "20260720_0006"
+        )
+        assert "uq_review_policy_name" not in _indexes(session)
+        # NOTE: read back via the full entity, not `select(ReviewPolicy.name)`
+        # (a SQLModel/SQLAlchemy column-only projection returns a corrupted value
+        # for this model); the raw stored value is what we assert is unchanged.
+        names = sorted(r.name for r in session.exec(select(ReviewPolicy)).all())
+        assert names == [" editorial-v1 ", "editorial-v1"]
+
+
+def test_migration_0007_rejects_single_non_canonical_name(tmp_path: Path) -> None:
+    """A single non-canonical (whitespace) name must abort the migration; the
+    migration must NOT silently trim/fix it."""
+    url = f"sqlite:///{(tmp_path / 'rp_noncanon.db').as_posix()}"
+    cfg = _config(url)
+    command.upgrade(cfg, "20260720_0006")
+    engine = get_engine(url)
+    with Session(engine) as session:
+        session.add(ReviewPolicy(name=" editorial-v1 "))
+        session.commit()
+
+    with pytest.raises(RuntimeError):
+        command.upgrade(cfg, "20260722_0007")
+
+    with Session(engine) as session:
+        assert (
+            session.exec(text("SELECT version_num FROM alembic_version")).first()[0]
+            == "20260720_0006"
+        )
+        assert "uq_review_policy_name" not in _indexes(session)
+        names = [r.name for r in session.exec(select(ReviewPolicy)).all()]
+        # Original (non-canonical) value is untouched by the migration.
+        assert names == [" editorial-v1 "]
+
+
+def test_migration_0007_rejects_whitespace_only_name(tmp_path: Path) -> None:
+    """A whitespace-only name (trim(name) = '') must abort the migration."""
+    url = f"sqlite:///{(tmp_path / 'rp_ws.db').as_posix()}"
+    cfg = _config(url)
+    command.upgrade(cfg, "20260720_0006")
+    engine = get_engine(url)
+    with Session(engine) as session:
+        session.add(ReviewPolicy(name="   "))
+        session.commit()
+
+    with pytest.raises(RuntimeError):
+        command.upgrade(cfg, "20260722_0007")
+
+    with Session(engine) as session:
+        assert (
+            session.exec(text("SELECT version_num FROM alembic_version")).first()[0]
+            == "20260720_0006"
+        )
+        assert "uq_review_policy_name" not in _indexes(session)
+
+
+def test_migration_0007_succeeds_when_all_names_canonical(tmp_path: Path) -> None:
+    """When every stored name is already canonical, the migration adds the
+    UNIQUE index and the DB advances to 0007."""
+    url = f"sqlite:///{(tmp_path / 'rp_ok.db').as_posix()}"
+    cfg = _config(url)
+    command.upgrade(cfg, "20260720_0006")
+    engine = get_engine(url)
+    with Session(engine) as session:
+        session.add(ReviewPolicy(name="editorial-v1"))
+        session.add(ReviewPolicy(name="risk-v2"))
+        session.commit()
+
+    command.upgrade(cfg, "20260722_0007")  # must not raise
+
+    with Session(engine) as session:
+        assert (
+            session.exec(text("SELECT version_num FROM alembic_version")).first()[0]
+            == "20260722_0007"
+        )
+        assert "uq_review_policy_name" in _indexes(session)

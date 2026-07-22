@@ -134,17 +134,19 @@ def _t1(session: Session) -> TaskModel:
 
 
 def _editorial_policy(session: Session, *, max_revisions: int = 2) -> ReviewPolicy:
+    # One-review-task-one-dimension: required_reviewers MUST equal the number of
+    # dimensions (D3 hardening invariant). Here both are 2, matching the two
+    # fact_research reviewers registered by the flow helpers below.
     policy = ReviewPolicy(
         name="editorial",
         applies_to="editorial",
         dimensions=[
             ReviewDimension.FACT_CORRECTNESS.value,
             ReviewDimension.ACCEPTANCE_CRITERIA.value,
-            ReviewDimension.BRAND_STRATEGY.value,
-            ReviewDimension.RISK.value,
         ],
         required_reviewer_trust=AgentTrustLevel.VERIFIED_EXTERNAL,
         required_capabilities=["fact_research"],
+        required_reviewers=2,
         max_revisions=max_revisions,
     )
     session.add(policy)

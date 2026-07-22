@@ -147,8 +147,9 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     command.upgrade(config, "head")
     # Head advanced past the Alpha-3 knowledge layer by the Agent Interop
     # Gateway work (#57 / #104 / #57-slices): 20260719_0001 + 20260719_0002 +
-    # 20260719_0003, Independent Review Protocol (#64): 20260719_0004, and the
-    # Phase A knowledge-tags slice (#67): 20260720_0005. The round-trip
-    # mechanics above already prove the knowledge migrations; this final step
-    # only confirms we can return to the current head.
-    assert revision() == "20260720_0006"
+    # 20260719_0003, Independent Review Protocol (#64): 20260719_0004, the
+    # Phase A knowledge-tags slice (#67): 20260720_0005, Review Binding (#69):
+    # 20260720_0006, and ReviewPolicy identity (#72/#74): 20260722_0007. The
+    # round-trip mechanics above already prove the knowledge migrations; this
+    # final step only confirms we can return to the current head.
+    assert revision() == "20260722_0007"

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import or_
@@ -55,6 +55,7 @@ from aios.models import (
 )
 from aios.orchestrator import Orchestrator, complete_task
 from aios.review import (
+    create_review_policy,
     dispatch_reviews_for_artifact,
     owner_approve_review,
     request_review_revision,
@@ -71,6 +72,7 @@ from aios.schemas import (
     KnowledgeReviewRequest,
     OrchestratorProcessResult,
     ProjectCreate,
+    ReviewPolicyCreate,
     RevisionRequest,
     TaskCreate,
 )
@@ -392,6 +394,55 @@ def create_app() -> FastAPI:
             )
         except ServiceError as error:
             raise _translate(error) from error
+
+    @application.post(
+        "/review-policies",
+        response_model=ReviewPolicy,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_review_policy_endpoint(
+        request: ReviewPolicyCreate,
+        response: Response,
+        actor: ActorContext = Depends(authenticate_owner),
+        session: Session = Depends(get_session),
+    ) -> ReviewPolicy:
+        """Create a ReviewPolicy (D3 hardening, #72 / #74).
+
+        The ONLY production path that writes a ReviewPolicy row, which addresses
+        part of the review-protocol blocker: ``dispatch`` requires an existing
+        ``policy_id`` and is intentionally unchanged (no implicit creation).
+        Equivalent duplicate requests return the existing policy with HTTP 200;
+        a newly created policy returns HTTP 201; a same-name policy with a
+        different config returns 409.
+
+        OWNER-AUTHENTICATED. The ``authenticate_owner`` dependency resolves a
+        trusted ``ActorContext(kind="owner", owner_id=AIOS_OWNER_ID)``; its
+        ``owner_id`` is recorded as the audit actor. No owner credential check
+        is bypassed and the production route never constructs an ``ActorContext``
+        directly -- access control is enforced entirely by ``authenticate_owner``.
+        """
+        try:
+            policy, created = create_review_policy(
+                session,
+                actor=actor,
+                name=request.name,
+                applies_to=request.applies_to,
+                dimensions=request.dimensions,
+                brand_policy_id=request.brand_policy_id,
+                required_reviewer_trust=request.required_reviewer_trust,
+                required_capabilities=request.required_capabilities,
+                max_revisions=request.max_revisions,
+                required_reviewers=request.required_reviewers,
+                enabled=request.enabled,
+                project_id=request.project_id,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+        # Distinguish "created new" (201) from "returned existing" (200) so the
+        # caller can tell whether a row was actually written.
+        if not created:
+            response.status_code = status.HTTP_200_OK
+        return policy
 
     @application.post(
         "/tasks/{review_task_id}/review/submit",
