@@ -344,6 +344,48 @@ def test_redact_secrets_redacts_credentials() -> None:
     assert _redact_secrets("Connection refused") == "Connection refused"
 
 
+def test_redact_secrets_redacts_48_63_alphanumeric() -> None:
+    # Issue #80 #5 / Codex BLOCKING: a 48-63 char pure-alphanumeric run (e.g. an
+    # opaque unprefixed provider/session/access token) MUST still be redacted. A
+    # regex cannot tell it from a benign trace id, and the secret-boundary
+    # invariant takes precedence over diagnostic fidelity.
+    secret = "a" * 56
+    out = _redact_secrets(secret)
+    assert "***REDACTED***" in out
+    assert secret not in out
+    sent = f"token={secret} status=500"
+    assert secret not in _redact_secrets(sent)
+
+
+def test_redact_secrets_redacts_base64_with_slash() -> None:
+    blob = "Z" * 47 + "/" + "Q" * 4  # 52 chars, contains '/'
+    out = _redact_secrets(blob)
+    assert "***REDACTED***" in out
+    assert blob not in out
+
+
+def test_redact_secrets_redacts_base64_with_plus() -> None:
+    blob = "a" * 50 + "+" + "b" * 5
+    out = _redact_secrets(blob)
+    assert "***REDACTED***" in out
+    assert blob not in out
+
+
+def test_redact_secrets_redacts_base64_with_padding() -> None:
+    blob = "Z" * 48 + "=="
+    out = _redact_secrets(blob)
+    assert "***REDACTED***" in out
+    assert blob not in out
+
+
+def test_redact_secrets_redacts_very_long_alphanumeric() -> None:
+    # Conservative secret-boundary net: >=64 pure-alphanumeric still redacted.
+    blob = "a" * 64
+    out = _redact_secrets(blob)
+    assert "***REDACTED***" in out
+    assert blob not in out
+
+
 def test_adapter_error_categorized_and_redacted_in_event(client: TestClient) -> None:
     _launch(client)
     with _session() as session:

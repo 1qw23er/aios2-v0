@@ -87,7 +87,12 @@ _SECRET_PATTERN = re.compile(
     r"|sk-[A-Za-z0-9]+"
     r"|nvapi-[A-Za-z0-9]+"
     r"|AKIA[0-9A-Z]{16}"
-    r"|[A-Za-z0-9+/]{48,}={0,2}"  # long base64-ish blobs
+    # Generic blob redaction (secret boundary, Issue #80 #5). Per Codex review the
+    # 48-63 char pure-alphanumeric relaxation is unsafe: a regex cannot tell a benign
+    # trace/content id from an opaque provider/session/access token that lacks a known
+    # prefix, and over-redaction on an error path is the documented invariant. So any
+    # 48+ char alphanumeric/base64-like run is redacted regardless of appearance.
+    r"|[A-Za-z0-9+/]{48,}={0,2}"  # long base64-ish / alphanumeric blobs (secret boundary)
 )
 
 
@@ -97,6 +102,14 @@ def _redact_secrets(text: str) -> str:
     Also redacts the live ``AIOS_AGENT_API_KEY`` value if present. Over-redaction
     is acceptable on an error path; the guarantee is that no secret ever reaches
     the database.
+
+    The generic blob rule redacts any 48+ char alphanumeric/base64-like run. An
+    appearance-based relaxation of 48-63 char strings (to spare benign trace ids /
+    content hashes) was rejected in Codex review of Issue #80 #5: a regex cannot
+    distinguish a benign identifier from an opaque unprefixed provider/session/access
+    token, so the secret-boundary invariant (no unknown secret reaches Event/AuditLog)
+    takes precedence over diagnostic fidelity. Over-redaction on an error path is
+    acceptable.
     """
     if not text:
         return text
