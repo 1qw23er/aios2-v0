@@ -14,6 +14,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import socket
+import urllib.error
+import urllib.request
+from enum import StrEnum
 from typing import Any, Protocol
 
 from jsonschema import validate
@@ -59,8 +64,66 @@ class ExecutionAdapter(Protocol):
     ) -> ExecutionResult: ...
 
 
+class AdapterErrorCategory(StrEnum):
+    """Recoverable classification for adapter failures (triage A–F).
+
+    Persisted in event/audit ``reason`` as ``adapter_error|<CATEGORY>|<detail>``.
+    Never includes provider secret, Authorization header, or raw body.
+    """
+
+    CONFIG_MISSING = "CONFIG_MISSING"  # A: no API key configured
+    NETWORK = "NETWORK"  # B: connection refused / DNS failure
+    TIMEOUT = "TIMEOUT"  # C: request timed out
+    PROVIDER_HTTP = "PROVIDER_HTTP"  # D: non-2xx from provider
+    PROVIDER_STRUCTURE = "PROVIDER_STRUCTURE"  # E: response parsed but wrong shape
+    JSON_PARSE = "JSON_PARSE"  # F: model returned non-JSON
+    UNKNOWN = "UNKNOWN"  # fallback
+
+
+_SECRET_PATTERN = re.compile(
+    r"Bearer\s+[A-Za-z0-9\-._~+/]+"
+    r"|Authorization:\s*\S+"
+    r"|api[_-]?key[=:]\s*\S+"
+    r"|sk-[A-Za-z0-9]+"
+    r"|nvapi-[A-Za-z0-9]+"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|[A-Za-z0-9+/]{48,}={0,2}"  # long base64-ish blobs
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Redact provider secrets/keys from an error detail before persistence.
+
+    Also redacts the live ``AIOS_AGENT_API_KEY`` value if present. Over-redaction
+    is acceptable on an error path; the guarantee is that no secret ever reaches
+    the database.
+    """
+    if not text:
+        return text
+    api_key = os.getenv("AIOS_AGENT_API_KEY")
+    if api_key and api_key in text:
+        text = text.replace(api_key, "***REDACTED***")
+    return _SECRET_PATTERN.sub("***REDACTED***", text)
+
+
 class ExecutionError(ServiceError):
-    """Raised when execution fails (adapter error or invalid output)."""
+    """Raised when execution fails (adapter error or invalid output).
+
+    Carries a recoverable ``category`` (AdapterErrorCategory) so failures can be
+    triaged instead of collapsing into a single generic ``adapter_error``.
+    """
+
+    category: AdapterErrorCategory
+
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        *,
+        category: AdapterErrorCategory = AdapterErrorCategory.UNKNOWN,
+    ) -> None:
+        super().__init__(status_code, detail)
+        self.category = category
 
 
 class ResultValidationError(ExecutionError):
@@ -190,8 +253,10 @@ def execute_task(
             output_schema=task.output_schema,
             idempotency_key=idempotency_key,
         )
-    except ExecutionError:
-        _mark_failed(session, task, idempotency_key, "adapter_error", actor)
+    except ExecutionError as exc:
+        category = getattr(exc, "category", AdapterErrorCategory.UNKNOWN).value
+        reason = f"adapter_error|{category}|{_redact_secrets(exc.detail)}"
+        _mark_failed(session, task, idempotency_key, reason, actor)
         raise
     except Exception as exc:  # noqa: BLE001 - surface as readable failure
         _mark_failed(
@@ -201,7 +266,7 @@ def execute_task(
             f"adapter_exception:{type(exc).__name__}",
             actor,
         )
-        raise ExecutionError(502, f"部门执行失败：{exc}") from exc
+        raise ExecutionError(502, _redact_secrets(f"部门执行失败：{exc}")) from exc
 
     # Validate each artifact's `data` against the task output_schema.
     try:
@@ -355,12 +420,20 @@ class LLMExecutionAdapter:
         idempotency_key: str,
     ) -> ExecutionResult:
         if not self.api_key:
-            raise ExecutionError(503, "执行适配器未配置：请设置 AIOS_AGENT_API_KEY 环境变量")
+            raise ExecutionError(
+                503,
+                "执行适配器未配置：请设置 AIOS_AGENT_API_KEY 环境变量",
+                category=AdapterErrorCategory.CONFIG_MISSING,
+            )
         prompt = self._build_prompt(task_context, output_schema)
         raw = self._chat(prompt)
         data = self._parse_json(raw)
         if not isinstance(data, dict):
-            raise ExecutionError(502, "模型返回的不是 JSON 对象")
+            raise ExecutionError(
+                502,
+                "模型返回的不是 JSON 对象",
+                category=AdapterErrorCategory.PROVIDER_STRUCTURE,
+            )
         artifacts = [
             {
                 "type": "json",
@@ -385,8 +458,6 @@ class LLMExecutionAdapter:
         )
 
     def _chat(self, prompt: str) -> str:
-        import urllib.request
-
         url = f"{self.base_url}/chat/completions"
         payload = {
             "model": self.model,
@@ -405,12 +476,36 @@ class LLMExecutionAdapter:
         try:
             with urllib.request.urlopen(request, timeout=120) as resp:
                 body = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            raise ExecutionError(
+                exc.code,
+                f"模型返回 HTTP {exc.code}",
+                category=AdapterErrorCategory.PROVIDER_HTTP,
+            ) from exc
+        except urllib.error.URLError as exc:
+            reason = exc.reason
+            timed_out = isinstance(reason, (TimeoutError, socket.timeout)) or (
+                "timed out" in str(reason).lower()
+            )
+            if timed_out:
+                raise ExecutionError(
+                    504, "模型调用超时", category=AdapterErrorCategory.TIMEOUT
+                ) from exc
+            raise ExecutionError(
+                502, f"模型连接失败：{reason}", category=AdapterErrorCategory.NETWORK
+            ) from exc
         except Exception as exc:  # noqa: BLE001
-            raise ExecutionError(502, f"模型调用失败：{exc}") from exc
+            raise ExecutionError(
+                502, f"模型调用失败：{exc}", category=AdapterErrorCategory.UNKNOWN
+            ) from exc
         try:
             return body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise ExecutionError(502, f"模型返回结构异常：{exc}") from exc
+            raise ExecutionError(
+                502,
+                f"模型返回结构异常：{exc}",
+                category=AdapterErrorCategory.PROVIDER_STRUCTURE,
+            ) from exc
 
     @staticmethod
     def _parse_json(text: str) -> Any:
@@ -429,4 +524,6 @@ class LLMExecutionAdapter:
                     return json.loads(text[start : end + 1])
                 except json.JSONDecodeError:
                     pass
-            raise ExecutionError(502, "模型未返回可解析的 JSON") from None
+            raise ExecutionError(
+                502, "模型未返回可解析的 JSON", category=AdapterErrorCategory.JSON_PARSE
+            ) from None

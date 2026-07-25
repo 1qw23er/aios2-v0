@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import urllib.error
+import urllib.request
 from typing import Any
 
 import pytest
@@ -10,9 +13,12 @@ from aios.api.app import create_app
 from aios.campaign import V1_TASKS
 from aios.db import get_database_url, get_engine
 from aios.execution import (
+    AdapterErrorCategory,
     ExecutionError,
     ExecutionResult,
+    LLMExecutionAdapter,
     ResultValidationError,
+    _redact_secrets,
     execute_task,
 )
 from aios.models import (
@@ -303,3 +309,180 @@ def test_owner_board_shows_run_button_and_artifact(client: TestClient) -> None:
 def _project_id(client: TestClient) -> str:
     with _session() as session:
         return session.exec(select(Project)).first().id
+
+
+# --- adapter error classification (defect #78) ---
+
+
+class CategorizedAdapter:
+    """Adapter that raises an ExecutionError with an explicit category."""
+
+    def __init__(
+        self,
+        *,
+        category: AdapterErrorCategory = AdapterErrorCategory.UNKNOWN,
+        detail: str = "error",
+    ) -> None:
+        self.category = category
+        self.detail = detail
+
+    def run(self, *, task_id, task_context, output_schema, idempotency_key) -> ExecutionResult:
+        raise ExecutionError(502, self.detail, category=self.category)
+
+
+def test_redact_secrets_redacts_credentials() -> None:
+    out = _redact_secrets(
+        "Bearer nvapi-abcdef123456 and sk-abcd1234 and AKIAIOSFODNN7EXAMPLE"
+    )
+    assert "nvapi-abcdef123456" not in out
+    assert "sk-abcd1234" not in out
+    assert "AKIAIOSFODNN7EXAMPLE" not in out
+    assert "***REDACTED***" in out
+    # benign text is untouched
+    assert _redact_secrets("Connection refused") == "Connection refused"
+
+
+def test_adapter_error_categorized_and_redacted_in_event(client: TestClient) -> None:
+    _launch(client)
+    with _session() as session:
+        t1 = _task_by_key(session, "T1")
+        with pytest.raises(ExecutionError):
+            execute_task(
+                session,
+                t1.id,
+                "cat",
+                adapter=CategorizedAdapter(
+                    category=AdapterErrorCategory.UNKNOWN,
+                    detail="Bearer nvapi-SUPERSECRET123 leaked",
+                ),
+            )
+        ev = session.exec(
+            select(Event).where(Event.type == "task.failed", Event.task_id == t1.id)
+        ).first()
+        assert ev is not None
+        reason = ev.payload["reason"]
+        assert reason.startswith("adapter_error|UNKNOWN|")
+        assert "nvapi-SUPERSECRET123" not in reason
+        assert "***REDACTED***" in reason
+
+
+def test_adapter_error_explicit_network_category(client: TestClient) -> None:
+    _launch(client)
+    with _session() as session:
+        t1 = _task_by_key(session, "T1")
+        with pytest.raises(ExecutionError):
+            execute_task(
+                session,
+                t1.id,
+                "net",
+                adapter=CategorizedAdapter(
+                    category=AdapterErrorCategory.NETWORK, detail="模型连接失败"
+                ),
+            )
+        ev = session.exec(
+            select(Event).where(Event.type == "task.failed", Event.task_id == t1.id)
+        ).first()
+        assert ev.payload["reason"] == "adapter_error|NETWORK|模型连接失败"
+
+
+class _FakeResp:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def __enter__(self) -> _FakeResp:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._data
+
+
+def test_llm_chat_categorizes_provider_http(monkeypatch) -> None:
+    def fake(*_a, **_k):
+        raise urllib.error.HTTPError("http://x", 503, "x", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    adapter = LLMExecutionAdapter(api_key="not-a-secret")
+    with pytest.raises(ExecutionError) as exc:
+        adapter._chat("prompt")
+    assert exc.value.category == AdapterErrorCategory.PROVIDER_HTTP
+    assert exc.value.status_code == 503
+
+
+def test_llm_chat_categorizes_timeout(monkeypatch) -> None:
+    def fake(*_a, **_k):
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    adapter = LLMExecutionAdapter(api_key="not-a-secret")
+    with pytest.raises(ExecutionError) as exc:
+        adapter._chat("prompt")
+    assert exc.value.category == AdapterErrorCategory.TIMEOUT
+
+
+def test_llm_chat_categorizes_network(monkeypatch) -> None:
+    def fake(*_a, **_k):
+        raise urllib.error.URLError("Name or service not known")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    adapter = LLMExecutionAdapter(api_key="not-a-secret")
+    with pytest.raises(ExecutionError) as exc:
+        adapter._chat("prompt")
+    assert exc.value.category == AdapterErrorCategory.NETWORK
+
+
+def test_llm_chat_categorizes_structure(monkeypatch) -> None:
+    def fake(*_a, **_k):
+        return _FakeResp(json.dumps({"choices": []}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    adapter = LLMExecutionAdapter(api_key="not-a-secret")
+    with pytest.raises(ExecutionError) as exc:
+        adapter._chat("prompt")
+    assert exc.value.category == AdapterErrorCategory.PROVIDER_STRUCTURE
+
+
+def test_parse_json_raises_json_parse_category() -> None:
+    with pytest.raises(ExecutionError) as exc:
+        LLMExecutionAdapter._parse_json("this is not json at all")
+    assert exc.value.category == AdapterErrorCategory.JSON_PARSE
+
+
+def test_redact_secrets_short_live_key_in_event(monkeypatch, client: TestClient) -> None:
+    # Codex BLOCKING: a credential shorter than 8 chars must still be redacted.
+    monkeypatch.setenv("AIOS_AGENT_API_KEY", "abc12")
+    _launch(client)
+    with _session() as session:
+        t1 = _task_by_key(session, "T1")
+        with pytest.raises(ExecutionError):
+            execute_task(
+                session,
+                t1.id,
+                "shortkey",
+                adapter=CategorizedAdapter(
+                    category=AdapterErrorCategory.UNKNOWN,
+                    detail="oops abc12 leaked",
+                ),
+            )
+        ev = session.exec(
+            select(Event).where(Event.type == "task.failed", Event.task_id == t1.id)
+        ).first()
+        assert ev is not None
+        reason = ev.payload["reason"]
+        assert "abc12" not in reason  # exact short key must be absent
+        assert "***REDACTED***" in reason
+
+
+def test_llm_chat_categorizes_config_missing() -> None:
+    adapter = LLMExecutionAdapter(api_key=None)
+    with pytest.raises(ExecutionError) as exc:
+        adapter.run(
+            task_id="t",
+            task_context=object(),  # not accessed before the api_key guard
+            output_schema={},
+            idempotency_key="k",
+        )
+    assert exc.value.category == AdapterErrorCategory.CONFIG_MISSING
+    assert exc.value.status_code == 503
