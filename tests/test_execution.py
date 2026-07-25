@@ -14,12 +14,14 @@ from aios.campaign import V1_TASKS
 from aios.db import get_database_url, get_engine
 from aios.execution import (
     AdapterErrorCategory,
+    AdapterErrorReason,
     ExecutionError,
     ExecutionResult,
     LLMExecutionAdapter,
     ResultValidationError,
     _redact_secrets,
     execute_task,
+    parse_adapter_error_reason,
 )
 from aios.models import (
     Artifact,
@@ -485,4 +487,76 @@ def test_llm_chat_categorizes_config_missing() -> None:
             idempotency_key="k",
         )
     assert exc.value.category == AdapterErrorCategory.CONFIG_MISSING
-    assert exc.value.status_code == 503
+
+
+def test_llm_chat_fetch_path_non_http_url_error_is_categorized(monkeypatch) -> None:
+    # Regression test for the #81 Codex BLOCKING finding: transport/runtime
+    # exceptions raised by urlopen that are NOT HTTPError/URLError must still
+    # become a categorized ExecutionError (UNKNOWN), not escape as
+    # 'adapter_exception:<Type>'.
+    def fake(*_a, **_k):
+        raise RuntimeError("connection reset by peer")  # outside HTTP/URL branches
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    adapter = LLMExecutionAdapter(api_key="not-a-secret")
+    with pytest.raises(ExecutionError) as exc:
+        adapter._chat("prompt")
+    assert exc.value.category == AdapterErrorCategory.UNKNOWN
+    assert "adapter_exception" not in exc.value.detail
+
+
+def test_llm_chat_fetch_path_direct_timeout_is_timed_out(monkeypatch) -> None:
+    # A bare TimeoutError raised by urlopen (not wrapped in URLError) must map
+    # to TIMEOUT, preserving the adapter-error contract.
+    def fake(*_a, **_k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    adapter = LLMExecutionAdapter(api_key="not-a-secret")
+    with pytest.raises(ExecutionError) as exc:
+        adapter._chat("prompt")
+    assert exc.value.category == AdapterErrorCategory.TIMEOUT
+
+
+def test_llm_chat_body_non_json_is_json_parse(monkeypatch) -> None:
+    # Body-level non-JSON response must be JSON_PARSE, not UNKNOWN.
+    def fake(*_a, **_k):
+        return _FakeResp(b"this is not json")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    adapter = LLMExecutionAdapter(api_key="not-a-secret")
+    with pytest.raises(ExecutionError) as exc:
+        adapter._chat("prompt")
+    assert exc.value.category == AdapterErrorCategory.JSON_PARSE
+    assert exc.value.status_code == 502
+
+
+def test_llm_chat_categorizes_body_json_parse(monkeypatch) -> None:
+    # Issue #80 #4: a non-JSON HTTP body must map to JSON_PARSE, not UNKNOWN.
+    def fake(*_a, **_k):
+        return _FakeResp(b"this is not json at all")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    adapter = LLMExecutionAdapter(api_key="not-a-secret")
+    with pytest.raises(ExecutionError) as exc:
+        adapter._chat("prompt")
+    assert exc.value.category == AdapterErrorCategory.JSON_PARSE
+    assert exc.value.status_code == 502
+
+
+def test_parse_adapter_error_reason_covers_all_formats() -> None:
+    # Issue #80 #3: stable parser for external tooling.
+    classified = parse_adapter_error_reason("adapter_error|PROVIDER_HTTP|模型返回 HTTP 503")
+    assert classified == AdapterErrorReason("adapter_error", "PROVIDER_HTTP", "模型返回 HTTP 503")
+
+    legacy = parse_adapter_error_reason("adapter_error")
+    assert legacy == AdapterErrorReason("adapter_error", None, "")
+
+    exc = parse_adapter_error_reason("adapter_exception:ValueError")
+    assert exc == AdapterErrorReason("adapter_exception", None, "ValueError")
+
+    validation = parse_adapter_error_reason("validation:missing field 'summary'")
+    assert validation == AdapterErrorReason("validation", None, "missing field 'summary'")
+
+    unknown = parse_adapter_error_reason("some-future-format")
+    assert unknown == AdapterErrorReason("some-future-format", None, "")

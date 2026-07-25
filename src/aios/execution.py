@@ -19,7 +19,7 @@ import socket
 import urllib.error
 import urllib.request
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from jsonschema import validate
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
@@ -358,6 +358,12 @@ def _mark_failed(
 ) -> None:
     from aios.audit import append_audit
 
+    # Reason format convention (consumed by parse_adapter_error_reason):
+    #   adapter_error|<CATEGORY>|<redacted-detail>   (ExecutionError, sanitized)
+    #   adapter_exception:<ExceptionType>             (unexpected Python error)
+    #   validation:<message>                          (output-schema failure)
+    #   adapter_error                                 (pre-classification legacy)
+    # The <redacted-detail> portion is safe to persist (no secret/body/prompt).
     before = task.status
     task.status = TaskStatus.FAILED
     task.updated_at = now_utc()
@@ -387,6 +393,39 @@ def _mark_failed(
     except Exception:
         session.rollback()
         raise
+
+
+class AdapterErrorReason(NamedTuple):
+    """Structured view of a persisted ``task.failed`` / audit ``reason``.
+
+    External tooling should parse reasons through ``parse_adapter_error_reason``
+    rather than hard-matching the bare literal ``"adapter_error"`` (the format
+    changed in PR #79 to carry a recoverable category). See ``_mark_failed``.
+    """
+
+    prefix: str  # one of: adapter_error | adapter_exception | validation | <other>
+    category: str | None  # AdapterErrorCategory value when present, else None
+    detail: str  # redacted human-readable detail (never contains secrets)
+
+
+def parse_adapter_error_reason(reason: str) -> AdapterErrorReason:
+    """Parse a persisted failure ``reason`` into its parts.
+
+    Never raises. Unknown formats are returned with ``prefix=<raw>`` and both
+    ``category``/``detail`` as ``None``/``""`` so callers can fall back gracefully.
+    """
+    if reason.startswith("adapter_error|"):
+        parts = reason.split("|", 2)
+        category = parts[1] if len(parts) > 1 else None
+        detail = parts[2] if len(parts) > 2 else ""
+        return AdapterErrorReason("adapter_error", category or None, detail)
+    if reason == "adapter_error":
+        return AdapterErrorReason("adapter_error", None, "")
+    if reason.startswith("adapter_exception:"):
+        return AdapterErrorReason("adapter_exception", None, reason.split(":", 1)[1])
+    if reason.startswith("validation:"):
+        return AdapterErrorReason("validation", None, reason.split(":", 1)[1])
+    return AdapterErrorReason(reason, None, "")
 
 
 class LLMExecutionAdapter:
@@ -473,9 +512,10 @@ class LLMExecutionAdapter:
                 "Authorization": f"Bearer {self.api_key}",
             },
         )
+        raw = ""
         try:
             with urllib.request.urlopen(request, timeout=120) as resp:
-                body = json.loads(resp.read().decode())
+                raw = resp.read().decode()
         except urllib.error.HTTPError as exc:
             raise ExecutionError(
                 exc.code,
@@ -493,6 +533,34 @@ class LLMExecutionAdapter:
                 ) from exc
             raise ExecutionError(
                 502, f"模型连接失败：{reason}", category=AdapterErrorCategory.NETWORK
+            ) from exc
+        except UnicodeDecodeError as exc:
+            raise ExecutionError(
+                502, "模型返回无法解码的响应体", category=AdapterErrorCategory.JSON_PARSE
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - transport/runtime error outside HTTP/URL
+            # Restore the pre-#81 catch-all for transport exceptions that are not
+            # HTTPError / URLError (e.g. a direct TimeoutError, ssl.SSLError, or any
+            # other runtime error raised by urlopen). Without this, such failures
+            # escape _chat() and reach execute_task's generic branch as
+            # 'adapter_exception:<Type>', regressing the adapter-error contract.
+            timed_out = isinstance(exc, (TimeoutError, socket.timeout)) or (
+                "timed out" in str(getattr(exc, "reason", "")).lower()
+            )
+            if timed_out:
+                raise ExecutionError(
+                    504, "模型调用超时", category=AdapterErrorCategory.TIMEOUT
+                ) from exc
+            raise ExecutionError(
+                502, f"模型调用失败：{exc}", category=AdapterErrorCategory.UNKNOWN
+            ) from exc
+        # Body-level JSON decode failure is categorized JSON_PARSE (uniform with
+        # the content-level parse in _parse_json), not the catch-all UNKNOWN.
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ExecutionError(
+                502, "模型返回非 JSON 响应体", category=AdapterErrorCategory.JSON_PARSE
             ) from exc
         except Exception as exc:  # noqa: BLE001
             raise ExecutionError(
