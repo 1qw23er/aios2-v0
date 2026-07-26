@@ -62,6 +62,23 @@ def _safe(value: Any) -> Any:
     return value
 
 
+def _structured_artifacts(metadata_json: dict[str, Any]) -> list[Any]:
+    """Extract structured artifact payloads from an Artifact's ``metadata_json``.
+
+    Repo fail-safe convention: a valid ``list`` is propagated **unchanged** as
+    JSON-compatible structured data; a *missing key*, ``null``, or any
+    *non-list* (malformed) value returns ``[]`` rather than being silently
+    injected. This mirrors the coercion used for ``summary``
+    (``summary if isinstance(summary, str) else ""``) and ``review.py``'s
+    ``(.get("artifacts") or [])``. The returned value is never mutated and the
+    stored ``Artifact`` / prior ``TaskContext`` snapshots are left untouched.
+    """
+    value = metadata_json.get("artifacts")
+    if isinstance(value, list):
+        return value
+    return []
+
+
 def _timestamp(value: datetime) -> str:
     normalized = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     return normalized.astimezone(UTC).isoformat().replace("+00:00", "Z")
@@ -302,6 +319,10 @@ class ContextService:
                         "type": artifact.type.value,
                         "checksum": artifact.checksum,
                         "summary": summary if isinstance(summary, str) else "",
+                        # Redact sensitive keys (e.g. api_key/token/password) before
+                        # injecting into the downstream TaskContext, and produce a
+                        # detached copy instead of reusing the ORM JSON container.
+                        "artifacts": _safe(_structured_artifacts(artifact.metadata_json)),
                     }
                 )
                 references.append(
