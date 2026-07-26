@@ -16,6 +16,7 @@ import json
 import os
 import re
 import socket
+import time
 import urllib.error
 import urllib.request
 from enum import StrEnum
@@ -51,6 +52,9 @@ class ExecutionResult(BaseModel):
     summary: str
     claims: list[dict[str, Any]] = []
     artifacts: list[dict[str, Any]] = []
+    # Optional adapter-supplied accounting (e.g. retry attempt count). Never
+    # holds secrets; consumed only for auditing, not output-schema validation.
+    metadata: dict[str, Any] = {}
 
 
 class ExecutionAdapter(Protocol):
@@ -78,6 +82,30 @@ class AdapterErrorCategory(StrEnum):
     PROVIDER_STRUCTURE = "PROVIDER_STRUCTURE"  # E: response parsed but wrong shape
     JSON_PARSE = "JSON_PARSE"  # F: model returned non-JSON
     UNKNOWN = "UNKNOWN"  # fallback
+
+
+# Retry is intentionally narrow: only *transient, likely-self-healing* transport
+# failures are retried. A provider returning 4xx/5xx (PROVIDER_HTTP), a malformed
+# body (PROVIDER_STRUCTURE / JSON_PARSE), a missing key (CONFIG_MISSING), or any
+# unexpected error (UNKNOWN) is NOT retried — re-sending the identical prompt would
+# waste owner-paid tokens and can never succeed. This allowlist is the contract
+# Codex required in the PR #56 blocking review (no over-broad retry).
+_RETRYABLE_CATEGORIES: frozenset[AdapterErrorCategory] = frozenset(
+    {AdapterErrorCategory.TIMEOUT, AdapterErrorCategory.NETWORK}
+)
+
+# Default ceiling on *additional* attempts (so MAX_RETRIES=2 means 1 initial +
+# 2 retries = 3 total outbound calls). Set AIOS_AGENT_MAX_RETRIES=0 to disable
+# retry entirely (1 outbound call, fail-fast). Tunable per environment.
+DEFAULT_MAX_RETRIES = 2
+DEFAULT_BACKOFF_SECONDS = 2.0
+
+# HARD SAFETY CAP on retries (Issue #55, Codex blocking review #1). A malformed
+# or hostile AIOS_AGENT_MAX_RETRIES (e.g. 100000) must NEVER translate into that
+# many paid outbound calls. This frozen constant bounds total outbound calls to
+# 1 + MAX_RETRIES_HARD_CAP regardless of the env value. It caps *total cost*,
+# not just a single sleep.
+MAX_RETRIES_HARD_CAP = 5
 
 
 _SECRET_PATTERN = re.compile(
@@ -127,6 +155,12 @@ class ExecutionError(ServiceError):
     """
 
     category: AdapterErrorCategory
+
+    # Set by LLMExecutionAdapter.run() on the *final* retry-exhausted failure so
+    # execute_task() can persist them. None for non-retry failures / unexpected
+    # errors (which have no meaningful attempt accounting).
+    attempts: int | None = None
+    max_attempts: int | None = None
 
     def __init__(
         self,
@@ -269,7 +303,15 @@ def execute_task(
     except ExecutionError as exc:
         category = getattr(exc, "category", AdapterErrorCategory.UNKNOWN).value
         reason = f"adapter_error|{category}|{_redact_secrets(exc.detail)}"
-        _mark_failed(session, task, idempotency_key, reason, actor)
+        # Persist structured retry accounting if the adapter supplied it (Codex #2).
+        meta = None
+        attempts = getattr(exc, "attempts", None)
+        if attempts is not None:
+            meta = {
+                "attempts": attempts,
+                "max_attempts": getattr(exc, "max_attempts", None),
+            }
+        _mark_failed(session, task, idempotency_key, reason, actor, meta=meta)
         raise
     except Exception as exc:  # noqa: BLE001 - surface as readable failure
         _mark_failed(
@@ -320,6 +362,24 @@ def execute_task(
             provenance_json = build_delegated_provenance(
                 adapter, persisted_run if persisted_run is not None else run
             )
+    # Persist retry accounting from the adapter (Codex #2): only when the adapter
+    # actually reported attempts (else omitted to keep metadata clean). These are
+    # plain counts — no secret/body/prompt — so safe to store verbatim.
+    # Use getattr: the delegated adapter may return a shim (e.g. _ExecutionResultShim)
+    # without a `metadata` field.
+    attempt_meta = getattr(result, "metadata", None) or {}
+    persisted_attempts = attempt_meta.get("attempts")
+    artifact_metadata = {
+        "summary": result.summary,
+        "actor": actor,
+        "adapter": source,
+        "context_hash": context.context_hash,
+        "artifacts": result.artifacts,
+        "claims": result.claims,
+    }
+    if persisted_attempts is not None:
+        artifact_metadata["attempts"] = persisted_attempts
+        artifact_metadata["max_attempts"] = attempt_meta.get("max_attempts")
     artifact = Artifact(
         project_id=task.project_id,
         task_id=task.id,
@@ -331,17 +391,17 @@ def execute_task(
         checksum=checksum,
         external_result_id=exec_result_id,
         result_checksum=checksum,
-        metadata_json={
-            "summary": result.summary,
-            "actor": actor,
-            "adapter": source,
-            "context_hash": context.context_hash,
-            "artifacts": result.artifacts,
-            "claims": result.claims,
-        },
+        metadata_json=artifact_metadata,
     )
     try:
         session.add(artifact)
+        audit_after: dict[str, Any] = {
+            "external_result_id": exec_result_id,
+            "summary": result.summary,
+        }
+        if persisted_attempts is not None:
+            audit_after["attempts"] = persisted_attempts
+            audit_after["max_attempts"] = attempt_meta.get("max_attempts")
         append_audit(
             session,
             actor=actor,
@@ -351,7 +411,7 @@ def execute_task(
             project_id=task.project_id,
             task_id=task.id,
             before={},
-            after={"external_result_id": exec_result_id, "summary": result.summary},
+            after=audit_after,
             idempotency_key=f"audit:exec:{idempotency_key}:artifact",
         )
         # Complete the task (emits task.completed, idempotent on its own key).
@@ -367,7 +427,13 @@ def execute_task(
 
 
 def _mark_failed(
-    session: Session, task: Task, idempotency_key: str, reason: str, actor: str
+    session: Session,
+    task: Task,
+    idempotency_key: str,
+    reason: str,
+    actor: str,
+    *,
+    meta: dict[str, Any] | None = None,
 ) -> None:
     from aios.audit import append_audit
 
@@ -377,18 +443,27 @@ def _mark_failed(
     #   validation:<message>                          (output-schema failure)
     #   adapter_error                                 (pre-classification legacy)
     # The <redacted-detail> portion is safe to persist (no secret/body/prompt).
+    # `meta` carries structured, secret-free extras (e.g. retry attempts /
+    # max_attempts) merged into the event + audit record so attempt accounting
+    # is queryable, not just buried in the human-readable reason string.
     before = task.status
     task.status = TaskStatus.FAILED
     task.updated_at = now_utc()
     session.add(task)
+    event_payload: dict[str, Any] = {"reason": reason, "before": before.value}
+    if meta:
+        event_payload.update(meta)
     append_event(
         session,
         project_id=task.project_id,
         task_id=task.id,
         event_type="task.failed",
         idempotency_key=f"exec:{idempotency_key}:failed",
-        payload={"reason": reason, "before": before.value},
+        payload=event_payload,
     )
+    audit_after: dict[str, Any] = {"status": TaskStatus.FAILED.value, "reason": reason}
+    if meta:
+        audit_after.update(meta)
     append_audit(
         session,
         actor=actor,
@@ -398,7 +473,7 @@ def _mark_failed(
         project_id=task.project_id,
         task_id=task.id,
         before={"status": before.value},
-        after={"status": TaskStatus.FAILED.value, "reason": reason},
+        after=audit_after,
         idempotency_key=f"audit:exec:{idempotency_key}:failed",
     )
     try:
@@ -456,12 +531,42 @@ class LLMExecutionAdapter:
         base_url: str | None = None,
         api_key: str | None = None,
         model: str | None = None,
+        max_retries: int | None = None,
+        backoff_seconds: float | None = None,
     ) -> None:
         self.base_url = (
             base_url or os.getenv("AIOS_AGENT_BASE_URL", "https://integrate.api.nvidia.com/v1")
         ).rstrip("/")
         self.api_key = api_key if api_key is not None else os.getenv("AIOS_AGENT_API_KEY")
         self.model = model or os.getenv("AIOS_AGENT_MODEL", "deepseek-ai/deepseek-v4-pro")
+        # Retry is ON by default (owner cost approval captured in Issue #55) and
+        # tunable: AIOS_AGENT_MAX_RETRIES (0 disables) and AIOS_AGENT_BACKOFF
+        # (base seconds; exponential growth capped). Values are clamped so a bad
+        # env cannot produce unbounded loops.
+        raw_retries = (
+            max_retries if max_retries is not None else os.getenv("AIOS_AGENT_MAX_RETRIES")
+        )
+        try:
+            self.max_retries = int(raw_retries) if raw_retries is not None else DEFAULT_MAX_RETRIES
+        except (TypeError, ValueError):
+            self.max_retries = DEFAULT_MAX_RETRIES
+        # HARD CAP (Codex blocking #1): never let a runaway/forged env value blow
+        # up paid outbound calls. Clamp to MAX_RETRIES_HARD_CAP from above.
+        if self.max_retries > MAX_RETRIES_HARD_CAP:
+            self.max_retries = MAX_RETRIES_HARD_CAP
+        if self.max_retries < 0:
+            self.max_retries = 0
+        raw_backoff = (
+            backoff_seconds if backoff_seconds is not None else os.getenv("AIOS_AGENT_BACKOFF")
+        )
+        try:
+            self.backoff_seconds = (
+                float(raw_backoff) if raw_backoff is not None else DEFAULT_BACKOFF_SECONDS
+            )
+        except (TypeError, ValueError):
+            self.backoff_seconds = DEFAULT_BACKOFF_SECONDS
+        if self.backoff_seconds < 0:
+            self.backoff_seconds = 0.0
 
     def run(
         self,
@@ -478,25 +583,73 @@ class LLMExecutionAdapter:
                 category=AdapterErrorCategory.CONFIG_MISSING,
             )
         prompt = self._build_prompt(task_context, output_schema)
-        raw = self._chat(prompt)
-        data = self._parse_json(raw)
-        if not isinstance(data, dict):
-            raise ExecutionError(
-                502,
-                "模型返回的不是 JSON 对象",
-                category=AdapterErrorCategory.PROVIDER_STRUCTURE,
-            )
-        artifacts = [
-            {
-                "type": "json",
-                "uri": f"exec://{task_id}/{idempotency_key}",
-                "summary": data.get("summary", "执行产物"),
-                "data": data,
-            }
-        ]
-        return ExecutionResult(
-            summary=data.get("summary", "执行产物"), claims=[], artifacts=artifacts
+        # Retry loop: only TIMEOUT / NETWORK (see _RETRYABLE_CATEGORIES) are
+        # retried. Non-retryable categories raise on the first attempt with a
+        # single outbound call. Attempt accounting is exposed on the result so
+        # execute_task can audit it. `last_sanitized` holds the redacted detail of
+        # the final failure (never the raw exception / secret).
+        last_exc: ExecutionError | None = None
+        attempts = 0
+        max_attempts = 1 + self.max_retries
+        for attempt in range(1, max_attempts + 1):
+            attempts = attempt
+            try:
+                recovery = None if attempt == 1 else self._RETRY_RECOVERY_HINT
+                raw = self._chat(prompt, attempt=attempt, recovery_hint=recovery)
+            except ExecutionError as exc:
+                last_exc = exc
+                if exc.category in _RETRYABLE_CATEGORIES and attempt < max_attempts:
+                    # Bounded sleep: exponential backoff capped at 30s. No secret
+                    # or raw error text is carried into the recovery prompt.
+                    delay = min(self.backoff_seconds * (2 ** (attempt - 1)), 30.0)
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+                break  # non-retryable, or out of attempts
+            else:
+                data = self._parse_json(raw)
+                if not isinstance(data, dict):
+                    raise ExecutionError(
+                        502,
+                        "模型返回的不是 JSON 对象",
+                        category=AdapterErrorCategory.PROVIDER_STRUCTURE,
+                    )
+                artifacts = [
+                    {
+                        "type": "json",
+                        "uri": f"exec://{task_id}/{idempotency_key}",
+                        "summary": data.get("summary", "执行产物"),
+                        "data": data,
+                    }
+                ]
+                result = ExecutionResult(
+                    summary=data.get("summary", "执行产物"),
+                    claims=[],
+                    artifacts=artifacts,
+                    metadata={"attempts": attempts, "max_attempts": max_attempts},
+                )
+                return result
+        # All attempts exhausted (or a non-retryable category on the first try).
+        assert last_exc is not None  # loop either raised or stored last_exc
+        attempts_made = attempts
+        sanitized_detail = _redact_secrets(last_exc.detail)
+        err = ExecutionError(
+            last_exc.status_code,
+            f"执行在 {attempts_made} 次尝试后失败（{last_exc.category.value}）：{sanitized_detail}",
+            category=last_exc.category,
         )
+        # Persist attempt accounting for execute_task() to record (Codex #2).
+        err.attempts = attempts_made
+        err.max_attempts = max_attempts
+        raise err from last_exc
+
+    # Hint appended to the prompt on retry attempts. Deliberately contains NO
+    # error text, exception string, or secret — just instructs the model to
+    # retry. This satisfies Codex's "sanitize recovery prompt" requirement.
+    _RETRY_RECOVERY_HINT = (
+        "\n\n[系统提示] 上一次调用因瞬时网络/超时问题未返回，"
+        "请在不改变任务目标的前提下重新生成结果。"
+    )
 
     def _build_prompt(self, task_context: TaskContext, output_schema: dict[str, Any]) -> str:
         md = render_task_context_markdown(task_context)
@@ -509,11 +662,16 @@ class LLMExecutionAdapter:
             + json.dumps(output_schema, ensure_ascii=False, indent=2)
         )
 
-    def _chat(self, prompt: str) -> str:
+    def _chat(self, prompt: str, *, attempt: int = 1, recovery_hint: str | None = None) -> str:
+        # `attempt` is the 1-based call index (for diagnostics). `recovery_hint`
+        # (when present, on retries) is the sanitized instruction appended to the
+        # prompt — it never contains the raw error or any secret (see
+        # _RETRY_RECOVERY_HINT). This keeps the recovery path leak-free.
+        effective_prompt = prompt + (recovery_hint or "")
         url = f"{self.base_url}/chat/completions"
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": effective_prompt}],
             "temperature": 0.3,
             "max_tokens": 4000,
         }

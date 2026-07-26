@@ -10,9 +10,11 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 from aios.api.app import create_app
+from aios.audit import AuditLog
 from aios.campaign import V1_TASKS
 from aios.db import get_database_url, get_engine
 from aios.execution import (
+    MAX_RETRIES_HARD_CAP,
     AdapterErrorCategory,
     AdapterErrorReason,
     ExecutionError,
@@ -602,3 +604,264 @@ def test_parse_adapter_error_reason_covers_all_formats() -> None:
 
     unknown = parse_adapter_error_reason("some-future-format")
     assert unknown == AdapterErrorReason("some-future-format", None, "")
+
+
+# --- Issue #55: retry + self-heal on transient transport failures ---
+
+class RetryingLLMExecutionAdapter(LLMExecutionAdapter):
+    """Test double for the production adapter.
+
+    Mirrors LLMExecutionAdapter.run's contract but substitutes the network
+    boundary: ``failures`` is a list of (category, detail) pairs raised on
+    successive outbound attempts (in order), after which a valid JSON string is
+    returned. ``calls`` counts how many times the transport (``_chat``) was
+    invoked — this is the key observable for "non-retryable = 1 call".
+    """
+
+    def __init__(self, *, failures=(), max_retries=2, backoff_seconds=0.0) -> None:
+        super().__init__(max_retries=max_retries, backoff_seconds=backoff_seconds)
+        # Always configured so we pass the CONFIG_MISSING gate.
+        self.api_key = "test-key-not-real"
+        self.base_url = "https://example.invalid/v1"
+        self.model = "test-model"
+        self._failures = list(failures)
+        self.calls = 0
+
+    def _chat(self, prompt: str, *, attempt: int = 1, recovery_hint: str | None = None) -> str:
+        self.calls += 1
+        if self._failures:
+            category, detail = self._failures.pop(0)
+            status = 504 if category == AdapterErrorCategory.TIMEOUT else 502
+            raise ExecutionError(status, detail, category=category)
+        # Success: returns a valid JSON object string expected by run()/_parse_json.
+        return '{"summary": "ok", "data": {}}'
+
+
+def _ctx_and_schema():
+    schema = {"type": "object", "properties": {"summary": {"type": "string"}}}
+    ctx = TaskContext(
+        task_id="t-fake",
+        project_id="p-fake",
+        objective="x",
+        instructions="x",
+        context_hash="h",
+    )
+    return ctx, schema
+
+
+def test_retry_then_succeed_is_capped_at_max_attempts() -> None:
+    # Two transient TIMEOUT failures then success -> 3 outbound calls, 1 result.
+    adapter = RetryingLLMExecutionAdapter(
+        failures=[
+            (AdapterErrorCategory.TIMEOUT, "模型调用超时"),
+            (AdapterErrorCategory.TIMEOUT, "模型调用超时"),
+        ],
+        max_retries=2,
+        backoff_seconds=0.0,
+    )
+    ctx, schema = _ctx_and_schema()
+    result = adapter.run(task_id="t1", task_context=ctx, output_schema=schema, idempotency_key="k")
+    assert adapter.calls == 3
+    assert result.summary == "ok"
+    assert result.metadata["attempts"] == 3
+    assert result.metadata["max_attempts"] == 3
+
+
+def test_non_retryable_category_makes_single_outbound_call() -> None:
+    # PROVIDER_HTTP (non-retryable) -> exactly 1 call, no retry, no backoff.
+    adapter = RetryingLLMExecutionAdapter(
+        failures=[(AdapterErrorCategory.PROVIDER_HTTP, "模型返回 HTTP 503")],
+        max_retries=2,
+        backoff_seconds=0.0,
+    )
+    ctx, schema = _ctx_and_schema()
+    with pytest.raises(ExecutionError) as exc:
+        adapter.run(task_id="t1", task_context=ctx, output_schema=schema, idempotency_key="k")
+    assert adapter.calls == 1
+    assert exc.value.category == AdapterErrorCategory.PROVIDER_HTTP
+
+
+def test_max_retries_zero_disables_retry() -> None:
+    # AIOS_AGENT_MAX_RETRIES=0 equivalent: one TIMEOUT then no further attempts.
+    adapter = RetryingLLMExecutionAdapter(
+        failures=[(AdapterErrorCategory.TIMEOUT, "模型调用超时")],
+        max_retries=0,
+        backoff_seconds=0.0,
+    )
+    ctx, schema = _ctx_and_schema()
+    with pytest.raises(ExecutionError):
+        adapter.run(task_id="t1", task_context=ctx, output_schema=schema, idempotency_key="k")
+    assert adapter.calls == 1
+
+
+def test_recovery_prompt_is_sanitized_no_raw_error() -> None:
+    # The recovery hint appended on retries must NOT contain the raw error text.
+    captured = {}
+
+    class SpyAdapter(RetryingLLMExecutionAdapter):
+        def _chat(self, prompt: str, *, attempt: int = 1, recovery_hint: str | None = None) -> str:
+            if attempt == 2:
+                captured["hint"] = recovery_hint
+            return super()._chat(prompt, attempt=attempt, recovery_hint=recovery_hint)
+
+    adapter = SpyAdapter(
+        failures=[(AdapterErrorCategory.NETWORK, "模型连接失败：Connection refused")],
+        max_retries=2,
+        backoff_seconds=0.0,
+    )
+    ctx, schema = _ctx_and_schema()
+    adapter.run(task_id="t1", task_context=ctx, output_schema=schema, idempotency_key="k")
+    # On the 2nd attempt a hint is present...
+    assert captured["hint"] is not None
+    # ...and it never carries the raw error detail or a secret.
+    assert "Connection refused" not in captured["hint"]
+    assert "模型连接失败" not in captured["hint"]
+
+
+def test_per_attempt_accounting_present_on_success() -> None:
+    # Each attempt is accounted for via result.metadata.
+    adapter = RetryingLLMExecutionAdapter(
+        failures=[(AdapterErrorCategory.NETWORK, "模型连接失败：DNS")],
+        max_retries=3,
+        backoff_seconds=0.0,
+    )
+    ctx, schema = _ctx_and_schema()
+    result = adapter.run(task_id="t1", task_context=ctx, output_schema=schema, idempotency_key="k")
+    assert adapter.calls == 2
+    assert result.metadata == {"attempts": 2, "max_attempts": 4}
+
+
+def test_final_failure_reason_is_sanitized() -> None:
+    # When all attempts fail, the raised detail is redacted (no secret leakage)
+    # and bounded with attempt count + category.
+    adapter = RetryingLLMExecutionAdapter(
+        failures=[
+            (AdapterErrorCategory.TIMEOUT, "模型调用超时"),
+            (AdapterErrorCategory.TIMEOUT, "模型调用超时"),
+            (AdapterErrorCategory.TIMEOUT, "模型调用超时"),
+        ],
+        max_retries=2,
+        backoff_seconds=0.0,
+    )
+    ctx, schema = _ctx_and_schema()
+    with pytest.raises(ExecutionError) as exc:
+        adapter.run(task_id="t1", task_context=ctx, output_schema=schema, idempotency_key="k")
+    assert adapter.calls == 3
+    assert exc.value.category == AdapterErrorCategory.TIMEOUT
+    assert "3 次尝试" in exc.value.detail
+    # No leak of any api_key-like secret (the test key itself is fake but we
+    # assert the redaction invariant regardless).
+    assert "test-key-not-real" not in exc.value.detail
+
+
+# --- Issue #55 / Codex blocking #1: hard cap on retries (total cost bound) ---
+
+def test_max_retries_hard_cap_from_explicit_argument() -> None:
+    # A runaway explicit value must be clamped, not honored.
+    adapter = RetryingLLMExecutionAdapter(
+        failures=[(AdapterErrorCategory.TIMEOUT, "模型调用超时")] * 100,
+        max_retries=100000,
+        backoff_seconds=0.0,
+    )
+    assert adapter.max_retries == MAX_RETRIES_HARD_CAP
+
+
+def test_max_retries_hard_cap_from_env_var(monkeypatch) -> None:
+    # AIOS_AGENT_MAX_RETRIES=100000 must NOT yield 100001 outbound calls.
+    monkeypatch.setenv("AIOS_AGENT_MAX_RETRIES", "100000")
+    adapter = RetryingLLMExecutionAdapter(
+        failures=[(AdapterErrorCategory.TIMEOUT, "模型调用超时")] * 100,
+        max_retries=None,  # force reading from env
+        backoff_seconds=0.0,
+    )
+    assert adapter.max_retries == MAX_RETRIES_HARD_CAP
+    ctx, schema = _ctx_and_schema()
+    with pytest.raises(ExecutionError):
+        adapter.run(task_id="t1", task_context=ctx, output_schema=schema, idempotency_key="k")
+    # Bounded by 1 + HARD_CAP regardless of the forged env value.
+    assert adapter.calls == 1 + MAX_RETRIES_HARD_CAP
+
+
+# --- Issue #55 / Codex blocking #2: persist per-attempt accounting ---
+
+class ScriptedAttemptAccountingAdapter:
+    """Reports retry accounting via result.metadata (success) or raised error
+    attributes (failure), to verify execute_task() persists it."""
+
+    def __init__(self, *, attempts=1, max_attempts=1, fail=False) -> None:
+        self.attempts = attempts
+        self.max_attempts = max_attempts
+        self.fail = fail
+
+    def run(self, *, task_id, task_context, output_schema, idempotency_key) -> ExecutionResult:
+        if self.fail:
+            err = ExecutionError(
+                504, "模型调用超时", category=AdapterErrorCategory.TIMEOUT
+            )
+            err.attempts = self.attempts
+            err.max_attempts = self.max_attempts
+            raise err
+        data = _sample_for_schema(output_schema)
+        return ExecutionResult(
+            summary="脚本化执行产物（测试用）",
+            claims=[],
+            artifacts=[
+                {
+                    "type": "json",
+                    "uri": f"exec://{task_id}/{idempotency_key}",
+                    "summary": "脚本化执行产物（测试用）",
+                    "data": data,
+                }
+            ],
+            metadata={"attempts": self.attempts, "max_attempts": self.max_attempts},
+        )
+
+
+def test_execute_persists_attempts_on_success(client: TestClient) -> None:
+    _launch(client)
+    with _session() as session:
+        t1 = _task_by_key(session, "T1")
+        artifact = execute_task(
+            session,
+            t1.id,
+            "idem-att-success",
+            adapter=ScriptedAttemptAccountingAdapter(attempts=3, max_attempts=3),
+        )
+        # Attempts land in the persisted Artifact metadata_json.
+        assert artifact.metadata_json.get("attempts") == 3
+        assert artifact.metadata_json.get("max_attempts") == 3
+        # ...and in the artifact.created AuditLog (after_snapshot).
+        audit = session.exec(
+            select(AuditLog).where(AuditLog.action == "artifact.created")
+        ).first()
+        assert audit is not None
+        assert audit.after_snapshot.get("attempts") == 3
+        assert audit.after_snapshot.get("max_attempts") == 3
+
+
+def test_execute_persists_attempts_on_failure(client: TestClient) -> None:
+    _launch(client)
+    with _session() as session:
+        t1 = _task_by_key(session, "T1")
+        with pytest.raises(ExecutionError):
+            execute_task(
+                session,
+                t1.id,
+                "idem-att-fail",
+                adapter=ScriptedAttemptAccountingAdapter(attempts=2, max_attempts=4, fail=True),
+            )
+        assert _status(session, t1) == TaskStatus.FAILED
+        # Structured attempts/max_attempts persist in the task.failed Event...
+        event = session.exec(
+            select(Event).where(Event.type == "task.failed")
+        ).first()
+        assert event is not None
+        assert event.payload.get("attempts") == 2
+        assert event.payload.get("max_attempts") == 4
+        # ...and in the task.failed AuditLog after_snapshot.
+        audit = session.exec(
+            select(AuditLog).where(AuditLog.action == "task.failed")
+        ).first()
+        assert audit is not None
+        assert audit.after_snapshot.get("attempts") == 2
+        assert audit.after_snapshot.get("max_attempts") == 4
