@@ -167,7 +167,7 @@ def route_task(
             else:
                 reason = "fixed_agent_unavailable"
         if selected is None:
-            _record_blocked(session, task, idempotency_key, considered, reason)
+            _record_blocked(session, task, idempotency_key, considered, reason, commit=commit)
             return None
     else:
         if task.routing_mode == RoutingMode.BEST_AVAILABLE and not task.required_capabilities:
@@ -177,6 +177,7 @@ def route_task(
                 idempotency_key,
                 considered,
                 "required_capabilities_missing",
+                commit=commit,
             )
             return None
         agents = list(session.exec(select(Agent).order_by(Agent.id)))

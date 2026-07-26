@@ -354,3 +354,115 @@ def test_best_available_without_requirements_is_blocked_once(tmp_path: Path) -> 
         ).one()
         assert audit.after_snapshot["routing_reason"] == "required_capabilities_missing"
         assert len(list(session.exec(select(ExecutionAssignment)))) == 0
+
+
+def _route_blocked_commit_false_is_deferred(
+    tmp_path: Path, task: Task, key: str, agent: Agent | None = None
+) -> tuple[Session, int]:
+    """Drive a blocked routing branch with commit=False inside an outer
+    transaction, and prove the blocked path did NOT commit the outer
+    transaction: after session.rollback() the routing.blocked audit row and
+    any ExecutionAssignment are gone.
+
+    Returns (session, blocked_audit_count_before_rollback) so callers can
+    assert both the in-transaction visibility (flush) and the rollback.
+    """
+    url = database(tmp_path, f"defer-{key}.db")
+    with Session(get_engine(url)) as session:
+        project = Project(name="P", objective="O")
+        session.add(project)
+        session.flush()
+        if agent is not None:
+            session.add(agent)
+            session.flush()
+        # attach the pre-built task to this session's project
+        task.project_id = project.id
+        task.status = TaskStatus.READY
+        session.add(task)
+        session.commit()
+
+        with session.begin():
+            result = route_task(session, task.id, key, commit=False)
+            assert result is None
+            blocked = list(
+                session.exec(select(AuditLog).where(AuditLog.action == "routing.blocked"))
+            )
+            # flushed into the transaction (visible before rollback) but not committed
+            assert len(blocked) == 1
+            assert len(list(session.exec(select(ExecutionAssignment)))) == 0
+            # deliberately abort the outer transaction
+            session.rollback()
+
+        # after rollback, the blocked audit must not have survived
+        blocked_after = list(
+            session.exec(select(AuditLog).where(AuditLog.action == "routing.blocked"))
+        )
+        assert len(blocked_after) == 0
+        assert len(list(session.exec(select(ExecutionAssignment)))) == 0
+        return session, 1
+
+
+def test_fixed_missing_agent_commit_false_is_deferred(tmp_path: Path) -> None:
+    # UNAVAILABLE assigned agent -> FIXED blocked branch (fixed_agent_unavailable)
+    agent = Agent(
+        id="agt_gone",
+        name="agt_gone",
+        role="worker",
+        adapter_type=AdapterType.API,
+        status=AgentStatus.UNAVAILABLE,
+    )
+    task = Task(
+        title="Fixed",
+        description="Fixed",
+        routing_mode=RoutingMode.FIXED,
+        assigned_agent_id="agt_gone",
+    )
+    _route_blocked_commit_false_is_deferred(tmp_path, task, "route-fixed-defer", agent=agent)
+
+
+def test_best_available_without_caps_commit_false_is_deferred(tmp_path: Path) -> None:
+    task = Task(
+        title="Draft",
+        description="Draft",
+        routing_mode=RoutingMode.BEST_AVAILABLE,
+        # no required_capabilities -> BEST_AVAILABLE no-caps blocked branch
+    )
+    _route_blocked_commit_false_is_deferred(tmp_path, task, "route-under-spec-defer")
+
+
+def test_fixed_missing_agent_default_commit_true_still_commits(tmp_path: Path) -> None:
+    """Guard against regression of existing default behavior: with the default
+    commit=True the blocked audit IS persisted even without an outer
+    transaction wrapper."""
+    url = database(tmp_path, "fixed-default.db")
+    with Session(get_engine(url)) as session:
+        project = Project(name="P", objective="O")
+        session.add(project)
+        session.flush()
+        # UNAVAILABLE agent -> FIXED blocked branch (fixed_agent_unavailable)
+        agent = Agent(
+            id="agt_missing_default",
+            name="agt_missing_default",
+            role="worker",
+            adapter_type=AdapterType.API,
+            status=AgentStatus.UNAVAILABLE,
+        )
+        session.add(agent)
+        session.flush()
+        task = Task(
+            project_id=project.id,
+            title="Fixed",
+            description="Fixed",
+            status=TaskStatus.READY,
+            routing_mode=RoutingMode.FIXED,
+            assigned_agent_id="agt_missing_default",
+        )
+        session.add(task)
+        session.commit()
+
+        assert route_task(session, task.id, "route-fixed-default") is None
+        blocked = list(
+            session.exec(select(AuditLog).where(AuditLog.action == "routing.blocked"))
+        )
+        assert len(blocked) == 1
+        assert blocked[0].after_snapshot["routing_reason"] == "fixed_agent_unavailable"
