@@ -663,7 +663,20 @@ class KnowledgeReviewDecision(SQLModel, table=True):
 class KnowledgeFact(SQLModel, table=True):
     __tablename__ = "knowledge_fact"
     __table_args__ = (
-        UniqueConstraint("series_id", "version", name="uq_knowledge_fact_series_version"),
+        # Per-(series, scope) version identity. Two cooperating DB-level guards:
+        # 1) uq_knowledge_fact_series_version below covers non-NULL project scopes:
+        #    (series_id, version, project_id) must be unique within a project.
+        # 2) uq_knowledge_fact_company_version (a partial unique index added by
+        #    migration 20260727_0008) covers the company scope (project_id IS NULL):
+        #    (series_id, version) must be unique for company-wide facts.
+        # SQLite treats every NULL as distinct in a plain UNIQUE constraint, so the
+        # 3-column constraint alone would NOT enforce company-scope identity -- the
+        # partial index is required. Both guards together allow a company v1 and a
+        # project v1 of the same series to coexist (the #53 bug fix) while still
+        # forbidding duplicate (series, version) within each scope. Fixes #53.
+        UniqueConstraint(
+            "series_id", "version", "project_id", name="uq_knowledge_fact_series_version"
+        ),
         UniqueConstraint("source_candidate_id", name="uq_knowledge_fact_source_candidate"),
         UniqueConstraint("review_decision_id", name="uq_knowledge_fact_review_decision"),
         UniqueConstraint("supersedes_fact_id", name="uq_knowledge_fact_supersedes"),

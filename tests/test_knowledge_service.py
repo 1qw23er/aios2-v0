@@ -322,6 +322,112 @@ def test_company_artifact_produces_only_company_candidate(tmp_path: Path) -> Non
         assert candidate.source_project_id == project.id
 
 
+def test_company_and_project_facts_share_series_version(tmp_path: Path) -> None:
+    """#53 regression: a company-wide fact (project_id NULL) and a project-scoped
+    fact (project_id = '<pid>') of the SAME series may both be version 1. Before
+    the fix the global UNIQUE(series_id, version) raised IntegrityError."""
+    url = database(tmp_path, "scope_coexist.db")
+    engine = get_engine(url)
+    with Session(engine) as session:
+        project, artifact = seed_artifact(session)
+        # Company-scoped fact, version 1.
+        company_cand = KnowledgeService(session).submit_candidate(
+            artifact.id,
+            "Company fact",
+            project_id=None,
+            tags=["positioning"],
+            actor=resolve_owner_actor(),
+        )
+        company_fact = KnowledgeService(session).review_candidate(
+            company_cand.id,
+            KnowledgeReviewDecisionValue.APPROVE,
+            "company rationale",
+            actor=resolve_owner_actor(),
+            series_id="shared-series",
+            version=1,
+        ).fact
+        # Project-scoped fact, SAME series, SAME version 1 -> must succeed (#53).
+        project_cand = KnowledgeService(session).submit_candidate(
+            artifact.id,
+            "Project fact",
+            project_id=project.id,
+            tags=["positioning"],
+            actor=resolve_owner_actor(),
+        )
+        project_fact = KnowledgeService(session).review_candidate(
+            project_cand.id,
+            KnowledgeReviewDecisionValue.APPROVE,
+            "project rationale",
+            actor=resolve_owner_actor(),
+            series_id="shared-series",
+            version=1,
+        ).fact
+        # Assertions inside the session: the fact objects are bound to it.
+        assert company_fact.project_id is None
+        assert project_fact.project_id == project.id
+        assert company_fact.series_id == project_fact.series_id == "shared-series"
+        assert company_fact.version == project_fact.version == 1
+        # A third fact in a DIFFERENT project scope must also coexist at v1.
+        project2 = Project(name="Knowledge2", objective="Reuse reviewed facts")
+        session.add(project2)
+        session.flush()
+        artifact2 = Artifact(
+            project_id=project2.id,
+            type=ArtifactType.JSON,
+            uri="source2.json",
+            checksum="sha256:source2",
+            review_status=ArtifactReviewStatus.APPROVED,
+            metadata_json={"password": "never-audit"},
+        )
+        session.add(artifact2)
+        session.commit()
+        project2_cand = KnowledgeService(session).submit_candidate(
+            artifact2.id,
+            "Project2 fact",
+            project_id=project2.id,
+            tags=["positioning"],
+            actor=resolve_owner_actor(),
+        )
+        project2_fact = KnowledgeService(session).review_candidate(
+            project2_cand.id,
+            KnowledgeReviewDecisionValue.APPROVE,
+            "project2 rationale",
+            actor=resolve_owner_actor(),
+            series_id="shared-series",
+            version=1,
+        ).fact
+        assert project2_fact.project_id == project2.id
+        assert project2_fact.series_id == "shared-series"
+        assert project2_fact.version == 1
+
+
+def test_knowledge_fact_version_unique_is_scope_aware(tmp_path: Path) -> None:
+    """#53: the (series_id, version) uniqueness must be scoped by project_id at
+    the schema level (UNIQUE(series_id, version, project_id)), AND the company
+    scope (project_id IS NULL) must have its own partial unique index
+    ``uq_knowledge_fact_company_version`` -- because SQLite treats NULL as
+    distinct in a plain UNIQUE constraint, the 3-col constraint alone would not
+    enforce company-scope version identity."""
+    from sqlalchemy import inspect
+
+    url = database(tmp_path, "scope_index.db")
+    engine = get_engine(url)
+    constraints = inspect(engine).get_unique_constraints("knowledge_fact")
+    target = next(c for c in constraints if c["name"] == "uq_knowledge_fact_series_version")
+    assert set(target["column_names"]) == {"series_id", "version", "project_id"}
+
+    # The company-scope partial index (added by migration 20260727_0008) must
+    # exist. It is a raw op.execute index, so reflect it from sqlite_master.
+    with Session(engine) as session:
+        indexes = {
+            row[0]
+            for row in session.connection().exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+    assert "uq_knowledge_fact_company_version" in indexes
+
+
 def test_concurrent_replacements_leave_one_approved_head(tmp_path: Path) -> None:
     url = database(tmp_path, "concurrent.db")
     with Session(get_engine(url)) as session:
