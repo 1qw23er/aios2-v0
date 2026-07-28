@@ -3,7 +3,18 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request, Response, status
+from fastapi import (
+    Body,
+    Depends,
+    FastAPI,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import or_
@@ -75,6 +86,7 @@ from aios.schemas import (
     ReviewPolicyCreate,
     RevisionRequest,
     TaskCreate,
+    WorkLogAttest,
     WorkLogSubmit,
 )
 from aios.services import (
@@ -856,6 +868,7 @@ def create_app() -> FastAPI:
                 content_value=payload.content_value,
                 should_enter_kb=payload.should_enter_kb,
                 content_angle=payload.content_angle,
+                source_platform=payload.source_platform,
             )
         except ServiceError as error:
             raise _translate(error) from error
@@ -875,6 +888,7 @@ def create_app() -> FastAPI:
             "content_value": metadata.get("content_value"),
             "should_enter_kb": metadata.get("should_enter_kb"),
             "content_angle": metadata.get("content_angle"),
+            "source_platform": metadata.get("source_platform"),
             "created_at": artifact.created_at.isoformat(),
         }
 
@@ -884,44 +898,70 @@ def create_app() -> FastAPI:
     )
     def attest_work_log_endpoint(
         artifact_id: str,
+        body: WorkLogAttest | None = Body(default=None),
         session: Session = Depends(get_session),
         actor: ActorContext = Depends(authenticate_owner),
     ) -> dict:
         """Owner attestation: the ONLY path that APPROVEs a work log (#88 plan §7.2).
 
-        OWNER-AUTHENTICATED, no body. Atomically writes the full evidence chain
-        (Approval ``work_log_attestation`` + status flip + AuditLog
-        ``work_log.owner_attested``) under a database write lock. Idempotent:
-        an already-APPROVED log with complete evidence returns 200 no-op; an
-        APPROVED log with missing/conflicting evidence -> 409 fail-closed.
+        OWNER-AUTHENTICATED. Optional body ``{should_enter_kb, content_value}``
+        lets the owner decide KB eligibility at attest time (#92 plan §6); an
+        empty/no body keeps the submitted metadata values (backward
+        compatible). Atomically writes the full evidence chain (Approval
+        ``work_log_attestation`` + status flip + AuditLog
+        ``work_log.owner_attested`` with a before/after snapshot of the two
+        judgement fields) under a database write lock. Idempotent: an
+        already-APPROVED log with complete evidence returns 200 no-op; a
+        conflicting override on an already-APPROVED log -> 409 fail-closed;
+        an APPROVED log with missing/conflicting evidence -> 409 fail-closed.
         """
         try:
             artifact = WorkLogService(session).attest_work_log(
                 artifact_id=artifact_id,
                 actor=actor,
+                should_enter_kb=body.should_enter_kb if body else None,
+                content_value=body.content_value if body else None,
             )
         except ServiceError as error:
             raise _translate(error) from error
-        return {"id": artifact.id, "review_status": artifact.review_status.value}
+        metadata = artifact.metadata_json or {}
+        return {
+            "id": artifact.id,
+            "review_status": artifact.review_status.value,
+            "should_enter_kb": metadata.get("should_enter_kb"),
+            "content_value": metadata.get("content_value"),
+        }
 
     @application.get(
         "/content-feed",
-        response_model=list,
+        response_model=None,
     )
     def content_feed_endpoint(
         project_id: str | None = Query(default=None),
         min_value: str = Query(default="medium"),
         limit: int = Query(default=100),
         offset: int = Query(default=0),
+        source_platform: str | None = Query(default=None),
+        log_limit: int | None = Query(default=None),
+        log_offset: int | None = Query(default=None),
+        fact_limit: int | None = Query(default=None),
+        fact_offset: int | None = Query(default=None),
         session: Session = Depends(get_session),
         actor: ActorContext = Depends(authenticate_owner),
-    ) -> list[dict]:
+    ) -> list[dict] | dict:
         """Read-only content feed: allowed-scope work logs + APPROVED facts (#88 §8.3).
 
         OWNER-AUTHENTICATED. ``project_id=P`` -> P's logs + P-scope facts +
         company-scope facts; omitted -> company view (everything). Parameter
         validation (min_value / limit / offset) is enforced by the service so
         the CLI export shares the exact same contract.
+
+        V2 (#92): ``source_platform`` switches to the structured split view
+        ``{work_logs, facts}`` with independent pagination
+        (``log_limit``/``log_offset`` for platform-filtered logs,
+        ``fact_limit``/``fact_offset`` for facts). Omitting ``source_platform``
+        returns the flat merged list unchanged (#88 zero-regression); the split
+        pagination params are only meaningful together with ``source_platform``.
         """
         try:
             return ContentFeed(session).get_content_feed(
@@ -930,6 +970,11 @@ def create_app() -> FastAPI:
                 min_value=min_value,
                 limit=limit,
                 offset=offset,
+                source_platform=source_platform,
+                log_limit=log_limit,
+                log_offset=log_offset,
+                fact_limit=fact_limit,
+                fact_offset=fact_offset,
             )
         except ServiceError as error:
             raise _translate(error) from error

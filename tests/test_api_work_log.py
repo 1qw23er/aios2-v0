@@ -244,3 +244,107 @@ def test_work_log_routes_require_owner_auth(tmp_path: Path, monkeypatch) -> None
         )
         assert anonymous.post("/work-logs/art_x/attest").status_code == 503
         assert anonymous.get("/content-feed").status_code == 503
+
+
+# --- V2 (#92): attest override body + structured platform feed ---------------
+
+
+def test_attest_endpoint_accepts_override(client: TestClient) -> None:
+    project = _seed_project()
+    created = client.post(
+        "/work-logs", json=_payload(project.id), headers={"Idempotency-Key": "k-o"}
+    ).json()
+    # Owner opts the draft into the KB at attest time.
+    resp = client.post(
+        f"/work-logs/{created['id']}/attest", json={"should_enter_kb": True}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["review_status"] == ArtifactReviewStatus.APPROVED.value
+    assert body["should_enter_kb"] is True
+    # Backward compatible: no body keeps the submitted default (False).
+    created2 = client.post(
+        "/work-logs", json=_payload(project.id), headers={"Idempotency-Key": "k-o2"}
+    ).json()
+    resp2 = client.post(f"/work-logs/{created2['id']}/attest")
+    assert resp2.json()["should_enter_kb"] is False
+
+
+def test_attest_endpoint_invalid_content_value_422(client: TestClient) -> None:
+    project = _seed_project()
+    created = client.post(
+        "/work-logs", json=_payload(project.id), headers={"Idempotency-Key": "k-b"}
+    ).json()
+    resp = client.post(
+        f"/work-logs/{created['id']}/attest", json={"content_value": "urgent"}
+    )
+    assert resp.status_code == 422
+
+
+def test_feed_structured_by_source_platform(client: TestClient) -> None:
+    project = _seed_project()
+    codex = client.post(
+        "/work-logs",
+        json=_payload(project.id, source_platform="codex"),
+        headers={"Idempotency-Key": "k-c"},
+    ).json()
+    hermes = client.post(
+        "/work-logs",
+        json=_payload(project.id, source_platform="hermes"),
+        headers={"Idempotency-Key": "k-h"},
+    ).json()
+    client.post(f"/work-logs/{codex['id']}/attest")
+    client.post(f"/work-logs/{hermes['id']}/attest")
+
+    resp = client.get(
+        "/content-feed",
+        params={
+            "project_id": project.id,
+            "source_platform": "codex",
+            "log_limit": 10,
+            "fact_limit": 10,
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    # Structured split view (plan §1 / v16).
+    assert isinstance(data, dict)
+    assert {k for k in data} == {"work_logs", "facts"}
+    # Platform filter applies ONLY to logs.
+    assert all(e["source_platform"] == "codex" for e in data["work_logs"])
+    assert all(e["id"] != hermes["id"] for e in data["work_logs"])
+    # Facts are never platform-filtered.
+    assert data["facts"] == []
+
+
+def test_feed_structured_offset_fallback_via_api(client: TestClient) -> None:
+    project = _seed_project()
+    # Three codex logs; created ascending so newest is last in codex_ids.
+    codex_ids = []
+    for i in range(3):
+        log = client.post(
+            "/work-logs",
+            json=_payload(project.id, source_platform="codex"),
+            headers={"Idempotency-Key": f"k-c{i}"},
+        ).json()
+        client.post(f"/work-logs/{log['id']}/attest")
+        codex_ids.append(log["id"])
+    # Omitting the split offsets but setting only `offset=1` must shift BOTH
+    # slices by 1 (the endpoint now passes None so the service falls back to
+    # `offset`); the most-recent log must be skipped, not reset to page 0.
+    resp = client.get(
+        "/content-feed",
+        params={
+            "project_id": project.id,
+            "source_platform": "codex",
+            "min_value": "low",
+            "offset": 1,
+            "log_limit": 10,
+            "fact_limit": 10,
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert codex_ids[-1] not in [e["id"] for e in data["work_logs"]]
+    assert len(data["work_logs"]) == 2
+    assert data["facts"] == []

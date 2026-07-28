@@ -223,6 +223,7 @@ class WorkLogService:
         content_value: str | None = None,
         should_enter_kb: bool = False,
         content_angle: str | None = None,
+        source_platform: str | None = None,
     ) -> tuple[Artifact, bool]:
         """Create an UNVERIFIED work-log Artifact (plan §7.1).
 
@@ -367,6 +368,7 @@ class WorkLogService:
             "content_value": content_value,
             "should_enter_kb": should_enter_kb,
             "content_angle": content_angle,
+            "source_platform": source_platform,
         }
         fingerprint = _request_fingerprint(business_fields)
         storage_key = storage_idempotency_key(project_id, client_key)
@@ -387,6 +389,7 @@ class WorkLogService:
             "content_value": judged_value,
             "should_enter_kb": judged_should_enter,
             "content_angle": judged_angle,
+            "source_platform": source_platform,
             "_request_fingerprint": fingerprint,
         }
         provenance_json = {
@@ -428,6 +431,7 @@ class WorkLogService:
                     "report_type": report_type,
                     "content_value": judged_value,
                     "should_enter_kb": judged_should_enter,
+                    "source_platform": source_platform,
                 },
                 idempotency_key=f"audit:work_log:submit:{artifact.id}",
             )
@@ -460,7 +464,14 @@ class WorkLogService:
 
     # -- attestation (plan §7.2) --------------------------------------------
 
-    def attest_work_log(self, *, artifact_id: str, actor: ActorContext) -> Artifact:
+    def attest_work_log(
+        self,
+        *,
+        artifact_id: str,
+        actor: ActorContext,
+        should_enter_kb: bool | None = None,
+        content_value: str | None = None,
+    ) -> Artifact:
         """Owner attestation: the ONLY path that flips a work log to APPROVED.
 
         Serialized via ``BEGIN IMMEDIATE`` (SQLite RESERVED write lock) so two
@@ -469,14 +480,36 @@ class WorkLogService:
         returns through the idempotent no-op branch. An IntegrityError (e.g.
         AuditLog idempotency collision) is caught, rolled back and
         re-adjudicated -- it never leaks to the caller.
+
+        V2 (#92): optional ``should_enter_kb`` / ``content_value`` override lets
+        the owner decide KB eligibility at attest time (the ONLY place it can be
+        set). The override only mutates ``metadata_json``'s two judgement fields
+        and atomically recomputes ``checksum`` -- never the evidence trio or
+        ``provenance``. A conflicting override on an already-APPROVED log raises
+        409 (fail-closed: owner decisions are never silently lost); a matching
+        or absent override is an idempotent no-op.
         """
         _assert_owner_actor(actor)
+        if content_value is not None and content_value not in _CONTENT_VALUE_RANK:
+            raise ServiceError(
+                422, "content_value must be one of high|medium|low|none"
+            )
         try:
-            return self._attest_locked(artifact_id=artifact_id, actor=actor)
+            return self._attest_locked(
+                artifact_id=artifact_id,
+                actor=actor,
+                should_enter_kb=should_enter_kb,
+                content_value=content_value,
+            )
         except IntegrityError:
             self.session.rollback()
             try:
-                return self._attest_locked(artifact_id=artifact_id, actor=actor)
+                return self._attest_locked(
+                    artifact_id=artifact_id,
+                    actor=actor,
+                    should_enter_kb=should_enter_kb,
+                    content_value=content_value,
+                )
             except IntegrityError:
                 # Persistent collision: never leak a raw DB exception; fail
                 # closed with a clean conflict (#88 Codex P2).
@@ -485,7 +518,14 @@ class WorkLogService:
                     409, "attestation conflict: persistent integrity error"
                 ) from None
 
-    def _attest_locked(self, *, artifact_id: str, actor: ActorContext) -> Artifact:
+    def _attest_locked(
+        self,
+        *,
+        artifact_id: str,
+        actor: ActorContext,
+        should_enter_kb: bool | None = None,
+        content_value: str | None = None,
+    ) -> Artifact:
         # Take the write lock BEFORE reading the artifact so every writer is
         # serialized and reads committed state (plan §7.2 arbitration step 1-2).
         self.session.rollback()  # ensure no implicit transaction is open
@@ -501,6 +541,15 @@ class WorkLogService:
                 # Idempotent no-op ONLY when the full evidence pair exists;
                 # otherwise fail closed (plan §7.2 semantics).
                 self._assert_attestation_evidence(artifact)
+                # V2 (#92): a conflicting override on an already-APPROVED log is
+                # fail-closed 409 -- never silently discard an owner decision.
+                metadata = artifact.metadata_json or {}
+                current_seb = bool(metadata.get("should_enter_kb", False))
+                current_cv = str(metadata.get("content_value") or "none")
+                if should_enter_kb is not None and bool(should_enter_kb) != current_seb:
+                    raise ServiceError(409, "conflicting attestation override")
+                if content_value is not None and content_value != current_cv:
+                    raise ServiceError(409, "conflicting attestation override")
                 self.session.rollback()  # release the write lock, no changes
                 return artifact
             if artifact.review_status != ArtifactReviewStatus.UNVERIFIED:
@@ -509,6 +558,21 @@ class WorkLogService:
                     "only an UNVERIFIED work log can be attested "
                     f"(current: {artifact.review_status.value})",
                 )
+
+            # V2 (#92): apply optional KB-eligibility override. The override
+            # mutates only the two judgement fields in metadata_json and
+            # atomically recomputes checksum; the evidence trio and provenance
+            # are untouched.
+            metadata = dict(artifact.metadata_json or {})
+            prev_seb = bool(metadata.get("should_enter_kb", False))
+            prev_cv = str(metadata.get("content_value") or "none")
+            next_seb = prev_seb if should_enter_kb is None else bool(should_enter_kb)
+            next_cv = prev_cv if content_value is None else content_value
+            if next_seb != prev_seb or next_cv != prev_cv:
+                metadata["should_enter_kb"] = next_seb
+                metadata["content_value"] = next_cv
+                artifact.metadata_json = metadata
+                artifact.checksum = f"sha256:{_sha256(canonical_json(metadata))}"
 
             before_status = artifact.review_status
             self.session.add(
@@ -533,8 +597,16 @@ class WorkLogService:
                 resource_id=artifact.id,
                 project_id=artifact.project_id,
                 task_id=artifact.task_id,
-                before={"review_status": before_status.value},
-                after={"review_status": ArtifactReviewStatus.APPROVED.value},
+                before={
+                    "review_status": before_status.value,
+                    "prev_should_enter_kb": prev_seb,
+                    "prev_content_value": prev_cv,
+                },
+                after={
+                    "review_status": ArtifactReviewStatus.APPROVED.value,
+                    "next_should_enter_kb": next_seb,
+                    "next_content_value": next_cv,
+                },
                 idempotency_key=f"audit:work_log:attest:{artifact.id}",
             )
             self.session.commit()
@@ -637,7 +709,26 @@ class ContentFeed:
         min_value: str = "medium",
         limit: int = 100,
         offset: int = 0,
-    ) -> list[dict[str, Any]]:
+        source_platform: str | None = None,
+        log_limit: int | None = None,
+        log_offset: int | None = None,
+        fact_limit: int | None = None,
+        fact_offset: int | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        """Read-only content feed (plan §8.3), V2 (#92) platform view.
+
+        No ``source_platform`` -> flat merged list (identical to #88, plus a
+        ``source_platform`` field on every work_log entry). A ``source_platform``
+        value switches to the structured split view
+        ``{"work_logs": [...], "facts": [...]}``         with INDEPENDENT pagination:
+        ``log_limit``/``log_offset`` scope the platform-filtered logs and
+        ``fact_limit``/``fact_offset`` scope the (never platform-filtered) facts.
+        Omitted split params fall back to ``limit``/``offset`` (so
+        ``?source_platform=codex&offset=10`` windows both slices at 10), and a
+        caller that only sets ``source_platform`` still gets sane windowing.
+        Facts are always the same eligible set regardless of the log filter, so
+        the structured view never explodes to ``2*limit``.
+        """
         _assert_owner_actor(actor)
         if min_value not in _CONTENT_VALUE_RANK:
             raise ServiceError(422, "min_value must be one of high|medium|low|none")
@@ -664,7 +755,25 @@ class ContentFeed:
                 | (KnowledgeFact.project_id == None)  # noqa: E711
             )
 
-        entries: list[tuple[Any, str, dict[str, Any]]] = []
+        # Materialize the eligible facts once; facts are NEVER platform-filtered
+        # and never value-filtered -- they are a self-contained slice.
+        facts: list[dict[str, Any]] = [
+            {
+                "kind": "fact",
+                "id": fact.id,
+                "series_id": fact.series_id,
+                "version": fact.version,
+                "project_id": fact.project_id,
+                "statement": fact.statement,
+                "tags": list(fact.tags or []),
+                "created_at": fact.created_at.isoformat(),
+            }
+            for fact in self.session.exec(fact_stmt)
+        ]
+
+        # Eligible, evidence-backed work logs (sorted DESC). The platform filter
+        # applies ONLY here, never to facts.
+        work_logs: list[dict[str, Any]] = []
         for log in self.session.exec(log_stmt):
             # Defense in depth: only evidence-backed work logs are publishable
             # (plan §7.2). A log flipped to APPROVED by the wrong path is
@@ -675,40 +784,53 @@ class ContentFeed:
             value = str(metadata.get("content_value") or "none")
             if _CONTENT_VALUE_RANK.get(value, 0) < threshold:
                 continue
-            entries.append(
-                (
-                    log.created_at,
-                    log.id,
-                    {
-                        "kind": "work_log",
-                        "id": log.id,
-                        "project_id": log.project_id,
-                        "report_type": metadata.get("report_type"),
-                        "content_value": value,
-                        "content_angle": metadata.get("content_angle"),
-                        "new_knowledge": metadata.get("new_knowledge"),
-                        "created_at": log.created_at.isoformat(),
-                    },
-                )
-            )
-        for fact in self.session.exec(fact_stmt):
-            entries.append(
-                (
-                    fact.created_at,
-                    fact.id,
-                    {
-                        "kind": "fact",
-                        "id": fact.id,
-                        "series_id": fact.series_id,
-                        "version": fact.version,
-                        "project_id": fact.project_id,
-                        "statement": fact.statement,
-                        "tags": list(fact.tags or []),
-                        "created_at": fact.created_at.isoformat(),
-                    },
-                )
+            if (
+                source_platform is not None
+                and str(metadata.get("source_platform") or "") != source_platform
+            ):
+                continue
+            work_logs.append(
+                {
+                    "kind": "work_log",
+                    "id": log.id,
+                    "project_id": log.project_id,
+                    "report_type": metadata.get("report_type"),
+                    "content_value": value,
+                    "content_angle": metadata.get("content_angle"),
+                    "new_knowledge": metadata.get("new_knowledge"),
+                    "source_platform": metadata.get("source_platform"),
+                    "created_at": log.created_at.isoformat(),
+                }
             )
 
-        # Stable order: created_at DESC, id DESC (deterministic tiebreaker).
-        entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [payload for _, _, payload in entries[offset : offset + limit]]
+        if source_platform is None:
+            # Flat merged single window -- identical to #88 behaviour.
+            entries = [
+                (item["created_at"], item["id"], item) for item in work_logs
+            ] + [(item["created_at"], item["id"], item) for item in facts]
+            entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            return [payload for _, _, payload in entries[offset : offset + limit]]
+
+        # Structured split view with independent pagination (plan §1 / v16).
+        # Omitted split offsets fall back to the legacy ``offset`` so a caller
+        # that sets only ``source_platform`` + ``offset`` still windows both
+        # slices consistently (e.g. ``?source_platform=codex&offset=10``).
+        log_limit_eff = log_limit if log_limit is not None else limit
+        fact_limit_eff = fact_limit if fact_limit is not None else limit
+        log_offset_eff = log_offset if log_offset is not None else offset
+        fact_offset_eff = fact_offset if fact_offset is not None else offset
+        if log_limit_eff < 1 or log_limit_eff > FEED_MAX_LIMIT:
+            raise ServiceError(422, f"log_limit must be between 1 and {FEED_MAX_LIMIT}")
+        if fact_limit_eff < 1 or fact_limit_eff > FEED_MAX_LIMIT:
+            raise ServiceError(422, f"fact_limit must be between 1 and {FEED_MAX_LIMIT}")
+        if log_offset_eff < 0 or fact_offset_eff < 0:
+            raise ServiceError(422, "log_offset and fact_offset must be >= 0")
+
+        work_logs.sort(
+            key=lambda item: (item["created_at"], item["id"]), reverse=True
+        )
+        facts.sort(key=lambda item: (item["created_at"], item["id"]), reverse=True)
+        return {
+            "work_logs": work_logs[log_offset_eff : log_offset_eff + log_limit_eff],
+            "facts": facts[fact_offset_eff : fact_offset_eff + fact_limit_eff],
+        }

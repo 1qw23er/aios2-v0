@@ -125,6 +125,19 @@ class WorkLogSubmit(BaseModel):
     content_value: str | None = None
     should_enter_kb: bool = False
     content_angle: str | None = None
+    source_platform: str | None = None  # V2 (#92): collection source tag; metadata only
+
+
+class WorkLogAttest(BaseModel):
+    """Optional KB-eligibility override at attest time (#92 plan §6).
+
+    Both fields are optional. ``should_enter_kb`` / ``content_value`` are
+    decided by the owner during the human attestation action; omitting them
+    keeps the submitted metadata values (backward compatible with #88).
+    """
+
+    should_enter_kb: bool | None = None
+    content_value: str | None = None
 
 
 class ArtifactReviewUpdate(BaseModel):
