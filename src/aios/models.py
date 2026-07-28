@@ -80,6 +80,11 @@ class ArtifactType(StrEnum):
     VIDEO = "video"
     DATASET = "dataset"
     LINK = "link"
+    # Work-log & knowledge-capture system (#88): a structured work report
+    # submitted by an AI employee. The 7 reporting fields live in
+    # metadata_json; the body markdown lives at ``uri``. Pure code addition --
+    # StrEnum values are stored as plain VARCHAR, so no migration is needed.
+    WORK_LOG = "work_log"
 
 
 class ArtifactReviewStatus(StrEnum):
@@ -267,6 +272,13 @@ class Agent(SQLModel, table=True):
     #    (reuses the W1 self-heal pattern). Default 3.
     timeout_s: float = 300.0
     max_retries: int = 3
+    # Work-log system (#88): which external platform this AI employee lives on
+    # (e.g. "chatgpt" | "codex" | "workbuddy" | "hermes" | "coze"). Free-form
+    # lowercase string, indexed for per-platform feeds/statistics.
+    platform: str | None = Field(default=None, index=True)
+    # Opaque external identity reference on that platform (e.g. a bot id or
+    # workspace handle). Never interpreted by AIOS; display/debugging only.
+    external_ref: str | None = Field(default=None)
 
 
 class Capability(SQLModel, table=True):
@@ -354,6 +366,16 @@ class Artifact(SQLModel, table=True):
     external_result_id: str | None = Field(default=None, unique=True, index=True)
     result_checksum: str | None = None
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column("metadata", JSON))
+    # Work-log system (#88): single idempotency contract for work-log
+    # submission. Storage key = ``work_log:{project_id}:{sha256(client_key)[:32]}``
+    # derived from the mandatory ``Idempotency-Key`` header. Uniqueness is
+    # enforced by a PARTIAL unique index (WHERE idempotency_key IS NOT NULL)
+    # created in migration 20260728_0009 via raw SQL -- deliberately NO
+    # unique=True/index=True here, because the artifact table is referenced by
+    # the external trigger ``knowledge_candidate_validate_insert`` with a
+    # literal ``main.artifact`` name, so schema changes must be raw ALTERs
+    # (never batch recreate).
+    idempotency_key: str | None = Field(default=None)
     created_at: datetime = Field(default_factory=now_utc)
 
 

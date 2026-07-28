@@ -92,27 +92,21 @@ def _load_owner_config() -> tuple[str, str]:
     return owner_id, owner_api_key
 
 
-def authenticate_owner(
-    credentials: HTTPBasicCredentials | None = Depends(_basic_scheme),
-) -> ActorContext:
-    """FastAPI dependency: authenticate the single owner via HTTP Basic.
+def verify_owner_credentials(username: str, password: str) -> ActorContext:
+    """Verify presented owner credentials against the configured environment.
 
-    Returns a trusted ``ActorContext(kind="owner", owner_id=AIOS_OWNER_ID)`` on
-    success. See the module docstring for the full fail-closed contract.
+    Single source of the fail-closed comparison logic, shared by the HTTP
+    boundary (``authenticate_owner``) and the CLI scripts (#88 §10) so no
+    caller can re-implement a weaker check. Raises the same ``HTTPException``
+    contract as the HTTP boundary (503 misconfigured / 401 invalid); CLI
+    callers translate that into a non-zero exit.
     """
     owner_id, owner_api_key = _load_owner_config()
 
-    if credentials is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="owner authentication required",
-            headers=_UNAUTH_HEADERS,
-        )
-
     # Evaluate BOTH comparisons unconditionally: a wrong id and a wrong key must
     # be indistinguishable to the caller (no short-circuit, no field leak).
-    id_ok = secrets.compare_digest(credentials.username, owner_id)
-    key_ok = secrets.compare_digest(credentials.password, owner_api_key)
+    id_ok = secrets.compare_digest(username, owner_id)
+    key_ok = secrets.compare_digest(password, owner_api_key)
     if not (id_ok and key_ok):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -121,3 +115,25 @@ def authenticate_owner(
         )
 
     return ActorContext(kind="owner", owner_id=owner_id)
+
+
+def authenticate_owner(
+    credentials: HTTPBasicCredentials | None = Depends(_basic_scheme),
+) -> ActorContext:
+    """FastAPI dependency: authenticate the single owner via HTTP Basic.
+
+    Returns a trusted ``ActorContext(kind="owner", owner_id=AIOS_OWNER_ID)`` on
+    success. See the module docstring for the full fail-closed contract.
+    """
+    # Configuration is validated FIRST (fail-closed): unconfigured -> 503 even
+    # when the request carries no credentials at all.
+    _load_owner_config()
+
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="owner authentication required",
+            headers=_UNAUTH_HEADERS,
+        )
+
+    return verify_owner_credentials(credentials.username, credentials.password)

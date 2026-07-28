@@ -509,16 +509,26 @@ def test_review_protocol_migration_round_trip(tmp_path: Path) -> None:
     assert revision() == "20260719_0004"
 
     # Seed a Project + Artifact row that must survive the round-trip.
-    with Session(get_engine(url)) as s:
-        proj = Project(name="rt", objective="rt")
-        s.add(proj)
-        s.flush()
-        art = Artifact(project_id=proj.id, type=ArtifactType.JSON, uri="u", checksum="c")
-        s.add(art)
-        s.flush()
-        proj_id = proj.id
-        seeded_id = art.id
-        s.commit()
+    # Raw SQL: the DB is pinned at 20260719_0004, but the ORM Artifact model
+    # follows the CURRENT head schema (e.g. idempotency_key from 20260728_0009)
+    # and would emit an INSERT with columns this snapshot does not have.
+    proj_id, seeded_id = "prj_rt_seed", "art_rt_seed"
+    with sqlite3.connect(str(db_file)) as c:
+        c.execute(
+            "INSERT INTO project (id, name, objective, description, status, owner,"
+            " budget_limit, budget_used, success_metrics, created_at, updated_at)"
+            " VALUES (?, 'rt', 'rt', '', 'PROPOSED', 'human_ceo', 0, 0, '[]',"
+            " '2026-07-28 00:00:00', '2026-07-28 00:00:00')",
+            (proj_id,),
+        )
+        c.execute(
+            "INSERT INTO artifact (id, project_id, type, uri, checksum, metadata,"
+            " review_status, revision_count, provenance, created_at)"
+            " VALUES (?, ?, 'JSON', 'u', 'c', '{}', 'UNVERIFIED', 0, '{}',"
+            " '2026-07-28 00:00:00')",
+            (seeded_id, proj_id),
+        )
+        c.commit()
 
     # 2) At head: the physical self-ref FK + index must exist, with ON DELETE SET NULL.
     idx, fks = artifact_indexes_and_fks()
@@ -533,16 +543,23 @@ def test_review_protocol_migration_round_trip(tmp_path: Path) -> None:
     assert base_triggers, "expected triggers (knowledge_*) to be present at head"
 
     # 3) Prove the ON DELETE SET NULL action actually fires (needs FK enforcement ON).
-    with Session(get_engine(url)) as s:
-        parent = Artifact(project_id=proj_id, type=ArtifactType.JSON, uri="up", checksum="cp")
-        child = Artifact(
-            project_id=proj_id, type=ArtifactType.JSON, uri="uc", checksum="cc",
-            revision_of=parent.id,
+    parent_id, child_id = "art_rt_parent", "art_rt_child"
+    with sqlite3.connect(str(db_file)) as c:
+        c.execute(
+            "INSERT INTO artifact (id, project_id, type, uri, checksum, metadata,"
+            " review_status, revision_count, provenance, created_at)"
+            " VALUES (?, ?, 'JSON', 'up', 'cp', '{}', 'UNVERIFIED', 0, '{}',"
+            " '2026-07-28 00:00:00')",
+            (parent_id, proj_id),
         )
-        s.add_all([parent, child])
-        s.flush()
-        parent_id, child_id = parent.id, child.id
-        s.commit()
+        c.execute(
+            "INSERT INTO artifact (id, project_id, type, uri, checksum, metadata,"
+            " review_status, revision_count, revision_of, provenance, created_at)"
+            " VALUES (?, ?, 'JSON', 'uc', 'cc', '{}', 'UNVERIFIED', 0, ?, '{}',"
+            " '2026-07-28 00:00:00')",
+            (child_id, proj_id, parent_id),
+        )
+        c.commit()
     with sqlite3.connect(str(db_file)) as c:
         c.execute("PRAGMA foreign_keys=ON")
         c.execute("DELETE FROM artifact WHERE id=?", (parent_id,))
@@ -568,8 +585,10 @@ def test_review_protocol_migration_round_trip(tmp_path: Path) -> None:
     # 5) Re-upgrade to head: row preserved, FK + index re-created, triggers intact.
     command.upgrade(config, "20260719_0004")
     assert revision() == "20260719_0004"
-    with Session(get_engine(url)) as s:
-        assert s.get(Artifact, seeded_id) is not None
+    with sqlite3.connect(str(db_file)) as c:
+        assert c.execute(
+            "SELECT id FROM artifact WHERE id=?", (seeded_id,)
+        ).fetchone() is not None
     idx2, fks2 = artifact_indexes_and_fks()
     assert "ix_artifact_revision_of" in idx2
     assert any(f[3] == "revision_of" for f in fks2)
@@ -643,7 +662,10 @@ def test_review_protocol_migration_previous_head_to_new_head(tmp_path: Path) -> 
             r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
         } == prev_triggers
 
-    # 3) The new head schema is immediately writable/readable via the ORM.
+    # 3) The CURRENT head schema is immediately writable/readable via the ORM.
+    # The ORM models track the real head (e.g. Artifact.idempotency_key from
+    # 20260728_0009), so finish the upgrade chain before using the ORM.
+    command.upgrade(config, "head")
     with Session(get_engine(url)) as s:
         proj = Project(name="ph", objective="ph")
         s.add(proj)

@@ -75,6 +75,7 @@ from aios.schemas import (
     ReviewPolicyCreate,
     RevisionRequest,
     TaskCreate,
+    WorkLogSubmit,
 )
 from aios.services import (
     ServiceError,
@@ -86,6 +87,7 @@ from aios.services import create_approval as create_approval_service
 from aios.services import create_project as create_project_service
 from aios.services import create_task as create_task_service
 from aios.services import get_board as get_board_service
+from aios.work_log import ContentFeed, WorkLogService
 
 
 @asynccontextmanager
@@ -813,6 +815,124 @@ def create_app() -> FastAPI:
     ) -> list[dict]:
         """Owner-visible report of approved facts still carrying the legacy sentinel."""
         return report_unclassified_knowledge(session)
+
+    @application.post(
+        "/work-logs",
+        response_model=dict,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def submit_work_log_endpoint(
+        payload: WorkLogSubmit,
+        response: Response,
+        session: Session = Depends(get_session),
+        idempotency_key: str = Header(alias="Idempotency-Key"),
+        actor: ActorContext = Depends(authenticate_owner),
+    ) -> dict:
+        """Submit an AI-worker work log as ``Artifact(type=WORK_LOG)`` (#88 plan §9).
+
+        OWNER-AUTHENTICATED; the ``Idempotency-Key`` header is REQUIRED (missing
+        header -> 422 by FastAPI). Semantics follow plan §5: a brand-new log
+        returns 201; replaying the same key with the same payload returns the
+        existing log with 200; reusing the key with a different payload -> 409.
+        The log is created ``UNVERIFIED`` -- only ``POST /work-logs/{id}/attest``
+        can make it APPROVED (plan §7). ``produced_by_agent_id`` is provenance
+        only and is proven against a durable ``ExecutionAssignment`` (plan §6);
+        it never becomes the actor.
+        """
+        try:
+            artifact, created = WorkLogService(session).submit_work_log(
+                project_id=payload.project_id,
+                report_type=payload.report_type,
+                what_done=payload.what_done,
+                why=payload.why,
+                problem=payload.problem,
+                solution=payload.solution,
+                new_knowledge=payload.new_knowledge,
+                idempotency_key=idempotency_key,
+                actor=actor,
+                task_ref=payload.task_ref,
+                produced_by_agent_id=payload.produced_by_agent_id,
+                execution_assignment_id=payload.execution_assignment_id,
+                content_value=payload.content_value,
+                should_enter_kb=payload.should_enter_kb,
+                content_angle=payload.content_angle,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+        # 201 only when this call actually inserted a new row; replays and
+        # concurrent-duplicate losers get 200. Derived atomically from the
+        # service result (no preliminary query -> no TOCTOU, no key-whitespace
+        # mismatch, since the service trims the key before hashing).
+        if not created:
+            response.status_code = status.HTTP_200_OK
+        metadata = artifact.metadata_json or {}
+        return {
+            "id": artifact.id,
+            "project_id": artifact.project_id,
+            "task_id": artifact.task_id,
+            "review_status": artifact.review_status.value,
+            "report_type": metadata.get("report_type"),
+            "content_value": metadata.get("content_value"),
+            "should_enter_kb": metadata.get("should_enter_kb"),
+            "content_angle": metadata.get("content_angle"),
+            "created_at": artifact.created_at.isoformat(),
+        }
+
+    @application.post(
+        "/work-logs/{artifact_id}/attest",
+        response_model=dict,
+    )
+    def attest_work_log_endpoint(
+        artifact_id: str,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
+    ) -> dict:
+        """Owner attestation: the ONLY path that APPROVEs a work log (#88 plan §7.2).
+
+        OWNER-AUTHENTICATED, no body. Atomically writes the full evidence chain
+        (Approval ``work_log_attestation`` + status flip + AuditLog
+        ``work_log.owner_attested``) under a database write lock. Idempotent:
+        an already-APPROVED log with complete evidence returns 200 no-op; an
+        APPROVED log with missing/conflicting evidence -> 409 fail-closed.
+        """
+        try:
+            artifact = WorkLogService(session).attest_work_log(
+                artifact_id=artifact_id,
+                actor=actor,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+        return {"id": artifact.id, "review_status": artifact.review_status.value}
+
+    @application.get(
+        "/content-feed",
+        response_model=list,
+    )
+    def content_feed_endpoint(
+        project_id: str | None = Query(default=None),
+        min_value: str = Query(default="medium"),
+        limit: int = Query(default=100),
+        offset: int = Query(default=0),
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
+    ) -> list[dict]:
+        """Read-only content feed: allowed-scope work logs + APPROVED facts (#88 §8.3).
+
+        OWNER-AUTHENTICATED. ``project_id=P`` -> P's logs + P-scope facts +
+        company-scope facts; omitted -> company view (everything). Parameter
+        validation (min_value / limit / offset) is enforced by the service so
+        the CLI export shares the exact same contract.
+        """
+        try:
+            return ContentFeed(session).get_content_feed(
+                actor=actor,
+                project_id=project_id,
+                min_value=min_value,
+                limit=limit,
+                offset=offset,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
 
     @application.post(
         "/owner/campaigns",

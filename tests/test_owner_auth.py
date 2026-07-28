@@ -311,6 +311,10 @@ def test_owner_route_inventory(real_auth_client: TestClient) -> None:
         ("/knowledge/candidates/{candidate_id}/review", "POST"),
         ("/knowledge/facts/{fact_id}/deactivate", "POST"),
         ("/knowledge/unclassified", "GET"),
+        # Work-log system (#88): all three routes are owner-only.
+        ("/work-logs", "POST"),
+        ("/work-logs/{artifact_id}/attest", "POST"),
+        ("/content-feed", "GET"),
     }
     missing = must_protect - protected
     assert not missing, f"expected these routes to be owner-protected: {sorted(missing)}"

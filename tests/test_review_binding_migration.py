@@ -35,7 +35,7 @@ from aios.models import (
 )
 from alembic import command
 
-HEAD = "20260727_0008"
+HEAD = "20260728_0009"
 BASE = "20260720_0005"
 
 

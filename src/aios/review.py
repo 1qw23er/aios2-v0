@@ -47,6 +47,7 @@ from aios.models import (
     ApprovalStatus,
     Artifact,
     ArtifactReviewStatus,
+    ArtifactType,
     ReviewAssignment,
     ReviewDimension,
     ReviewedFact,
@@ -1109,6 +1110,16 @@ def owner_approve_review(
     artifact = session.get(Artifact, artifact_id)
     if artifact is None:
         raise ServiceError(404, "Artifact not found")
+    # Work logs have their OWN sole APPROVED path -- `attest_work_log` -- which
+    # atomically writes the exact-one attestation Approval + AuditLog. The
+    # generic review workflow must never flip a WORK_LOG to APPROVED, or the
+    # central trust boundary (plan §7.2) is bypassed. (#88 Codex P1)
+    if artifact.type == ArtifactType.WORK_LOG:
+        raise ServiceError(
+            409,
+            "work logs must be approved via POST /work-logs/{id}/attest, "
+            "not the generic review workflow",
+        )
     if artifact.review_status == ArtifactReviewStatus.APPROVED:
         return artifact  # idempotent no-op
     if artifact.review_status != ArtifactReviewStatus.REVIEW_PASSED:

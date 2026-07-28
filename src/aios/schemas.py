@@ -101,6 +101,32 @@ class KnowledgeClassifyRequest(BaseModel):
     tags: list[str] = Field(min_length=1)
 
 
+class WorkLogSubmit(BaseModel):
+    """Owner submits an AI-worker work log (#88 plan §9).
+
+    The submitter identity is NEVER taken from this payload -- it is always the
+    trusted owner actor injected by ``authenticate_owner``. ``produced_by_agent_id``
+    is provenance only (plan §6): it must be proven against a durable
+    ``ExecutionAssignment`` (``execution_assignment_id`` required on routed tasks)
+    and never becomes the actor. The ``Idempotency-Key`` header is REQUIRED and is
+    handled at the endpoint (plan §5), not in this body.
+    """
+
+    project_id: str = Field(min_length=1)
+    report_type: str = Field(min_length=1)
+    what_done: str = Field(min_length=1)
+    why: str = Field(min_length=1)
+    problem: str = Field(min_length=1)
+    solution: str = Field(min_length=1)
+    new_knowledge: str = Field(min_length=1)
+    task_ref: str | None = None
+    produced_by_agent_id: str | None = None
+    execution_assignment_id: str | None = None
+    content_value: str | None = None
+    should_enter_kb: bool = False
+    content_angle: str | None = None
+
+
 class ArtifactReviewUpdate(BaseModel):
     review_status: ArtifactReviewStatus
 
