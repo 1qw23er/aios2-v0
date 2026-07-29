@@ -89,13 +89,26 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def storage_idempotency_key(project_id: str, client_key: str) -> str:
+def storage_idempotency_key(
+    project_id: str, client_key: str, scope: str | None = None
+) -> str:
     """Namespaced storage key (plan §5.3): endpoint + verified project_id.
 
     Deliberately date-free (retries across UTC midnight replay cleanly) and
     free of any untrusted agent id.
+
+    V4 (#99/#101): an optional ``scope`` segment isolates the idempotency
+    namespace per authenticated identity so that an agent's relay ingest and the
+    owner's direct submission (and two different agents) never converge on the
+    same storage row even with an identical ``Idempotency-Key``. ``scope=None``
+    preserves the legacy owner-key format ``work_log:{project_id}:{hash}``; a
+    relay scope of ``"agent:<agent_id>"`` yields
+    ``work_log:{project_id}:agent:<agent_id>:{hash}`` -- the literal
+    ``:agent:`` segment makes the two formats structurally disjoint.
     """
-    return f"work_log:{project_id}:{_sha256(client_key)[:32]}"
+    if scope is None:
+        return f"work_log:{project_id}:{_sha256(client_key)[:32]}"
+    return f"work_log:{project_id}:{scope}:{_sha256(client_key)[:32]}"
 
 
 def _request_fingerprint(business_fields: dict[str, Any]) -> str:
@@ -342,18 +355,8 @@ class WorkLogService:
                 422, "execution_assignment_id requires produced_by_agent_id"
             )
 
-        # -- Derived judgement (pure function; §8.1) --
-        raw_metadata = {
-            "new_knowledge": new_knowledge,
-            "content_value": content_value,
-            "should_enter_kb": should_enter_kb,
-            "content_angle": content_angle,
-        }
-        judged_value, judged_should_enter, judged_angle = ContentValueJudge.judge(
-            raw_metadata
-        )
-
         # -- Idempotency (plan §5): storage key + request fingerprint --
+        # (content-value judgement is performed inside the shared helper)
         business_fields = {
             "project_id": project_id,
             "report_type": report_type,
@@ -371,7 +374,109 @@ class WorkLogService:
             "source_platform": source_platform,
         }
         fingerprint = _request_fingerprint(business_fields)
-        storage_key = storage_idempotency_key(project_id, client_key)
+        storage_key = storage_idempotency_key(project_id, client_key, scope=None)
+
+        artifact, created = self._create_unverified_work_log(
+            project_id=project_id,
+            report_type=report_type,
+            what_done=what_done,
+            why=why,
+            problem=problem,
+            solution=solution,
+            new_knowledge=new_knowledge,
+            task_ref=task_ref,
+            produced_by_agent_id=produced_by_agent_id,
+            source_platform=source_platform,
+            content_value=content_value,
+            should_enter_kb=should_enter_kb,
+            content_angle=content_angle,
+            task=task,
+            agent=agent,
+            provenance_assignment_id=provenance_assignment_id,
+            legacy_assigned_agent=legacy_assigned_agent,
+            fingerprint=fingerprint,
+            storage_key=storage_key,
+            actor=actor,
+            scope=None,
+        )
+        if created:
+            metadata = artifact.metadata_json or {}
+            append_audit(
+                self.session,
+                actor=actor.derive_submitted_by(),
+                action=WORK_LOG_SUBMIT_AUDIT_ACTION,
+                resource_type="artifact",
+                resource_id=artifact.id,
+                project_id=project_id,
+                task_id=artifact.task_id,
+                before={},
+                after={
+                    "review_status": ArtifactReviewStatus.UNVERIFIED.value,
+                    "report_type": report_type,
+                    "content_value": metadata.get("content_value"),
+                    "should_enter_kb": metadata.get("should_enter_kb"),
+                    "source_platform": source_platform,
+                },
+                idempotency_key=f"audit:work_log:submit:{artifact.id}",
+            )
+            self.session.commit()
+        return artifact, created
+
+    def _find_by_storage_key(self, storage_key: str) -> Artifact | None:
+        return self.session.exec(
+            select(Artifact).where(Artifact.idempotency_key == storage_key)
+        ).first()
+
+    def _adjudicate_replay(self, existing: Artifact, fingerprint: str) -> Artifact:
+        stored = (existing.metadata_json or {}).get("_request_fingerprint")
+        if stored == fingerprint:
+            return existing  # replay no-op (plan §5.5 case 1)
+        raise ServiceError(409, "idempotency key reuse with different payload")
+
+    def _create_unverified_work_log(
+        self,
+        *,
+        project_id: str,
+        report_type: str,
+        what_done: str,
+        why: str,
+        problem: str,
+        solution: str,
+        new_knowledge: str,
+        task_ref: str | None,
+        produced_by_agent_id: str | None,
+        source_platform: str | None,
+        content_value: str | None,
+        should_enter_kb: bool,
+        content_angle: str | None,
+        task: Task | None,
+        agent: Agent | None,
+        provenance_assignment_id: str | None,
+        legacy_assigned_agent: bool,
+        fingerprint: str,
+        storage_key: str,
+        actor: ActorContext,
+        scope: str | None,
+    ) -> tuple[Artifact, bool]:
+        """Shared UNVERIFIED-artifact creation used by BOTH ``submit_work_log``
+        (owner, ``scope=None``) and ``relay_work_log`` (agent, scoped).
+
+        Builds the work-log ``Artifact`` (UNVERIFIED) and performs the
+        idempotency / concurrent-duplicate adjudication, but does NOT write the
+        audit row and does NOT commit -- the caller decides which audit action
+        applies (``work_log.submitted`` for owner, ``relay.work_log_ingested``
+        for relay) and commits. This keeps the trust chain identical across both
+        entry points while letting each own its audit identity (V4, #99/#101).
+        """
+        raw_metadata = {
+            "new_knowledge": new_knowledge,
+            "content_value": content_value,
+            "should_enter_kb": should_enter_kb,
+            "content_angle": content_angle,
+        }
+        judged_value, judged_should_enter, judged_angle = ContentValueJudge.judge(
+            raw_metadata
+        )
 
         existing = self._find_by_storage_key(storage_key)
         if existing is not None:
@@ -417,27 +522,9 @@ class WorkLogService:
             self.session.flush()
             artifact.uri = f"work_log:{artifact.id}"
             self.session.add(artifact)
-            append_audit(
-                self.session,
-                actor=actor.derive_submitted_by(),
-                action=WORK_LOG_SUBMIT_AUDIT_ACTION,
-                resource_type="artifact",
-                resource_id=artifact.id,
-                project_id=project_id,
-                task_id=artifact.task_id,
-                before={},
-                after={
-                    "review_status": ArtifactReviewStatus.UNVERIFIED.value,
-                    "report_type": report_type,
-                    "content_value": judged_value,
-                    "should_enter_kb": judged_should_enter,
-                    "source_platform": source_platform,
-                },
-                idempotency_key=f"audit:work_log:submit:{artifact.id}",
-            )
-            self.session.commit()
+            self.session.flush()
         except IntegrityError:
-            # Concurrent duplicate submit: the partial unique index
+            # Concurrent duplicate submit/relay: the partial unique index
             # uq_artifact_idempotency is the arbiter. Re-read the winner and
             # re-adjudicate by fingerprint (plan §5.5 case 3).
             self.session.rollback()
@@ -450,17 +537,6 @@ class WorkLogService:
             raise
         self.session.refresh(artifact)
         return artifact, True
-
-    def _find_by_storage_key(self, storage_key: str) -> Artifact | None:
-        return self.session.exec(
-            select(Artifact).where(Artifact.idempotency_key == storage_key)
-        ).first()
-
-    def _adjudicate_replay(self, existing: Artifact, fingerprint: str) -> Artifact:
-        stored = (existing.metadata_json or {}).get("_request_fingerprint")
-        if stored == fingerprint:
-            return existing  # replay no-op (plan §5.5 case 1)
-        raise ServiceError(409, "idempotency key reuse with different payload")
 
     # -- attestation (plan §7.2) --------------------------------------------
 

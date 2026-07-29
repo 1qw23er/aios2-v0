@@ -279,6 +279,13 @@ class Agent(SQLModel, table=True):
     # Opaque external identity reference on that platform (e.g. a bot id or
     # workspace handle). Never interpreted by AIOS; display/debugging only.
     external_ref: str | None = Field(default=None)
+    # V4 self-registration (#99/#101): opaque handle recording which scoped
+    # bootstrap token claimed this agent row. A row with
+    # ``bootstrap_token_ref = :jti`` is the DB-side proof that the token has been
+    # *consumed*; it is committed atomically with the agent row. Deliberately
+    # has NO dedicated index -- the ``(platform, external_ref)`` partial unique
+    # index (migration 20260729_0001) provides tuple uniqueness instead.
+    bootstrap_token_ref: str | None = Field(default=None)
 
 
 class Capability(SQLModel, table=True):

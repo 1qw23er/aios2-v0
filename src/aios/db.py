@@ -27,9 +27,15 @@ def _ensure_sqlite_parent(database_url: str) -> None:
 @lru_cache
 def get_engine(database_url: str) -> Engine:
     _ensure_sqlite_parent(database_url)
+    # ``timeout`` is SQLite's busy-handler timeout (seconds): concurrent writers
+    # that cannot acquire the RESERVED lock immediately (e.g. the BEGIN IMMEDIATE
+    # serialization used by attest / V4 self-update) wait up to this long instead
+    # of failing with "database is locked". ``check_same_thread=False`` allows the
+    # FastAPI threadpool to share the connection.
+    sqlite_connect_args = {"check_same_thread": False, "timeout": 30}
     engine = create_engine(
         database_url,
-        connect_args={"check_same_thread": False} if database_url.startswith("sqlite") else {},
+        connect_args=sqlite_connect_args if database_url.startswith("sqlite") else {},
     )
     if database_url.startswith("sqlite"):
 

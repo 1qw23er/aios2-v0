@@ -22,12 +22,22 @@ from sqlmodel import Session, select
 
 from aios.actor import ActorContext
 from aios.agent_registry import (
+    create_agent_via_bootstrap,
     get_agent,
     list_agents,
+    list_capabilities,
     register_agent,
+    rotate_credential,
     set_agent_enabled,
+    upsert_agent,
 )
-from aios.api.security import authenticate_owner
+from aios.api.security import (
+    _AGENT_UNAUTH_HEADERS,
+    BootstrapClaims,
+    authenticate_agent,
+    authenticate_bootstrap_token,
+    authenticate_owner,
+)
 from aios.audit import AuditLog
 from aios.campaign import CampaignLaunchResult, launch_campaign
 from aios.console import (
@@ -65,6 +75,7 @@ from aios.models import (
     new_id,
 )
 from aios.orchestrator import Orchestrator, complete_task
+from aios.relay import relay_work_log
 from aios.review import (
     create_review_policy,
     dispatch_reviews_for_artifact,
@@ -73,8 +84,12 @@ from aios.review import (
     submit_review_from_artifact,
 )
 from aios.schemas import (
+    AgentBootstrapResponse,
     AgentEnabledUpdate,
+    AgentPublic,
     AgentRegister,
+    AgentRegistrationResponse,
+    AgentSelfRegister,
     ApprovalCreate,
     ApprovalDecision,
     BoardRead,
@@ -1041,11 +1056,18 @@ def create_app() -> FastAPI:
     # --- Agent Interoperability Gateway: DB-backed agent registry (#57, #61) ---
     # Reuses the same ``agent_registry`` service as the owner console below.
 
-    @application.get("/agents", response_model=list[Agent])
+    @application.get("/agents", response_model=list[AgentPublic])
     def list_registered_agents(
         session: Session = Depends(get_session),
-    ) -> list[Agent]:
-        return list_agents(session)
+        capability: str | None = Query(default=None),
+    ) -> list[AgentPublic]:
+        """List registry agents. When ``capability`` is supplied, returns only
+        enabled agents declaring that capability (fail-closed 422 on an unknown
+        slug). The capability catalog is the single source of truth."""
+        try:
+            return list_agents(session, capability=capability)
+        except ServiceError as error:
+            raise _translate(error) from error
 
     @application.post(
         "/agents", response_model=Agent, status_code=status.HTTP_201_CREATED
@@ -1077,7 +1099,7 @@ def create_app() -> FastAPI:
         except ServiceError as error:
             raise _translate(error) from error
 
-    @application.get("/agents/{agent_id}", response_model=Agent)
+    @application.get("/agents/{agent_id}", response_model=AgentPublic)
     def read_agent(
         agent_id: str,
         session: Session = Depends(get_session),
@@ -1098,6 +1120,199 @@ def create_app() -> FastAPI:
             return set_agent_enabled(session, agent_id, request.enabled, actor=actor)
         except ServiceError as error:
             raise _translate(error) from error
+
+    # --- V4 Agent Platform: self-registration, discovery, relay (#99/#101) ---
+    # Inbound surface for the unified Agent platform:
+    #   * bootstrap (strict single-use CREATE via a scoped owner-signed token)
+    #   * self-update (agent-authenticated, scope-locked, last-writer-wins)
+    #   * capability discovery (catalog + filtered agent listing)
+    #   * Agent Relay ingest (agent-authenticated work-log intake, #77 port)
+    # Trust boundaries are enforced entirely by the security dependencies and
+    # the registry primitives; routes never mint an ActorContext and perform at
+    # most a single equality scope check at the bootstrap edge.
+
+    @application.post(
+        "/agents/bootstrap",
+        response_model=AgentBootstrapResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def bootstrap_agent(
+        payload: AgentSelfRegister,
+        claims: BootstrapClaims = Depends(authenticate_bootstrap_token),
+        session: Session = Depends(get_session),
+    ) -> AgentBootstrapResponse:
+        """Strict single-use agent CREATE via a scoped bootstrap token (plan §3).
+
+        ``authenticate_bootstrap_token`` verifies the owner signature + expiry and
+        returns the claims ``(platform, external_ref, jti)``. The request body
+        MUST declare the same identity -- a mismatch is a scope violation and is
+        rejected with 401 (zero side effects, no audit). Single-use and tuple
+        uniqueness are enforced by ``create_agent_via_bootstrap`` (401 on a
+        consumed token or a concurrent collision). The one-time credential is
+        returned ONLY here.
+        """
+        if payload.platform != claims.platform or payload.external_ref != claims.external_ref:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="bootstrap scope mismatch: token identity != body identity",
+                headers=_AGENT_UNAUTH_HEADERS,
+            )
+        try:
+            agent, credential = create_agent_via_bootstrap(
+                session,
+                platform=claims.platform,
+                external_ref=claims.external_ref,
+                jti=claims.jti,
+                name=payload.name,
+                role=payload.role,
+                adapter_type=payload.adapter_type,
+                delegation_mode=payload.delegation_mode,
+                capabilities=payload.capabilities,
+                endpoint=payload.endpoint,
+                callback_url=payload.callback_url,
+                config_ref=payload.config_ref,
+                limitations=payload.limitations,
+                timeout_s=payload.timeout_s,
+                max_retries=payload.max_retries,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+        return AgentBootstrapResponse(
+            id=agent.id,
+            platform=agent.platform,
+            external_ref=agent.external_ref,
+            name=agent.name,
+            role=agent.role,
+            adapter_type=agent.adapter_type.value,
+            status=agent.status.value,
+            capabilities=agent.capabilities or [],
+            credential=credential,
+        )
+
+    @application.put(
+        "/agents/self",
+        response_model=AgentRegistrationResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    def agent_self_update(
+        payload: AgentSelfRegister,
+        actor: ActorContext = Depends(authenticate_agent),
+        session: Session = Depends(get_session),
+    ) -> AgentRegistrationResponse:
+        """Agent-authenticated self-update of the agent's OWN identity (plan §3.2).
+
+        The actor is resolved from the bearer credential (``authenticate_agent``)
+        and locked to its own ``(platform, external_ref)`` by ``upsert_agent``. A
+        missing / non-agent credential is 401; a scope mismatch is 422. Concurrent
+        same-agent updates are serialized (``BEGIN IMMEDIATE``) so the read-modify-
+        write is atomic and last-writer-wins.
+        """
+        try:
+            agent = upsert_agent(
+                session,
+                actor=actor,
+                platform=payload.platform,
+                external_ref=payload.external_ref,
+                name=payload.name,
+                role=payload.role,
+                adapter_type=payload.adapter_type,
+                delegation_mode=payload.delegation_mode,
+                capabilities=payload.capabilities,
+                endpoint=payload.endpoint,
+                callback_url=payload.callback_url,
+                config_ref=payload.config_ref,
+                limitations=payload.limitations,
+                timeout_s=payload.timeout_s,
+                max_retries=payload.max_retries,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+        return AgentRegistrationResponse(
+            id=agent.id,
+            platform=agent.platform,
+            external_ref=agent.external_ref,
+            name=agent.name,
+            role=agent.role,
+            adapter_type=agent.adapter_type.value,
+            status=agent.status.value,
+            capabilities=agent.capabilities or [],
+        )
+
+    @application.post(
+        "/agents/{agent_id}/rotate-credential",
+        response_model=dict,
+        status_code=status.HTTP_200_OK,
+    )
+    def rotate_agent_credential(
+        agent_id: str,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
+    ) -> dict:
+        """Owner-only: rotate an agent's self-update credential, invalidating the old.
+
+        Issues a fresh bearer secret through the external secret store; the new
+        credential is returned once and must be delivered to the agent out of band.
+        A consumed bootstrap token stays 401 forever -- rotation is the owner
+        recovery path, not a second bootstrap.
+        """
+        try:
+            credential = rotate_credential(session, agent_id, actor=actor)
+        except ServiceError as error:
+            raise _translate(error) from error
+        return {"agent_id": agent_id, "credential": credential}
+
+    @application.get("/capabilities", response_model=list[Capability])
+    def list_capability_catalog(
+        session: Session = Depends(get_session),
+    ) -> list[Capability]:
+        """Read-only capability discovery (plan §4): the full capability catalog."""
+        return list_capabilities(session)
+
+    @application.post(
+        "/relay/work-logs",
+        response_model=dict,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def relay_work_log_endpoint(
+        payload: WorkLogSubmit,
+        response: Response,
+        idempotency_key: str = Header(alias="Idempotency-Key"),
+        actor: ActorContext = Depends(authenticate_agent),
+        session: Session = Depends(get_session),
+    ) -> dict:
+        """Agent Relay ingest: agent-authenticated UNVERIFIED work-log intake (#77).
+
+        Reuses the owner's ``submit_work_log`` creation machinery but scopes
+        idempotency per agent (``scope="agent:<agent_id>"``) and substitutes the
+        authenticated agent identity as provenance (the payload's
+        ``produced_by_agent_id`` is ignored). The relay NEVER attests -- the
+        owner attests manually. The ``Idempotency-Key`` header is REQUIRED
+        (missing -> 422); a replay returns 200, a conflicting payload -> 409.
+        """
+        agent = session.get(Agent, actor.agent_id)
+        if agent is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="agent not found"
+            )
+        try:
+            artifact, created = relay_work_log(
+                session,
+                payload=payload,
+                idempotency_key=idempotency_key,
+                actor=actor,
+                agent=agent,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+        if not created:
+            response.status_code = status.HTTP_200_OK
+        return {
+            "id": artifact.id,
+            "project_id": artifact.project_id,
+            "task_id": artifact.task_id,
+            "review_status": artifact.review_status.value,
+            "created_at": artifact.created_at.isoformat() if artifact.created_at else None,
+        }
 
     # --- Minimal owner console (server-rendered HTML; no separate frontend) ---
     # Reuses the SAME service layer as the JSON endpoints above:

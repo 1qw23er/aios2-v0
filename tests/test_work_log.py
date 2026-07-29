@@ -51,7 +51,7 @@ from aios.work_log import (
 )
 from alembic import command
 
-HEAD = "20260728_0009"
+HEAD = "20260729_0001"
 PREV = "20260727_0008"
 
 
@@ -143,6 +143,16 @@ def _assert_0009_schema_absent(url: str) -> None:
     assert "idempotency_key" not in _columns(url, "artifact")
     assert "uq_artifact_idempotency" not in _index_names(url)
     assert "ix_agent_platform" not in _index_names(url)
+
+
+def _assert_0029_schema_present(url: str) -> None:
+    assert "bootstrap_token_ref" in _columns(url, "agent")
+    assert "uq_agent_platform_external_ref" in _index_names(url)
+
+
+def _assert_0029_schema_absent(url: str) -> None:
+    assert "bootstrap_token_ref" not in _columns(url, "agent")
+    assert "uq_agent_platform_external_ref" not in _index_names(url)
 
 
 def test_work_log_migration_round_trip(tmp_path: Path) -> None:
@@ -1140,8 +1150,11 @@ def test_migration_0009_downgrade_fail_closed_populated(
     with pytest.raises(RuntimeError):
         command.downgrade(config, PREV)
 
-    # Fail-closed: everything stays intact on 0009.
-    assert _revision(url) == HEAD
+    # Fail-closed: the 0009 downgrade aborts, so the DB is left exactly on
+    # 0009 (the 20260729_0001 downgrade already committed, but 0009's
+    # downgrade to PREV raised before any DDL). Schema, rows, indexes and
+    # revision all remain on 20260728_0009.
+    assert _revision(url) == "20260728_0009"
     _assert_0009_schema_present(url)
     with Session(get_engine(url)) as session:
         if populated == "agent_platform":
@@ -1152,6 +1165,69 @@ def test_migration_0009_downgrade_fail_closed_populated(
             n = session.connection().exec_driver_sql(
                 "SELECT COUNT(*) FROM artifact WHERE idempotency_key IS NOT NULL"
             ).scalar_one()
+    assert n == 1
+
+
+# ---------------------------------------------------------------------------
+# Migration 20260729_0001 (V4 self-registration, plan §11 "迁移" Gate F:
+# fail-closed downgrade must preserve the single-use consumption record)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_0029_downgrade_empty_is_lossless(tmp_path: Path) -> None:
+    """No consumed bootstrap tokens -> the 0029 downgrade drops the partial
+    unique index + ``bootstrap_token_ref`` column cleanly and the revision
+    lands on 20260728_0009."""
+    url = f"sqlite:///{(tmp_path / 'v4_downgrade_empty.db').as_posix()}"
+    config = _config(url)
+    command.upgrade(config, HEAD)
+    assert _revision(url) == HEAD
+    _assert_0029_schema_present(url)
+
+    # Empty V4 registration state -> lossless one-step downgrade.
+    command.downgrade(config, "20260728_0009")
+    assert _revision(url) == "20260728_0009"
+    _assert_0029_schema_absent(url)
+    # The 0009 columns/indexes that 0029 did not touch remain intact.
+    _assert_0009_schema_present(url)
+
+
+def test_migration_0029_downgrade_fail_closed_when_tokens_consumed(
+    tmp_path: Path,
+) -> None:
+    """Any agent with a populated ``bootstrap_token_ref`` makes the 0029
+    downgrade abort with RuntimeError BEFORE any DDL; the consumption record,
+    schema, index and revision all stay on 20260729_0001 (plan §3.2 strict
+    single-use permanence)."""
+    url = f"sqlite:///{(tmp_path / 'v4_downgrade_fc.db').as_posix()}"
+    config = _config(url)
+    command.upgrade(config, HEAD)
+    assert _revision(url) == HEAD
+
+    # Seed an agent that has consumed a bootstrap token.
+    with Session(get_engine(url)) as session:
+        session.add(
+            Agent(
+                name="a",
+                role="r",
+                adapter_type="external",
+                platform="p1",
+                external_ref="r1",
+                bootstrap_token_ref="jti-consumed",
+            )
+        )
+        session.commit()
+
+    with pytest.raises(RuntimeError):
+        command.downgrade(config, "20260728_0009")
+
+    # Fail-closed: nothing was touched. The consumed-token record survives.
+    assert _revision(url) == HEAD
+    _assert_0029_schema_present(url)
+    with Session(get_engine(url)) as session:
+        n = session.connection().exec_driver_sql(
+            "SELECT COUNT(*) FROM agent WHERE bootstrap_token_ref IS NOT NULL"
+        ).scalar_one()
     assert n == 1
 
 

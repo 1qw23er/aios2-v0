@@ -6,8 +6,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from aios.models import (
     AdapterType,
+    AgentStatus,
+    AgentTrustLevel,
     ApprovalStatus,
     ArtifactReviewStatus,
+    DelegationMode,
     KnowledgeReviewDecisionValue,
     RiskLevel,
     RoutingMode,
@@ -207,6 +210,90 @@ class AgentRegister(BaseModel):
 
 class AgentEnabledUpdate(BaseModel):
     enabled: bool
+
+
+class AgentSelfRegister(BaseModel):
+    """Agent self-registration payload (V4, #99/#101).
+
+    ``platform`` + ``external_ref`` form the immutable identity tuple (the
+    idempotency key for registration). The submitter is NEVER taken from this
+    body: for bootstrap it is the scoped token, for self-update it is the
+    authenticated agent actor. ``secret_ref`` is deliberately absent -- only an
+    opaque handle is ever stored, and credentials are issued out of band.
+    """
+
+    platform: str = Field(min_length=1)
+    external_ref: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    role: str = Field(min_length=1)
+    adapter_type: str = Field(min_length=1)
+    delegation_mode: str | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    endpoint: str | None = None
+    callback_url: str | None = None
+    config_ref: str | None = None
+    limitations: list[str] = Field(default_factory=list)
+    timeout_s: float = 300.0
+    max_retries: int = 3
+
+
+class AgentRegistrationResponse(BaseModel):
+    """Safe read model for a self-registered agent (V4, #99/#101).
+
+    NEVER includes ``secret_ref`` (credential isolation, plan §0.6). Only
+    scheduling-visible fields are exposed.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    platform: str | None = None
+    external_ref: str | None = None
+    name: str
+    role: str
+    adapter_type: str
+    status: str
+    capabilities: list[str] = Field(default_factory=list)
+
+
+class AgentBootstrapResponse(AgentRegistrationResponse):
+    """Bootstrap response -- additionally carries the ONE-TIME credential.
+
+    The ``credential`` is the only place a plaintext bearer secret is returned;
+    it is never persisted and never appears in any subsequent response or audit.
+    """
+
+    credential: str
+
+
+class AgentPublic(BaseModel):
+    """Safe public read model for any registry agent (V4, #99/#101).
+
+    Used by the read/list registry endpoints (``GET /agents``,
+    ``GET /agents/{id}``). Deliberately EXCLUDES ``secret_ref`` and ``config_ref``
+    so an opaque credential handle or config pointer can never leak through the
+    API (credential isolation, plan §0.6). Enum fields are kept as their enum
+    types so the ORM object validates directly and serializes to its value.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    platform: str | None = None
+    external_ref: str | None = None
+    name: str
+    role: str
+    adapter_type: AdapterType
+    delegation_mode: DelegationMode | None = None
+    status: AgentStatus
+    enabled: bool
+    trust_level: AgentTrustLevel
+    capabilities: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    endpoint: str | None = None
+    callback_url: str | None = None
+    timeout_s: float = 300.0
+    max_retries: int = 3
 
 
 class ReviewPolicyCreate(BaseModel):
