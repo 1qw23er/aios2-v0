@@ -52,6 +52,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
+from aios.actor import resolve_owner_actor
 from aios.campaign import V1_TASKS, launch_campaign
 from aios.context_service import ContextService
 from aios.db import get_engine, run_migrations
@@ -201,10 +202,15 @@ def run_campaign(
     # T9 knowledge capture (depends on T6) + owner preservation -> approved fact.
     t9 = _task_by_key(session, "T9", pid)
     execute_task(session, t9.id, f"exec:{pid}:T9", adapter=adapter)
-    scope = "company" if company_knowledge else "project"
     statement = f"[{index}] {name}：已验证的 V1 增长洞察（来源 campaign {pid}）"
+    # scope is now derived from project_id (None => company-wide, else the source
+    # campaign) per the refactored KnowledgeService.submit_candidate signature.
     candidate = KnowledgeService(session).submit_candidate(
-        art3.id, statement, scope, "owner"
+        art3.id,
+        statement,
+        project_id=None if company_knowledge else pid,
+        tags=["positioning"],
+        actor=resolve_owner_actor("owner"),
     )
     # NOTE: each campaign preserves under its OWN series ("positioning:c{index}").
     # This is deliberate: the current DB unique constraint on (series_id, version)
@@ -217,8 +223,8 @@ def run_campaign(
     KnowledgeService(session).review_candidate(
         candidate.id,
         KnowledgeReviewDecisionValue.APPROVE,
-        "owner",
         "证据充分，批准为 v1 可复用事实",
+        actor=resolve_owner_actor("owner"),
         series_id=series,
         version=1,
     )
@@ -419,6 +425,10 @@ def main(argv: list[str] | None = None) -> int:
             "sqlite:///" + os.path.join(tempfile.mkdtemp(prefix="aios_v1m_"), "v1.db")
         )
     os.environ["AIOS_DATABASE_URL"] = db_url
+    # I6 acceptance (AC7: knowledge reuse) requires the least-privilege
+    # KnowledgeFact projection to be ENABLED. It is fail-closed (OFF) by default
+    # (#67), so the measurement runner must opt in to actually verify reuse.
+    os.environ["KNOWLEDGE_LEAST_PRIVILEGE_ENABLED"] = "true"
     run_migrations(db_url)  # idempotent; real Alembic upgrade to head
 
     adapter = LLMExecutionAdapter() if args.real_llm else ScriptedExecutionAdapter()
