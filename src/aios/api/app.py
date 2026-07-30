@@ -104,7 +104,7 @@ from aios.schemas import (
     WorkLogAttest,
     WorkLogSubmit,
 )
-from aios.secrets_store import SecretStoreUnavailable
+from aios.secrets_store import SecretStoreUnavailable, validate_secret_store_config
 from aios.services import (
     ServiceError,
     decide_approval,
@@ -121,6 +121,10 @@ from aios.work_log import ContentFeed, WorkLogService
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     run_migrations()
+    # Fail-closed startup validation: an explicitly selected encrypted_db
+    # backend without a valid KEK (or an unknown backend) must crash at boot
+    # with a readable message, not serve silent 503s. (issue #103 follow-up)
+    validate_secret_store_config()
     yield
 
 

@@ -56,6 +56,17 @@ class SecretStoreUnavailable(Exception):
     """
 
 
+class SecretStoreMisconfigured(SecretStoreUnavailable):
+    """Raised at startup when the secret-store backend config is invalid.
+
+    A subclass of :class:`SecretStoreUnavailable` so the message family stays
+    coherent, but it is thrown during app startup (``lifespan``) rather than at
+    request time. It surfaces operator errors -- e.g. selecting ``encrypted_db``
+    without a valid KEK, or an unknown backend -- as an explicit boot failure
+    instead of silent 503s on every credential check.
+    """
+
+
 # Backend selection + key material (issue #103 §4.1 / §4.3).
 SECRET_STORE_BACKEND_ENV = "AIOS_SECRET_STORE_BACKEND"
 SECRET_MASTER_KEY_ENV = "AIOS_SECRET_MASTER_KEY"
@@ -380,3 +391,38 @@ def reset_secret_store() -> None:
     """Reset the singleton (test isolation)."""
     global _STORE
     _STORE = AgentSecretStore()
+
+
+def validate_secret_store_config() -> None:
+    """Fail-closed startup check for the secret-store backend configuration.
+
+    Call this once during application startup (``lifespan``). It validates the
+    operator's backend choice and key material *before* the app accepts traffic:
+
+      * ``memory`` (default, or unset) -> always valid, no KEK required.
+      * ``encrypted_db`` -> requires a valid :data:`SECRET_MASTER_KEY_ENV`
+        (exactly 32 bytes, hex or base64); otherwise raises
+        :class:`SecretStoreMisconfigured`.
+      * any other explicit value -> raises :class:`SecretStoreMisconfigured`.
+
+    This turns a permanent operator mistake into an explicit boot failure with a
+    readable message, instead of silent HTTP 503 on every agent authentication.
+
+    Transient backend unavailability (e.g. the DB is momentarily down) is
+    intentionally NOT checked here: that remains a request-time 503 (issue #103
+    G3) so a brief outage never prevents the process from starting.
+    """
+    backend = os.environ.get(SECRET_STORE_BACKEND_ENV, _DEFAULT_BACKEND)
+    if backend == _DEFAULT_BACKEND:
+        return
+    if backend == "encrypted_db":
+        if not _load_kek():
+            raise SecretStoreMisconfigured(
+                f"secret store misconfigured: backend 'encrypted_db' requires a "
+                f"valid {SECRET_MASTER_KEY_ENV} (exactly 32 bytes, hex or base64)"
+            )
+        return
+    raise SecretStoreMisconfigured(
+        "secret store misconfigured: unsupported AIOS_SECRET_STORE_BACKEND "
+        "value (permitted: 'memory', 'encrypted_db')"
+    )

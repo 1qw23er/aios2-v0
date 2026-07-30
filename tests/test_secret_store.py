@@ -33,10 +33,12 @@ from aios.models import Agent, AgentSecret
 from aios.secrets_store import (
     AgentSecretStore,
     EncryptedDbAgentSecretStore,
+    SecretStoreMisconfigured,
     SecretStoreUnavailable,
     _load_kek,
     get_secret_store,
     reset_secret_store,
+    validate_secret_store_config,
 )
 
 KEK = bytes.fromhex("00" * 32)
@@ -520,3 +522,40 @@ def test_authenticate_agent_missing_bearer_401_when_store_ready(
         assert exc.value.status_code == 401
     finally:
         reset_secret_store()
+
+
+# --- Startup fail-closed configuration validation (#103 follow-up) ---
+
+
+def test_validate_config_memory_default_ok(monkeypatch) -> None:
+    monkeypatch.delenv("AIOS_SECRET_STORE_BACKEND", raising=False)
+    monkeypatch.delenv("AIOS_SECRET_MASTER_KEY", raising=False)
+    # No exception for the default in-memory backend (no KEK required).
+    validate_secret_store_config()
+
+
+def test_validate_config_encrypted_db_valid_kek_ok(monkeypatch) -> None:
+    monkeypatch.setenv("AIOS_SECRET_STORE_BACKEND", "encrypted_db")
+    monkeypatch.setenv("AIOS_SECRET_MASTER_KEY", KEK_HEX)
+    # A correctly provisioned encrypted_db backend passes validation.
+    validate_secret_store_config()
+
+
+def test_validate_config_encrypted_db_missing_kek_raises(monkeypatch) -> None:
+    monkeypatch.setenv("AIOS_SECRET_STORE_BACKEND", "encrypted_db")
+    monkeypatch.delenv("AIOS_SECRET_MASTER_KEY", raising=False)
+    with pytest.raises(SecretStoreMisconfigured):
+        validate_secret_store_config()
+
+
+def test_validate_config_encrypted_db_invalid_kek_raises(monkeypatch) -> None:
+    monkeypatch.setenv("AIOS_SECRET_STORE_BACKEND", "encrypted_db")
+    monkeypatch.setenv("AIOS_SECRET_MASTER_KEY", "00" * 16)  # 16 bytes, too short
+    with pytest.raises(SecretStoreMisconfigured):
+        validate_secret_store_config()
+
+
+def test_validate_config_unknown_backend_raises(monkeypatch) -> None:
+    monkeypatch.setenv("AIOS_SECRET_STORE_BACKEND", "vault")
+    with pytest.raises(SecretStoreMisconfigured):
+        validate_secret_store_config()
