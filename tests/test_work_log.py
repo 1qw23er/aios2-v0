@@ -51,7 +51,7 @@ from aios.work_log import (
 )
 from alembic import command
 
-HEAD = "20260729_0001"
+HEAD = "20260730_0001"
 PREV = "20260727_0008"
 
 
@@ -1221,8 +1221,11 @@ def test_migration_0029_downgrade_fail_closed_when_tokens_consumed(
     with pytest.raises(RuntimeError):
         command.downgrade(config, "20260728_0009")
 
-    # Fail-closed: nothing was touched. The consumed-token record survives.
-    assert _revision(url) == HEAD
+    # Fail-closed on the 0029 layer: the consumed-token record and 0029 schema
+    # are intact. (The empty top secret-store layer 20260730_0001 is cleanly
+    # removable on SQLite's per-migration commit semantics, so the chain stops
+    # exactly at the 0029 revision rather than the current head.)
+    assert _revision(url) == "20260729_0001"
     _assert_0029_schema_present(url)
     with Session(get_engine(url)) as session:
         n = session.connection().exec_driver_sql(

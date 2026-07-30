@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Column, ForeignKey, String, UniqueConstraint
+from sqlalchemy import JSON, Column, ForeignKey, LargeBinary, String, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -286,6 +286,34 @@ class Agent(SQLModel, table=True):
     # has NO dedicated index -- the ``(platform, external_ref)`` partial unique
     # index (migration 20260729_0001) provides tuple uniqueness instead.
     bootstrap_token_ref: str | None = Field(default=None)
+
+
+class AgentSecret(SQLModel, table=True):
+    """Static credential material for one agent's self-update bearer (#103).
+
+    Persisted ONLY by the opt-in ``encrypted_db`` secret-store backend. The
+    table holds KEK-derived HMAC tags -- never the plaintext bearer and never
+    any reversible ciphertext (issue #103 §4.2):
+
+    * ``token_tag`` -- ``HMAC-SHA256(KEK, token)``, the one-way lookup key.
+      Uniqueness is the required access-path index; it cannot be reversed to
+      recover the token.
+    * ``row_mac`` -- ``HMAC-SHA256(KEK, agent_id || token_tag)``, a
+      cryptographic binding of the tag to its owning ``agent_id`` so the tag
+      cannot be transplanted to another agent row.
+
+    ``revoked_at`` is ``NULL`` for the single active token and set on revoke
+    (kept for forensic history; the strict single-use contract is preserved by
+    the bootstrap-token consumption record on ``Agent``).
+    """
+
+    __tablename__ = "agent_secret"
+
+    agent_id: str = Field(primary_key=True, foreign_key="agent.id")
+    token_tag: bytes = Field(sa_column=Column(LargeBinary, nullable=False))
+    row_mac: bytes = Field(sa_column=Column(LargeBinary, nullable=False))
+    created_at: datetime = Field(default_factory=now_utc)
+    revoked_at: datetime | None = Field(default=None)
 
 
 class Capability(SQLModel, table=True):

@@ -353,7 +353,7 @@ def test_bootstrap_credential_failure_rolls_back(v4_session, monkeypatch) -> Non
     """If the external credential store fails, the agent row is NOT committed."""
     _seed_capability(v4_session, "cap_x", "cap_x")
 
-    def _boom(self, agent_id: str) -> str:  # pragma: no cover - injected failure
+    def _boom(self, agent_id: str, session=None) -> str:  # pragma: no cover - injected failure
         raise RuntimeError("secret store unavailable")
 
     monkeypatch.setattr(
@@ -385,7 +385,7 @@ def test_bootstrap_commit_failure_revokes_credential(
 
     real_issue = store.issue
 
-    def _spy_issue(agent_id: str) -> str:
+    def _spy_issue(agent_id: str, session=None) -> str:
         tok = real_issue(agent_id)
         captured["token"] = tok
         return tok
@@ -417,7 +417,7 @@ def test_bootstrap_audit_failure_revokes_credential(
 
     real_issue = store.issue
 
-    def _spy_issue(agent_id: str) -> str:
+    def _spy_issue(agent_id: str, session=None) -> str:
         tok = real_issue(agent_id)
         captured["token"] = tok
         return tok
@@ -449,7 +449,7 @@ def test_rotate_credential_audit_failure_revokes_credential(
 
     real_issue = store.issue
 
-    def _spy_issue(agent_id: str) -> str:
+    def _spy_issue(agent_id: str, session=None) -> str:
         tok = real_issue(agent_id)
         captured["token"] = tok
         return tok
@@ -821,6 +821,7 @@ def test_relay_concurrent_idempotent(v4_session) -> None:
     """Concurrent same-key same-payload relays converge to exactly one log."""
     _seed_capability(v4_session, "cap_x", "cap_x")
     agent, _ = _bootstrap_via_service(v4_session, "p1", "r1", "jti-cr")
+    agent_id = agent.id  # capture before cross-session use
     project = _make_project(v4_session)
     eng = get_engine(get_database_url())
     barrier = threading.Barrier(3)
@@ -832,6 +833,8 @@ def test_relay_concurrent_idempotent(v4_session) -> None:
             from aios.relay import relay_work_log
             from aios.schemas import WorkLogSubmit
 
+            worker_agent = s.get(Agent, agent_id)  # re-fetch in worker session
+            assert worker_agent is not None, "agent must exist in worker session"
             payload = WorkLogSubmit(
                 project_id=project.id,
                 report_type="daily",
@@ -847,8 +850,8 @@ def test_relay_concurrent_idempotent(v4_session) -> None:
                 s,
                 payload=payload,
                 idempotency_key="k-concurrent",
-                actor=resolve_agent_actor(agent.id),
-                agent=agent,
+                actor=resolve_agent_actor(agent_id),
+                agent=worker_agent,
             )
         except Exception as exc:  # noqa: BLE001 - surface thread failures as test errors
             errors.append(exc)
@@ -1185,7 +1188,7 @@ def test_alembic_single_new_head() -> None:
     cfg = Config(root / "alembic.ini")
     cfg.set_main_option("script_location", str(root / "alembic"))
     head = ScriptDirectory.from_config(cfg).get_current_head()
-    assert head == "20260729_0001"
+    assert head == "20260730_0001"
 
 
 def test_migration_adds_bootstrap_token_ref_no_second_index(v4_session) -> None:
@@ -1208,16 +1211,21 @@ def test_migration_adds_bootstrap_token_ref_no_second_index(v4_session) -> None:
 
 
 def test_no_new_tables(v4_session) -> None:
-    """V4 introduces zero new tables (reuses Agent/Capability/AgentCapability)."""
+    """V4 reuses Agent/Capability/AgentCapability; #103 adds ONLY agent_secret.
+
+    No *other* secret-store / token table (bootstrap_token, secret_store,
+    agent_credential) was created -- agent_secret is the single, deliberate
+    addition carrying only KEK-derived HMAC tags (issue #103 §4.2).
+    """
     from sqlalchemy import inspect as sa_inspect
 
     inspector = sa_inspect(v4_session.get_bind())
     tables = set(inspector.get_table_names())
-    # No secret-store / token table was created.
-    for forbidden in ("agent_secret", "bootstrap_token", "secret_store", "agent_credential"):
+    # No *extra* secret-store / token table was created beyond the one #103 adds.
+    for forbidden in ("bootstrap_token", "secret_store", "agent_credential"):
         assert forbidden not in tables
     # The pre-existing registry tables are still present (reused, not forked).
-    for expected in ("agent", "capability", "agent_capability"):
+    for expected in ("agent", "capability", "agent_capability", "agent_secret"):
         assert expected in tables
 
 

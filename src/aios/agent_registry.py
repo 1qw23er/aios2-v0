@@ -399,7 +399,7 @@ def create_agent_via_bootstrap(
     # back, so we MUST revoke the already-issued plaintext credential to avoid an
     # orphaned, active bearer secret -- compensation for every post-issuance
     # failure, not just the commit.
-    credential = get_secret_store().issue(agent.id)
+    credential = get_secret_store().issue(agent.id, session=session)
     agent.secret_ref = f"secret://agent/{agent.id}"
     session.add(agent)
     try:
@@ -423,11 +423,17 @@ def create_agent_via_bootstrap(
         )
         session.commit()
     except Exception:
-        # Compensate: the agent row / audit may not have persisted, but the
-        # plaintext credential already lives in the secret store. Revoke it so
-        # no orphaned, active bearer secret survives a failed bootstrap.
-        get_secret_store().revoke(agent.id)
+        # Compensate: the plaintext credential already lives in the secret
+        # store, so revoke it so no orphaned, active bearer secret survives a
+        # failed bootstrap. Roll back T1 FIRST to release the caller's write
+        # lock (SQLite), then perform the session-less, independent revoke (G5
+        # durable compensation). If the failure happened after commit the
+        # rollback is a no-op and the revoke still cleans up the persisted row;
+        # if it happened before commit the rolled-back row is gone and the
+        # revoke is a harmless no-op -- so this ordering can never deadlock on
+        # "database is locked" while T1 still holds the lock.
         session.rollback()
+        get_secret_store().revoke(agent.id)
         raise
     session.refresh(agent)
     return agent, credential
@@ -572,10 +578,12 @@ def rotate_credential(
     except Exception:
         # Compensate: a post-issuance failure (audit write OR commit) would
         # otherwise leave the new plaintext credential active while the rotation
-        # never persisted. Revoke the already-issued plaintext credential and
-        # roll back so no orphaned, active bearer secret survives.
-        get_secret_store().revoke(agent.id)
+        # never persisted. Roll back the caller transaction FIRST so the
+        # store-owned revoke session can acquire the SQLite write lock (G5
+        # durable); otherwise the revoke waits on the still-held lock and fails
+        # with 'database is locked', leaving the newly issued credential active.
         session.rollback()
+        get_secret_store().revoke(agent.id)
         raise
     session.refresh(agent)
     return credential

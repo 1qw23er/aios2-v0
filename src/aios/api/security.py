@@ -56,7 +56,7 @@ from fastapi.security import (
 )
 
 from aios.actor import ActorContext, resolve_agent_actor
-from aios.secrets_store import get_secret_store
+from aios.secrets_store import SecretStoreUnavailable, get_secret_store
 
 OWNER_ID_ENV = "AIOS_OWNER_ID"
 OWNER_API_KEY_ENV = "AIOS_OWNER_API_KEY"
@@ -173,16 +173,41 @@ def authenticate_agent(
     route to obtain an agent actor. The agent can never escalate to owner/system
     and can only ever touch its own identity (the route layer enforces scope).
 
-    A *missing* or *unknown* credential maps to ``401`` (never 503 -- agent auth
-    has no server-misconfiguration branch; the store is always available).
+    A *missing* / *unknown* / *revoked* / *malformed* credential maps to
+    ``401`` -- all indistinguishable (no existence leak, issue #103 §6). A
+    *store-unavailable* condition (KEK missing, backend error, or row
+    integrity failure) maps to ``503`` via ``SecretStoreUnavailable``; that
+    readiness check precedes any token-format short-circuit so it fires for
+    *every* input -- including a request that carries no bearer at all (G3).
     """
+    # G3 ordering: probe store readiness BEFORE the missing-credential 401
+    # branch. ``resolve(None)`` raises ``SecretStoreUnavailable`` (503) when the
+    # store is down and returns ``None`` (a no-op readiness confirmation) when
+    # ready, so a store outage yields a consistent 503 for every input rather
+    # than a token-dependent 401. The readiness probe is format-independent.
+    try:
+        get_secret_store().resolve(None)
+    except SecretStoreUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="secret_store_unavailable",
+            headers=_AGENT_UNAUTH_HEADERS,
+        ) from None
+
     if credentials is None or not credentials.credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="agent authentication required",
             headers=_AGENT_UNAUTH_HEADERS,
         )
-    agent_id = get_secret_store().resolve(credentials.credentials)
+    try:
+        agent_id = get_secret_store().resolve(credentials.credentials)
+    except SecretStoreUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="secret_store_unavailable",
+            headers=_AGENT_UNAUTH_HEADERS,
+        ) from None
     if agent_id is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

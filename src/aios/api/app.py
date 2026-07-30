@@ -104,6 +104,7 @@ from aios.schemas import (
     WorkLogAttest,
     WorkLogSubmit,
 )
+from aios.secrets_store import SecretStoreUnavailable
 from aios.services import (
     ServiceError,
     decide_approval,
@@ -125,6 +126,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 def _translate(error: ServiceError) -> HTTPException:
     return HTTPException(status_code=error.status_code, detail=error.detail)
+
+
+def _secret_unavailable() -> HTTPException:
+    """Map a secret-store outage to HTTP 503 (issue #103 §6)."""
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="secret_store_unavailable",
+    )
 
 
 def _key(value: str | None) -> str:
@@ -1175,6 +1184,8 @@ def create_app() -> FastAPI:
                 timeout_s=payload.timeout_s,
                 max_retries=payload.max_retries,
             )
+        except SecretStoreUnavailable:
+            raise _secret_unavailable() from None
         except ServiceError as error:
             raise _translate(error) from error
         return AgentBootstrapResponse(
@@ -1225,6 +1236,8 @@ def create_app() -> FastAPI:
                 timeout_s=payload.timeout_s,
                 max_retries=payload.max_retries,
             )
+        except SecretStoreUnavailable:
+            raise _secret_unavailable() from None
         except ServiceError as error:
             raise _translate(error) from error
         return AgentRegistrationResponse(
@@ -1257,6 +1270,8 @@ def create_app() -> FastAPI:
         """
         try:
             credential = rotate_credential(session, agent_id, actor=actor)
+        except SecretStoreUnavailable:
+            raise _secret_unavailable() from None
         except ServiceError as error:
             raise _translate(error) from error
         return {"agent_id": agent_id, "credential": credential}

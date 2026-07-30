@@ -59,3 +59,14 @@ def run_migrations(database_url: str | None = None) -> None:
 def get_session() -> Generator[Session, None, None]:
     with Session(get_engine(get_database_url())) as session:
         yield session
+
+
+def make_session() -> Session:
+    """Return a standalone SQLAlchemy ``Session`` bound to the default engine.
+
+    Unlike ``get_session`` (a FastAPI generator dependency meant for the request
+    lifecycle), this is a plain factory for use outside request handling -- e.g.
+    the encrypted secret store opens its own store-owned transactions via this
+    so its commits are independent of the caller's transaction (issue #103 §4.5).
+    """
+    return Session(get_engine(get_database_url()))

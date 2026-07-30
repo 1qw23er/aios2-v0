@@ -154,10 +154,11 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     # 20260720_0006, ReviewPolicy identity (#72/#74): 20260722_0007, and the
     # scope-aware knowledge_fact version uniqueness fix (#53): 20260727_0008,
     # and the work-log & agent-platform slice (#88): 20260728_0009, and the V4
-    # agent self-registration slice (#99/#101): 20260729_0001. The round-trip
-    # mechanics above already prove the knowledge migrations; this final step
-    # only confirms we can return to the current head.
-    assert revision() == "20260729_0001"
+    # agent self-registration slice (#99/#101): 20260729_0001, and the #103
+    # agent_secret slice: 20260730_0001. The round-trip mechanics above already
+    # prove the knowledge migrations; this final step only confirms we can
+    # return to the current head.
+    assert revision() == "20260730_0001"
 
 
 def test_scope_unique_migration_round_trip(tmp_path: Path) -> None:
