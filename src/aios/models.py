@@ -90,6 +90,13 @@ class ArtifactType(StrEnum):
     # addition -- StrEnum values are stored as plain VARCHAR, so no migration is
     # needed.
     CONTENT_DRAFT = "content_draft"
+    # Usage-feedback loop (V1.2-C, #110): a user/owner-reported product feedback
+    # item (original text / scenario / expected outcome / risk tags / suggested
+    # solution). Business fields live in ``metadata_json``; the original text
+    # lives at ``uri``; the content checksum covers the A-zone fields (plan
+    # §1.3). Pure code addition -- StrEnum values are stored as plain VARCHAR,
+    # so no Alembic migration is required (single head ``20260730_0001``).
+    FEEDBACK = "feedback"
 
 
 class ArtifactReviewStatus(StrEnum):

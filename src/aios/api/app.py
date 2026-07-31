@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import (
     Body,
@@ -58,6 +59,7 @@ from aios.distribution import (
     is_publish_gate_task,
 )
 from aios.execution import LLMExecutionAdapter, execute_task
+from aios.feedback import FeedbackService, FeedbackTransition, redact_pii
 from aios.knowledge_service import KnowledgeService
 from aios.knowledge_tags import report_unclassified_knowledge
 from aios.measurement import MeasurementService
@@ -247,6 +249,157 @@ class ContentDraftMetrics(BaseModel):
     metrics: dict
     idempotency_key: str
     supersedes_audit_id: str | None = None
+
+
+# --- Feedback loop (V1.2-C, #110) -------------------------------------------
+
+
+class FeedbackCreate(BaseModel):
+    """Owner/agent submission of a new feedback item (plan §2)."""
+
+    project_id: str
+    original_text: str
+    scenario: str | None = None
+    expected_outcome: str | None = None
+    risk_tags: list[str] | None = None
+    channel: str = "owner_console"
+
+
+class FeedbackAmend(BaseModel):
+    """Edit of A-zone content (only COLLECTED/CLARIFY/SOLUTION). reason required."""
+
+    reason: str
+    scenario: str | None = None
+    expected_outcome: str | None = None
+    risk_tags: list[str] | None = None
+    solution_text: str | None = None
+
+
+class FeedbackTransitionRequest(BaseModel):
+    """A kanban transition. Only namics verbs are accepted (never a bare stage).
+
+    An unknown ``transition`` value (or a raw stage string) fails Pydantic
+    validation with 422 (plan §3.2 / T3).
+    """
+
+    transition: FeedbackTransition
+    reason: str | None = None
+    canonical_feedback_id: str | None = None
+    scenario: str | None = None
+    expected_outcome: str | None = None
+    risk_tags: list[str] | None = None
+    solution_text: str | None = None
+
+
+class FeedbackClusterRequest(BaseModel):
+    """Run a deterministic clustering over the given member feedback ids."""
+
+    project_id: str
+    window_start: str
+    window_end: str
+    member_ids: list[str]
+    policy_version: str = "det-1.0"
+
+
+class FeedbackListItem(BaseModel):
+    """Bounded list view: original_text truncated + PII redacted (plan §5)."""
+
+    id: str
+    project_id: str
+    type: str
+    stage: str
+    submitted_by: str
+    channel: str | None = None
+    cluster_id: str | None = None
+    workflow_revision: str | None = None
+    transition_seq: int = 0
+    risk_tags: list[str] = []
+    checksum: str
+    revision_count: int = 0
+    review_status: str
+    created_at: datetime | None = None
+    original_text_preview: str
+
+
+class FeedbackDetail(BaseModel):
+    """Authorized detail view. PII is redacted (text is untrusted data)."""
+
+    id: str
+    project_id: str
+    task_id: str | None = None
+    type: str
+    stage: str
+    submitted_by: str
+    channel: str | None = None
+    cluster_id: str | None = None
+    duplicate_of: str | None = None
+    workflow_revision: str | None = None
+    transition_seq: int = 0
+    risk_tags: list[str] = []
+    checksum: str
+    revision_count: int = 0
+    review_status: str
+    created_at: datetime | None = None
+    original_text: str
+    solution_text: str | None = None
+    scenario: str | None = None
+    expected_outcome: str | None = None
+    corrections: list[dict] = []
+
+
+def _to_feedback_list_item(fb: Artifact) -> FeedbackListItem:
+    md = fb.metadata_json or {}
+    preview = (fb.uri or "")[:200]
+    return FeedbackListItem(
+        id=fb.id,
+        project_id=fb.project_id,
+        type=fb.type.value if hasattr(fb.type, "value") else str(fb.type),
+        stage=md.get("stage", "COLLECTED"),
+        submitted_by=md.get("submitted_by", ""),
+        channel=md.get("channel"),
+        cluster_id=md.get("cluster_id"),
+        workflow_revision=md.get("workflow_revision"),
+        transition_seq=int(md.get("transition_seq", 0)),
+        risk_tags=md.get("risk_tags") or [],
+        checksum=fb.checksum,
+        revision_count=fb.revision_count,
+        review_status=(
+            fb.review_status.value if hasattr(fb.review_status, "value") else str(fb.review_status)
+        ),
+        created_at=fb.created_at,
+        original_text_preview=redact_pii(preview),
+    )
+
+
+def _to_feedback_detail(fb: Artifact) -> FeedbackDetail:
+    md = fb.metadata_json or {}
+    return FeedbackDetail(
+        id=fb.id,
+        project_id=fb.project_id,
+        task_id=fb.task_id,
+        type=fb.type.value if hasattr(fb.type, "value") else str(fb.type),
+        stage=md.get("stage", "COLLECTED"),
+        submitted_by=md.get("submitted_by", ""),
+        channel=md.get("channel"),
+        cluster_id=md.get("cluster_id"),
+        duplicate_of=md.get("duplicate_of"),
+        workflow_revision=md.get("workflow_revision"),
+        transition_seq=int(md.get("transition_seq", 0)),
+        risk_tags=md.get("risk_tags") or [],
+        checksum=fb.checksum,
+        revision_count=fb.revision_count,
+        review_status=(
+            fb.review_status.value if hasattr(fb.review_status, "value") else str(fb.review_status)
+        ),
+        created_at=fb.created_at,
+        original_text=redact_pii(fb.uri or ""),
+        solution_text=redact_pii(md.get("solution_text")) if md.get("solution_text") else None,
+        scenario=redact_pii(md.get("scenario")) if md.get("scenario") else None,
+        expected_outcome=(
+            redact_pii(md.get("expected_outcome")) if md.get("expected_outcome") else None
+        ),
+        corrections=redact_pii(md.get("corrections") or []),
+    )
 
 
 def create_app() -> FastAPI:
@@ -722,6 +875,158 @@ def create_app() -> FastAPI:
                 metrics=payload.metrics,
                 idempotency_key=payload.idempotency_key,
                 supersedes_audit_id=payload.supersedes_audit_id,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    # --- Feedback loop (V1.2-C, #110) --------------------------------------
+
+    @application.post(
+        "/feedback", response_model=FeedbackDetail, status_code=status.HTTP_201_CREATED
+    )
+    def create_feedback_endpoint(
+        payload: FeedbackCreate,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> FeedbackDetail:
+        """Create a COLLECTED feedback item. Owner or authenticated Agent."""
+        try:
+            fb = FeedbackService(session).create_feedback(
+                project_id=payload.project_id,
+                actor=actor,
+                original_text=payload.original_text,
+                scenario=payload.scenario,
+                expected_outcome=payload.expected_outcome,
+                risk_tags=payload.risk_tags,
+                channel=payload.channel,
+            )
+            return _to_feedback_detail(fb)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.get("/feedback", response_model=list[FeedbackListItem])
+    def list_feedback_endpoint(
+        project_id: str,
+        limit: int = Query(default=100, ge=1, le=100),
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> list[FeedbackListItem]:
+        """List feedback. Owner sees all; a submitter sees own; an unrelated
+        same-project agent receives 403 (plan §5). original_text truncated."""
+        try:
+            items = FeedbackService(session).list_feedback(project_id=project_id, actor=actor)
+            return [_to_feedback_list_item(fb) for fb in items[:limit]]
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.get("/feedback/clusters", response_model=list[AuditLog])
+    def list_clusters_endpoint(
+        project_id: str,
+        limit: int = Query(default=100, ge=1, le=100),
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> list[AuditLog]:
+        """List cluster-summary AuditLogs for a project (read-only, inert).
+
+        Authorization mirrors feedback reads (plan §5): an unrelated agent —
+        including a same-project unrelated agent — is rejected with 403 rather
+        than silently empty/filtered. Responses are bounded by ``limit<=100``,
+        applied in the query.
+        """
+        # Reuse the exact same per-project authorization as feedback reads
+        # (plan §5): an unrelated same-project agent is rejected with 403 by
+        # list_feedback; owner and related submitters are authorized (returns a
+        # list, possibly empty). Never a silent empty set.
+        try:
+            FeedbackService(session).list_feedback(project_id=project_id, actor=actor)
+        except ServiceError as error:
+            raise _translate(error) from error
+        rows = session.exec(
+            select(AuditLog)
+            .where(
+                AuditLog.action == "feedback.cluster_summary",
+                AuditLog.project_id == project_id,
+            )
+            .order_by(AuditLog.created_at.desc())
+            .limit(limit)
+        ).all()
+        return list(rows)
+
+    @application.get("/feedback/{artifact_id}", response_model=FeedbackDetail)
+    def get_feedback_endpoint(
+        artifact_id: str,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> FeedbackDetail:
+        """Read one feedback item. Unrelated agent -> 403 (never 404/filter)."""
+        try:
+            fb = FeedbackService(session).get_feedback(artifact_id=artifact_id, actor=actor)
+            return _to_feedback_detail(fb)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.put("/feedback/{artifact_id}", response_model=FeedbackDetail)
+    def amend_feedback_endpoint(
+        artifact_id: str,
+        payload: FeedbackAmend,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> FeedbackDetail:
+        """Edit A-zone content (COLLECTED/CLARIFY/SOLUTION only). reason required."""
+        try:
+            fb = FeedbackService(session).amend_feedback(
+                artifact_id=artifact_id,
+                actor=actor,
+                reason=payload.reason,
+                scenario=payload.scenario,
+                expected_outcome=payload.expected_outcome,
+                risk_tags=payload.risk_tags,
+                solution_text=payload.solution_text,
+            )
+            return _to_feedback_detail(fb)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post("/feedback/{artifact_id}/transition", response_model=FeedbackDetail)
+    def transition_feedback_endpoint(
+        artifact_id: str,
+        payload: FeedbackTransitionRequest,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> FeedbackDetail:
+        """Apply a named transition verb. Never accepts a bare stage string."""
+        try:
+            fb = FeedbackService(session).apply_transition(
+                artifact_id=artifact_id,
+                actor=actor,
+                transition=payload.transition,
+                reason=payload.reason,
+                canonical_feedback_id=payload.canonical_feedback_id,
+                scenario=payload.scenario,
+                expected_outcome=payload.expected_outcome,
+                risk_tags=payload.risk_tags,
+                solution_text=payload.solution_text,
+            )
+            return _to_feedback_detail(fb)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post("/feedback/clusters", response_model=AuditLog)
+    def cluster_feedback_endpoint(
+        payload: FeedbackClusterRequest,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> AuditLog:
+        """Deterministic, idempotent clustering. Appends one inert AuditLog;
+        never mutates Feedback/Task/Approval/KnowledgeFact/Event (plan §4)."""
+        try:
+            return FeedbackService(session).record_cluster_run(
+                actor=actor,
+                project_id=payload.project_id,
+                window_start=payload.window_start,
+                window_end=payload.window_end,
+                member_ids=payload.member_ids,
+                policy_version=payload.policy_version,
             )
         except ServiceError as error:
             raise _translate(error) from error
