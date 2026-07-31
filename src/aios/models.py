@@ -85,6 +85,11 @@ class ArtifactType(StrEnum):
     # metadata_json; the body markdown lives at ``uri``. Pure code addition --
     # StrEnum values are stored as plain VARCHAR, so no migration is needed.
     WORK_LOG = "work_log"
+    # Personal-IP content & monetization workflow (#108-A): a content draft
+    # (topic / outline / body / conversion anchors / review metrics). Pure code
+    # addition -- StrEnum values are stored as plain VARCHAR, so no migration is
+    # needed.
+    CONTENT_DRAFT = "content_draft"
 
 
 class ArtifactReviewStatus(StrEnum):

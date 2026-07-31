@@ -49,6 +49,7 @@ from aios.console import (
     owner_measurement_html,
     owner_not_found_html,
 )
+from aios.content_draft import ContentDraftService, authenticate_owner_or_agent
 from aios.db import get_session, run_migrations
 from aios.distribution import (
     assemble_distribution_package,
@@ -202,6 +203,50 @@ class ReviewDispatchRequest(BaseModel):
 
     policy_id: str
     executor_agent_id: str | None = None
+
+
+class ContentDraftCreate(BaseModel):
+    """Owner/agent submission of a new content draft (plan v3 §5)."""
+
+    project_id: str
+    topic: str
+    body: str
+    phase: str = "idea"
+    outline: list[str] | None = None
+    conversion_anchors: list[dict] | None = None
+    series_id: str = "黎叔AI创业实验室"
+    task_id: str | None = None
+    idempotency_key: str | None = None
+
+
+class ContentDraftUpdate(BaseModel):
+    """Producer/owner edit of an UNVERIFIED or NEEDS_REVISION draft."""
+
+    topic: str | None = None
+    body: str | None = None
+    phase: str | None = None
+    outline: list[str] | None = None
+    conversion_anchors: list[dict] | None = None
+    series_id: str | None = None
+
+
+class ContentDraftApprove(BaseModel):
+    """Owner approval, bound to the exact reviewed revision (plan v3 §1)."""
+
+    review_checksum: str
+    review_revision: int
+
+
+class ContentDraftReject(BaseModel):
+    reason: str | None = None
+
+
+class ContentDraftMetrics(BaseModel):
+    """Append-only metric/retrospective record for an APPROVED draft."""
+
+    metrics: dict
+    idempotency_key: str
+    supersedes_audit_id: str | None = None
 
 
 def create_app() -> FastAPI:
@@ -529,6 +574,155 @@ def create_app() -> FastAPI:
         """
         try:
             return owner_approve_review(session, artifact_id=artifact_id, actor=actor)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/content-drafts",
+        response_model=Artifact,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_content_draft_endpoint(
+        payload: ContentDraftCreate,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> Artifact:
+        """Create an UNVERIFIED content draft. Owner or authenticated Agent."""
+        try:
+            return ContentDraftService(session).create_content_draft(
+                project_id=payload.project_id,
+                actor=actor,
+                topic=payload.topic,
+                body=payload.body,
+                phase=payload.phase,
+                outline=payload.outline,
+                conversion_anchors=payload.conversion_anchors,
+                series_id=payload.series_id,
+                task_id=payload.task_id,
+                idempotency_key=payload.idempotency_key,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.get("/content-drafts", response_model=list[Artifact])
+    def list_content_drafts_endpoint(
+        project_id: str,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> list[Artifact]:
+        """List content drafts. Owner sees all; a related Agent sees only its own
+        produced/reviewed drafts; an unrelated same-project Agent receives 403."""
+        try:
+            return ContentDraftService(session).list_content_drafts(
+                project_id=project_id, actor=actor
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.get("/content-drafts/{artifact_id}", response_model=Artifact)
+    def get_content_draft_endpoint(
+        artifact_id: str,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> Artifact:
+        """Read one draft. Owner or the related producer/reviewer only."""
+        try:
+            return ContentDraftService(session).get_content_draft(
+                artifact_id=artifact_id, actor=actor
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.patch("/content-drafts/{artifact_id}", response_model=Artifact)
+    def update_content_draft_endpoint(
+        artifact_id: str,
+        payload: ContentDraftUpdate,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> Artifact:
+        """Edit an UNVERIFIED/NEEDS_REVISION draft. Owner or the producer only."""
+        try:
+            return ContentDraftService(session).update_content_draft(
+                artifact_id=artifact_id,
+                actor=actor,
+                topic=payload.topic,
+                body=payload.body,
+                phase=payload.phase,
+                outline=payload.outline,
+                conversion_anchors=payload.conversion_anchors,
+                series_id=payload.series_id,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post("/content-drafts/{artifact_id}/submit", response_model=Artifact)
+    def submit_content_draft_endpoint(
+        artifact_id: str,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> Artifact:
+        """Submit for independent review (owner-trigger, reviewer server-derived,
+        never APPROVED by the review). Owner or the producer only."""
+        try:
+            return ContentDraftService(session).submit_content_draft(
+                artifact_id=artifact_id, actor=actor
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post("/content-drafts/{artifact_id}/approve", response_model=Artifact)
+    def approve_content_draft_endpoint(
+        artifact_id: str,
+        payload: ContentDraftApprove,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
+    ) -> Artifact:
+        """Owner final approval, bound to the exact reviewed revision. NEVER
+        creates a KnowledgeFact (plan v3 §1)."""
+        try:
+            return ContentDraftService(session).approve_content_draft(
+                artifact_id=artifact_id,
+                actor=actor,
+                review_checksum=payload.review_checksum,
+                review_revision=payload.review_revision,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post("/content-drafts/{artifact_id}/reject", response_model=Artifact)
+    def reject_content_draft_endpoint(
+        artifact_id: str,
+        payload: ContentDraftReject,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
+    ) -> Artifact:
+        """Owner rejection. Terminal REJECTED (plan v3 §3)."""
+        try:
+            return ContentDraftService(session).reject_content_draft(
+                artifact_id=artifact_id, actor=actor, reason=payload.reason
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/content-drafts/{artifact_id}/metrics", response_model=AuditLog
+    )
+    def record_content_metrics_endpoint(
+        artifact_id: str,
+        payload: ContentDraftMetrics,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner),
+    ) -> AuditLog:
+        """Append an immutable review-metric record for an APPROVED draft. Does not
+        mutate the draft; uses the inert AuditLog primitive (plan v3 §2)."""
+        try:
+            return ContentDraftService(session).record_review_metrics(
+                artifact_id=artifact_id,
+                actor=actor,
+                metrics=payload.metrics,
+                idempotency_key=payload.idempotency_key,
+                supersedes_audit_id=payload.supersedes_audit_id,
+            )
         except ServiceError as error:
             raise _translate(error) from error
 
