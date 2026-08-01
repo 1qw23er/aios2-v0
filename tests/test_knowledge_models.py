@@ -157,8 +157,9 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     # agent self-registration slice (#99/#101): 20260729_0001, and the #103
     # agent_secret slice: 20260730_0001. The round-trip mechanics above already
     # prove the knowledge migrations; this final step only confirms we can
-    # return to the current head.
-    assert revision() == "20260730_0001"
+    # return to the current head (#109 customer-service workflow slice
+    # 20260731_0001 extends the chain past the #103 secret-store slice).
+    assert revision() == "20260731_0001"
 
 
 def test_scope_unique_migration_round_trip(tmp_path: Path) -> None:

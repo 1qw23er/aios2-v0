@@ -28,6 +28,12 @@ class ActorContext:
     kind: Literal["owner", "agent", "system"]
     owner_id: str | None = None
     agent_id: str | None = None
+    # Optional project scope for agent actors. When an agent carries a scope,
+    # it may only act on resources belonging to that project (fail-closed
+    # otherwise). Owner/system actors leave this as None -- they are governed
+    # by their own guards. This enables per-project isolation of compute
+    # actions (contract B) without changing how the actor is resolved.
+    project_id: str | None = None
 
     def derive_submitted_by(self) -> str:
         if self.kind == "owner":
@@ -55,13 +61,19 @@ def resolve_owner_actor(owner_id: str = OWNER_IDENTITY) -> ActorContext:
     return ActorContext(kind="owner", owner_id=owner_id)
 
 
-def resolve_agent_actor(agent_id: str) -> ActorContext:
+def resolve_agent_actor(agent_id: str, project_id: str | None = None) -> ActorContext:
     """Trusted agent resolution (Agent Interop Gateway / delegation only).
 
     The gateway supplies a registry-validated ``agent_id``; the kind is fixed to
     ``"agent"`` so an external agent can never escalate to owner/system.
+
+    An optional ``project_id`` scope may be attached. When present, the actor is
+    only authorized to act on resources within that project (see
+    ``CustomerService._assert_can_act``). When omitted (the default, and what the
+    current Agent Interop Gateway supplies), the actor is fail-closed: compute
+    actions reject it with 403 unless it is an owner.
     """
-    return ActorContext(kind="agent", agent_id=agent_id)
+    return ActorContext(kind="agent", agent_id=agent_id, project_id=project_id)
 
 
 def _assert_owner_actor(actor: ActorContext) -> None:

@@ -827,3 +827,90 @@ class TaskContext(SQLModel, table=True):
     source_references: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     context_hash: str = Field(index=True)
     created_at: datetime = Field(default_factory=now_utc)
+
+
+# --- Customer service / sales-conversion workflow (#109, V1.2-B) ----------
+# StrEnum values are stored as plain VARCHAR (see ArtifactType note above):
+# on read they come back as plain ``str``, so compare with ``== "value"``
+# literals rather than ``.value``.
+
+
+class CsChannel(StrEnum):
+    WECHAT_WORK = "wechat_work"
+    WECHAT_PUBLIC = "wechat_public"
+    MOCK = "mock"
+
+
+class LeadStage(StrEnum):
+    VISITOR = "visitor"
+    LEAD = "lead"
+    QUALIFIED = "qualified"
+    PROPOSAL = "proposal"
+    WON = "won"
+
+
+class MessageDirection(StrEnum):
+    INBOUND = "inbound"
+    OUTBOUND = "outbound"
+
+
+class SenderType(StrEnum):
+    CUSTOMER = "customer"
+    AGENT = "agent"
+    OWNER = "owner"
+
+
+class CsSuggestionDecision(StrEnum):
+    AUTO_SEND = "auto_send"
+    HUMAN_CONFIRM = "human_confirm"
+    ESCALATE = "escalate"
+
+
+class Conversation(SQLModel, table=True):
+    __tablename__ = "conversation"
+
+    id: str = Field(default_factory=lambda: new_id("conv"), primary_key=True)
+    project_id: str = Field(foreign_key="project.id", index=True)
+    channel: CsChannel = Field(default=CsChannel.MOCK, sa_column=Column(String, nullable=False))
+    external_conversation_ref: str | None = Field(default=None)
+    customer_ref: str | None = Field(default=None)
+    lead_stage: LeadStage = Field(
+        default=LeadStage.VISITOR, sa_column=Column(String, nullable=False)
+    )
+    assigned_human: str | None = Field(default=None)
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class Message(SQLModel, table=True):
+    __tablename__ = "message"
+
+    id: str = Field(default_factory=lambda: new_id("msg"), primary_key=True)
+    conversation_id: str = Field(foreign_key="conversation.id", index=True)
+    project_id: str = Field(foreign_key="project.id", index=True)
+    direction: MessageDirection = Field(sa_column=Column(String, nullable=False))
+    sender_type: SenderType = Field(sa_column=Column(String, nullable=False))
+    body: str
+    confidence: float | None = Field(default=None)
+    is_auto_sent: bool = Field(default=False)
+    escalation_flag: bool = Field(default=False)
+    escalation_categories: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    knowledge_fact_refs: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class CsSuggestion(SQLModel, table=True):
+    __tablename__ = "cs_suggestion"
+
+    id: str = Field(default_factory=lambda: new_id("sug"), primary_key=True)
+    conversation_id: str = Field(foreign_key="conversation.id", index=True)
+    project_id: str = Field(foreign_key="project.id", index=True)
+    decision: CsSuggestionDecision = Field(sa_column=Column(String, nullable=False))
+    text: str
+    confidence: float | None = Field(default=None)
+    escalation_categories: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    knowledge_fact_refs: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    fact_revisions: dict[str, int] = Field(default_factory=dict, sa_column=Column(JSON))
+    consumed: bool = Field(default=False)
+    idempotency_key: str = Field(unique=True, index=True)
+    created_at: datetime = Field(default_factory=now_utc)

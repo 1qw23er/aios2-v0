@@ -51,7 +51,7 @@ from aios.work_log import (
 )
 from alembic import command
 
-HEAD = "20260730_0001"
+HEAD = "20260731_0001"
 PREV = "20260727_0008"
 
 

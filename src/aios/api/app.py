@@ -22,6 +22,7 @@ from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from aios.actor import ActorContext
+from aios.adapters.wecom import MockWeComAdapter
 from aios.agent_registry import (
     create_agent_via_bootstrap,
     get_agent,
@@ -51,6 +52,7 @@ from aios.console import (
     owner_not_found_html,
 )
 from aios.content_draft import ContentDraftService, authenticate_owner_or_agent
+from aios.customer_service import CustomerService
 from aios.db import get_session, run_migrations
 from aios.distribution import (
     assemble_distribution_package,
@@ -69,8 +71,13 @@ from aios.models import (
     ApprovalStatus,
     Artifact,
     Capability,
+    Conversation,
+    CsChannel,
+    CsSuggestion,
     KnowledgeCandidate,
     KnowledgeReviewDecisionValue,
+    LeadStage,
+    Message,
     Project,
     ReviewPolicy,
     ReviewResult,
@@ -119,6 +126,164 @@ from aios.services import create_project as create_project_service
 from aios.services import create_task as create_task_service
 from aios.services import get_board as get_board_service
 from aios.work_log import ContentFeed, WorkLogService
+
+# --- Customer-service / sales-conversion API models (#109, V1.2-B) ---------
+
+
+class CsConversationCreate(BaseModel):
+    project_id: str
+    channel: str = "mock"
+    external_conversation_ref: str | None = None
+    customer_ref: str | None = None
+
+
+class CsMessageInbound(BaseModel):
+    text: str
+
+
+class CsSuggestRequest(BaseModel):
+    text: str
+    inbound_message_id: str | None = None
+
+
+class CsSendRequest(BaseModel):
+    text: str
+    auto_send: bool = False
+    suggestion_id: str | None = None
+
+
+class CsEscalateRequest(BaseModel):
+    categories: list[str] | None = None
+    reason: str = "manual"
+
+
+class CsStageUpdate(BaseModel):
+    stage: str
+    reason: str = ""
+
+
+class CsFollowupCreate(BaseModel):
+    title: str
+
+
+class CsConversationDetail(BaseModel):
+    id: str
+    project_id: str
+    channel: str
+    external_conversation_ref: str | None = None
+    customer_ref: str | None = None
+    lead_stage: str
+    assigned_human: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class CsMessageListItem(BaseModel):
+    id: str
+    conversation_id: str
+    project_id: str
+    direction: str
+    sender_type: str
+    body: str
+    confidence: float | None = None
+    is_auto_sent: bool
+    escalation_flag: bool
+    escalation_categories: list[str] = []
+    knowledge_fact_refs: list[str] = []
+    created_at: datetime
+
+
+class CsMessageDetail(BaseModel):
+    id: str
+    conversation_id: str
+    project_id: str
+    direction: str
+    sender_type: str
+    body: str
+    confidence: float | None = None
+    is_auto_sent: bool
+    escalation_flag: bool
+    escalation_categories: list[str] = []
+    knowledge_fact_refs: list[str] = []
+    created_at: datetime
+
+
+class CsSuggestionDetail(BaseModel):
+    id: str
+    conversation_id: str
+    project_id: str
+    decision: str
+    text: str
+    confidence: float | None = None
+    escalation_categories: list[str] = []
+    knowledge_fact_refs: list[str] = []
+    consumed: bool
+    created_at: datetime
+
+
+def _cs_conversation_detail(conv: Conversation) -> CsConversationDetail:
+    return CsConversationDetail(
+        id=conv.id,
+        project_id=conv.project_id,
+        channel=conv.channel,
+        external_conversation_ref=conv.external_conversation_ref,
+        customer_ref=conv.customer_ref,
+        lead_stage=conv.lead_stage,
+        assigned_human=conv.assigned_human,
+        created_at=conv.created_at,
+        updated_at=conv.updated_at,
+    )
+
+
+def _cs_message_list_item(msg: Message) -> CsMessageListItem:
+    # List surface: bound the body to <=200 chars (plan §6).
+    body = msg.body if len(msg.body) <= 200 else msg.body[:200] + "…"
+    return CsMessageListItem(
+        id=msg.id,
+        conversation_id=msg.conversation_id,
+        project_id=msg.project_id,
+        direction=msg.direction,
+        sender_type=msg.sender_type,
+        body=body,
+        confidence=msg.confidence,
+        is_auto_sent=msg.is_auto_sent,
+        escalation_flag=msg.escalation_flag,
+        escalation_categories=msg.escalation_categories or [],
+        knowledge_fact_refs=msg.knowledge_fact_refs or [],
+        created_at=msg.created_at,
+    )
+
+
+def _cs_message_detail(msg: Message) -> CsMessageDetail:
+    return CsMessageDetail(
+        id=msg.id,
+        conversation_id=msg.conversation_id,
+        project_id=msg.project_id,
+        direction=msg.direction,
+        sender_type=msg.sender_type,
+        body=msg.body,
+        confidence=msg.confidence,
+        is_auto_sent=msg.is_auto_sent,
+        escalation_flag=msg.escalation_flag,
+        escalation_categories=msg.escalation_categories or [],
+        knowledge_fact_refs=msg.knowledge_fact_refs or [],
+        created_at=msg.created_at,
+    )
+
+
+def _cs_suggestion_detail(sug: CsSuggestion) -> CsSuggestionDetail:
+    return CsSuggestionDetail(
+        id=sug.id,
+        conversation_id=sug.conversation_id,
+        project_id=sug.project_id,
+        decision=sug.decision,
+        text=sug.text,
+        confidence=sug.confidence,
+        escalation_categories=sug.escalation_categories or [],
+        knowledge_fact_refs=sug.knowledge_fact_refs or [],
+        consumed=sug.consumed,
+        created_at=sug.created_at,
+    )
 
 
 @asynccontextmanager
@@ -1027,6 +1192,220 @@ def create_app() -> FastAPI:
                 window_end=payload.window_end,
                 member_ids=payload.member_ids,
                 policy_version=payload.policy_version,
+            )
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    # --- Customer service / sales conversion (V1.2-B, #109) ----------------
+
+    @application.post(
+        "/conversations", response_model=CsConversationDetail, status_code=status.HTTP_201_CREATED
+    )
+    def create_conversation_endpoint(
+        payload: CsConversationCreate,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> CsConversationDetail:
+        """Create a conversation (Mock adapter / owner console)."""
+        try:
+            conv = CustomerService(session, adapter=MockWeComAdapter()).create_conversation(
+                actor,
+                project_id=payload.project_id,
+                channel=CsChannel(payload.channel),
+                external_conversation_ref=payload.external_conversation_ref,
+                customer_ref=payload.customer_ref,
+            )
+            return _cs_conversation_detail(conv)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail="invalid channel") from error
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.get("/conversations", response_model=list[CsConversationDetail])
+    def list_conversations_endpoint(
+        project_id: str,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> list[CsConversationDetail]:
+        """List conversations for a project (owner only; agent -> 403)."""
+        try:
+            convs = CustomerService(session, adapter=MockWeComAdapter()).list_conversations(
+                actor, project_id=project_id
+            )
+            return [_cs_conversation_detail(c) for c in convs]
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.get("/conversations/{conversation_id}", response_model=CsConversationDetail)
+    def get_conversation_endpoint(
+        conversation_id: str,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> CsConversationDetail:
+        """Read one conversation (per-project 403 for agents)."""
+        try:
+            conv = CustomerService(session, adapter=MockWeComAdapter()).get_conversation(
+                actor, conversation_id=conversation_id
+            )
+            return _cs_conversation_detail(conv)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/conversations/{conversation_id}/messages",
+        response_model=CsMessageDetail,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def post_inbound_message_endpoint(
+        conversation_id: str,
+        payload: CsMessageInbound,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> CsMessageDetail:
+        """Post an inbound customer message on an existing conversation."""
+        try:
+            msg = CustomerService(session, adapter=MockWeComAdapter()).post_inbound_message(
+                actor, conversation_id=conversation_id, text=payload.text
+            )
+            return _cs_message_detail(msg)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.get(
+        "/conversations/{conversation_id}/messages", response_model=list[CsMessageListItem]
+    )
+    def list_messages_endpoint(
+        conversation_id: str,
+        limit: int = Query(default=100, ge=1, le=100),
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> list[CsMessageListItem]:
+        """List messages (bounded, body truncated to <=200 chars)."""
+        try:
+            msgs = CustomerService(session, adapter=MockWeComAdapter()).get_messages(
+                actor, conversation_id=conversation_id, limit=limit
+            )
+            return [_cs_message_list_item(m) for m in msgs]
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/conversations/{conversation_id}/suggest", response_model=CsSuggestionDetail
+    )
+    def suggest_endpoint(
+        conversation_id: str,
+        payload: CsSuggestRequest,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> CsSuggestionDetail:
+        """Generate a deterministic reply suggestion (zero LLM by default)."""
+        try:
+            sug = CustomerService(session, adapter=MockWeComAdapter()).generate_suggestion(
+                actor,
+                conversation_id=conversation_id,
+                inbound_message_id=payload.inbound_message_id,
+                text=payload.text,
+            )
+            return _cs_suggestion_detail(sug)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/conversations/{conversation_id}/send", response_model=CsMessageDetail
+    )
+    def send_endpoint(
+        conversation_id: str,
+        payload: CsSendRequest,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> CsMessageDetail:
+        """Send a message. auto_send=True enforces the AUTO_SEND suggestion
+        guard (text match / one-shot consume / stale-knowledge recheck)."""
+        try:
+            msg = CustomerService(session, adapter=MockWeComAdapter()).send_message(
+                actor,
+                conversation_id=conversation_id,
+                text=payload.text,
+                auto_send=payload.auto_send,
+                suggestion_id=payload.suggestion_id,
+            )
+            return _cs_message_detail(msg)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/conversations/{conversation_id}/escalate", response_model=CsMessageDetail
+    )
+    def escalate_endpoint(
+        conversation_id: str,
+        payload: CsEscalateRequest,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> CsMessageDetail:
+        """Force a human escalation (writes escalation Message + audit)."""
+        try:
+            msg = CustomerService(session, adapter=MockWeComAdapter()).escalate(
+                actor,
+                conversation_id=conversation_id,
+                categories=payload.categories,
+                reason=payload.reason,
+            )
+            return _cs_message_detail(msg)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.patch(
+        "/conversations/{conversation_id}/stage", response_model=CsConversationDetail
+    )
+    def set_stage_endpoint(
+        conversation_id: str,
+        payload: CsStageUpdate,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> CsConversationDetail:
+        """Advance the lead funnel (owner only; agent -> 403)."""
+        try:
+            stage = LeadStage(payload.stage)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail="invalid lead stage") from error
+        try:
+            conv = CustomerService(session, adapter=MockWeComAdapter()).set_lead_stage(
+                actor, conversation_id=conversation_id, stage=stage, reason=payload.reason
+            )
+            return _cs_conversation_detail(conv)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/conversations/{conversation_id}/assign", response_model=CsConversationDetail
+    )
+    def assign_endpoint(
+        conversation_id: str,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> CsConversationDetail:
+        """Owner takeover of a conversation (records assigned_human)."""
+        try:
+            conv = CustomerService(session, adapter=MockWeComAdapter()).assign_human(
+                actor, conversation_id=conversation_id
+            )
+            return _cs_conversation_detail(conv)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/conversations/{conversation_id}/followup-task", response_model=Task
+    )
+    def followup_task_endpoint(
+        conversation_id: str,
+        payload: CsFollowupCreate,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_owner_or_agent),
+    ) -> Task:
+        """Create an explicit follow-up Task (owner only; never auto-created)."""
+        try:
+            return CustomerService(session, adapter=MockWeComAdapter()).create_followup_task(
+                actor, conversation_id=conversation_id, title=payload.title
             )
         except ServiceError as error:
             raise _translate(error) from error

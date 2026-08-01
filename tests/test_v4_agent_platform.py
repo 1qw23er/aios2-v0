@@ -1180,7 +1180,9 @@ def test_relay_ingest_audit_logged(v4_session) -> None:
 
 
 def test_alembic_single_new_head() -> None:
-    """Alembic head advanced exactly one step past the #88 slice."""
+    """Alembic head is the current single leaf: past the V4 secret-store #103
+    slice (20260730_0001) and the #109 customer-service workflow slice
+    (20260731_0001)."""
     from alembic.config import Config
     from alembic.script import ScriptDirectory
 
@@ -1188,7 +1190,7 @@ def test_alembic_single_new_head() -> None:
     cfg = Config(root / "alembic.ini")
     cfg.set_main_option("script_location", str(root / "alembic"))
     head = ScriptDirectory.from_config(cfg).get_current_head()
-    assert head == "20260730_0001"
+    assert head == "20260731_0001"
 
 
 def test_migration_adds_bootstrap_token_ref_no_second_index(v4_session) -> None:
