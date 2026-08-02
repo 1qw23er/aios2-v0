@@ -153,6 +153,35 @@ def _get_independent_review(artifact: Artifact) -> dict[str, Any] | None:
     return review if isinstance(review, dict) else None
 
 
+def _matches_current_review(
+    artifact: Artifact,
+    *,
+    source_revision: int | None = None,
+    source_checksum: str | None = None,
+) -> bool:
+    """Return whether the active review exactly binds the current revision.
+
+    ``reviewed_checksum`` binds owner approval to the frozen post-review
+    artifact. ``source_checksum`` identifies the exact pre-review content and
+    makes submission replay safe without conflating later revisions.
+    """
+    if artifact.review_status not in (
+        ArtifactReviewStatus.REVIEW_PASSED,
+        ArtifactReviewStatus.NEEDS_REVISION,
+    ):
+        return False
+    review = _get_independent_review(artifact)
+    if review is None:
+        return False
+    if review.get("reviewed_revision") != artifact.revision_count:
+        return False
+    if review.get("reviewed_checksum") != artifact.checksum:
+        return False
+    if source_revision is not None and review.get("reviewed_revision") != source_revision:
+        return False
+    return source_checksum is None or review.get("source_checksum") == source_checksum
+
+
 def _reviewer_of(artifact: Artifact) -> str | None:
     """Server-derived reviewer identity stored in the persisted review record."""
     review = _get_independent_review(artifact)
@@ -462,6 +491,8 @@ class ContentDraftService:
         if not (actor.kind == "owner" or actor.derive_submitted_by() == producer):
             raise ServiceError(403, "only owner or the producer may submit this draft")
         if artifact.review_status != ArtifactReviewStatus.UNVERIFIED:
+            if _matches_current_review(artifact):
+                return artifact
             raise ServiceError(
                 409,
                 f"only an UNVERIFIED draft can be submitted "
@@ -489,8 +520,8 @@ class ContentDraftService:
             # --- run the review (adapter call, outside the transaction) ---
             result = _safe_review(adapter, artifact=artifact, producer_identity=producer)
 
-        reviewed_checksum = artifact.checksum
-        reviewed_revision = artifact.revision_count
+        source_checksum = artifact.checksum
+        source_revision = artifact.revision_count
 
         # --- serialize the write under BEGIN IMMEDIATE (P1#2) ---
         self.session.rollback()
@@ -500,17 +531,25 @@ class ContentDraftService:
             if fresh is None:
                 raise ServiceError(404, "Artifact not found")
             if fresh.review_status != ArtifactReviewStatus.UNVERIFIED:
+                if _matches_current_review(
+                    fresh,
+                    source_revision=source_revision,
+                    source_checksum=source_checksum,
+                ):
+                    self.session.commit()
+                    return fresh
                 raise ServiceError(409, "content draft already submitted or reviewed")
             # A concurrent update would change checksum/revision; refuse a stale
             # review so unreviewed content can never be approved.
-            if fresh.checksum != reviewed_checksum or fresh.revision_count != reviewed_revision:
+            if fresh.checksum != source_checksum or fresh.revision_count != source_revision:
                 raise ServiceError(409, "content changed since review; re-submit")
 
             metadata = dict(fresh.metadata_json or {})
             review_record = {
                 "artifact_id": fresh.id,
                 "reviewed_checksum": None,  # bound to the final checksum below
-                "reviewed_revision": reviewed_revision,
+                "reviewed_revision": source_revision,
+                "source_checksum": source_checksum,
                 "producer": producer,
                 "reviewer": reviewer_identity if isinstance(reviewer_identity, str) else "unknown",
                 "result": result.result,
@@ -543,8 +582,14 @@ class ContentDraftService:
                     "review_status": fresh.review_status.value,
                     "reviewer": review_record["reviewer"],
                     "result": result.result,
+                    "source_revision": source_revision,
+                    "source_checksum": source_checksum,
+                    "reviewed_checksum": fresh.checksum,
                 },
-                idempotency_key=f"audit:content_draft:review:{fresh.id}",
+                idempotency_key=(
+                    f"audit:content_draft:review:{fresh.id}:"
+                    f"{source_revision}:{source_checksum}"
+                ),
             )
             self.session.commit()
         except ServiceError:

@@ -27,6 +27,7 @@ from aios.actor import ActorContext
 from aios.audit import AuditLog
 from aios.content_draft import (
     CONTENT_DRAFT_APPROVE_ACTION,
+    CONTENT_DRAFT_REVIEW_AUDIT,
     ContentDraftService,
     ContentReviewResult,
     FakeReviewAdapter,
@@ -68,6 +69,31 @@ class _LowConfidenceAdapter(FakeReviewAdapter):
     def review(self, *, artifact, producer_identity):
         return ContentReviewResult(
             result="review_passed", confidence=0.1, bounded_reason="low confidence pass"
+        )
+
+
+class _NeedsRevisionAdapter(FakeReviewAdapter):
+    """Deterministic first-round reviewer used by the re-review regression."""
+
+    def review(self, *, artifact, producer_identity):
+        return ContentReviewResult(
+            result="needs_revision",
+            confidence=1.0,
+            bounded_reason="revise before approval",
+        )
+
+
+class _BarrierReviewAdapter(FakeReviewAdapter):
+    """Hold two exact-review requests until both captured the same revision."""
+
+    def __init__(self, barrier: Barrier):
+        self._barrier = barrier
+
+    def review(self, *, artifact, producer_identity):
+        self._barrier.wait()
+        return super().review(
+            artifact=artifact,
+            producer_identity=producer_identity,
         )
 
 
@@ -301,12 +327,88 @@ def test_submit_rejects_spoofed_reviewer(session, project):
     assert exc.value.status_code == 409
 
 
-def test_submit_requires_unverified(session, project):
+def test_submit_same_revision_replay_is_idempotent(session, project):
     a = _make_draft(session, project, actor=OWNER)
-    _submit(session, a, OWNER)
-    with pytest.raises(ServiceError) as exc:
-        _submit(session, a, OWNER)
-    assert exc.value.status_code == 409
+    first = _submit(session, a, OWNER)
+    replay = _submit(session, a, OWNER)
+
+    assert replay.id == first.id
+    assert replay.checksum == first.checksum
+    audits = session.exec(
+        select(AuditLog).where(
+            AuditLog.resource_id == a.id,
+            AuditLog.action == CONTENT_DRAFT_REVIEW_AUDIT,
+        )
+    ).all()
+    assert len(audits) == 1
+
+
+def test_review_edit_rereview_and_owner_approve_preserves_history(session, project):
+    a = _make_draft(session, project, actor=OWNER)
+    rev1 = ContentDraftService(session).submit_content_draft(
+        artifact_id=a.id,
+        actor=OWNER,
+        adapter=_NeedsRevisionAdapter(),
+    )
+    rev1_checksum = rev1.checksum
+    rev1_revision = rev1.revision_count
+
+    rev2_unverified = ContentDraftService(session).update_content_draft(
+        artifact_id=a.id,
+        actor=OWNER,
+        body="revised content",
+    )
+    assert rev2_unverified.revision_count == rev1_revision + 1
+    assert rev2_unverified.checksum != rev1_checksum
+
+    rev2 = ContentDraftService(session).submit_content_draft(
+        artifact_id=a.id,
+        actor=OWNER,
+    )
+    assert rev2.review_status == ArtifactReviewStatus.REVIEW_PASSED
+
+    with pytest.raises(ServiceError) as stale:
+        ContentDraftService(session).approve_content_draft(
+            artifact_id=a.id,
+            actor=OWNER,
+            review_checksum=rev1_checksum,
+            review_revision=rev1_revision,
+        )
+    assert stale.value.status_code == 409
+
+    approved = ContentDraftService(session).approve_content_draft(
+        artifact_id=a.id,
+        actor=OWNER,
+        review_checksum=rev2.checksum,
+        review_revision=rev2.revision_count,
+    )
+    assert approved.review_status == ArtifactReviewStatus.APPROVED
+
+    metadata = approved.metadata_json or {}
+    history = metadata.get("review_history") or []
+    assert len(history) == 1
+    assert history[0]["reviewed_revision"] == rev1_revision
+    assert history[0]["reviewed_checksum"] == rev1_checksum
+
+    audits = session.exec(
+        select(AuditLog)
+        .where(
+            AuditLog.resource_id == a.id,
+            AuditLog.action == CONTENT_DRAFT_REVIEW_AUDIT,
+        )
+        .order_by(AuditLog.created_at)
+    ).all()
+    assert len(audits) == 2
+    assert audits[0].idempotency_key != audits[1].idempotency_key
+    assert [audit.after_snapshot["source_revision"] for audit in audits] == [
+        rev1_revision,
+        rev2.revision_count,
+    ]
+    assert all(audit.after_snapshot["source_checksum"] for audit in audits)
+    assert [audit.after_snapshot["reviewed_checksum"] for audit in audits] == [
+        rev1_checksum,
+        rev2.checksum,
+    ]
 
 
 def test_submit_low_confidence_fails_closed(session, project):
@@ -397,6 +499,51 @@ def test_submit_rejects_concurrent_update(session, engine, project):
     # the concurrent edit won: the draft is back to UNVERIFIED, never reviewed
     session.refresh(a)
     assert a.review_status == ArtifactReviewStatus.UNVERIFIED
+
+
+def test_concurrent_same_revision_review_is_idempotent(session, engine, project):
+    a = _make_draft(session, project, actor=OWNER)
+    artifact_id = a.id
+    barrier = Barrier(2)
+    outcomes: list[tuple[str, ...]] = []
+
+    def submit():
+        with Session(engine) as worker:
+            worker.exec(text("PRAGMA busy_timeout=5000"))
+            try:
+                reviewed = ContentDraftService(worker).submit_content_draft(
+                    artifact_id=artifact_id,
+                    actor=OWNER,
+                    adapter=_BarrierReviewAdapter(barrier),
+                )
+                outcomes.append(("ok", reviewed.id, reviewed.checksum))
+            except Exception as exc:
+                outcomes.append(("error", type(exc).__name__))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(submit) for _ in range(2)]
+        for future in futures:
+            future.result()
+
+    assert len(outcomes) == 2
+    assert all(outcome[0] == "ok" for outcome in outcomes), outcomes
+    assert {outcome[1] for outcome in outcomes} == {artifact_id}
+    assert len({outcome[2] for outcome in outcomes}) == 1
+
+    session.expire_all()
+    persisted = session.get(Artifact, artifact_id)
+    assert persisted.review_status == ArtifactReviewStatus.REVIEW_PASSED
+    review = (persisted.metadata_json or {}).get("independent_review")
+    assert review is not None
+    assert review["source_checksum"]
+
+    audits = session.exec(
+        select(AuditLog).where(
+            AuditLog.resource_id == artifact_id,
+            AuditLog.action == CONTENT_DRAFT_REVIEW_AUDIT,
+        )
+    ).all()
+    assert len(audits) == 1
 
 
 # ---------------------------------------------------------------------------
