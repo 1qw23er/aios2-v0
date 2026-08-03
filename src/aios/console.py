@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from html import escape
 from typing import Any
+from urllib.parse import quote
 
 from sqlmodel import Session, or_, select
 
@@ -919,3 +920,300 @@ def owner_agents_html(agents: list[Agent], *, error: str | None = None) -> str:
 </div>
 </body>
 </html>"""
+
+
+# ---------------------------------------------------------------------------
+# Owner Operating Layer V0 (#121) -- server-rendered inbox surfaces.
+#
+# HARD RULE (plan §1.3 / §4.1 / T-D1): these pages MUST NOT render any internal
+# identity. No project id, no artifact / conversation / suggestion / candidate /
+# fact id, no checksum, no revision, no enum value, no canonical tag id, no
+# series·version, no ``display_binding``. The ONLY opaque strings on the wire are
+# the sealed ``OwnerSealedToken`` values, whose payload is AES-256-GCM encrypted.
+# ---------------------------------------------------------------------------
+
+OOL_STYLE = """
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f5f6f8; color: #1f2329; }
+  .wrap { max-width: 820px; margin: 40px auto; padding: 0 20px; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  h2 { font-size: 17px; margin: 0 0 10px; }
+  .sub { color: #6b7280; font-size: 13px; margin: 0 0 20px; }
+  .card { background: #fff; border-radius: 10px; padding: 20px 22px; margin-bottom: 14px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .tag { font-size: 12px; color: #1d4ed8; background: #eef4ff; border: 1px solid #c9dbff;
+         border-radius: 999px; padding: 2px 10px; white-space: nowrap; }
+  .ref { color: #6b7280; font-size: 12px; }
+  .preview { color: #4b5563; font-size: 14px; margin: 8px 0 0; line-height: 1.6; }
+  .sec { border-top: 1px solid #eef0f3; padding-top: 12px; margin-top: 12px; }
+  .sec-k { font-weight: 600; font-size: 13px; color: #374151; }
+  .sec-v { font-size: 14px; color: #1f2329; margin-top: 4px; line-height: 1.6;
+           white-space: pre-wrap; }
+  .msg { padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; font-size: 14px; }
+  .msg-error { background: #fdecea; color: #b42318; border: 1px solid #f5c2bd; }
+  .msg-ok { background: #ecfdf3; color: #067647; border: 1px solid #bbf0d2; }
+  .msg-info { background: #eef4ff; color: #1d4ed8; border: 1px solid #c9dbff; }
+  .empty { color: #6b7280; font-size: 14px; }
+  button { padding: 10px 16px; font-size: 15px; background: #2f6fed; color: #fff;
+           border: 0; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #2559c9; }
+  button.ghost { background: #fff; color: #2f6fed; border: 1px solid #c9dbff; }
+  textarea, select, input[type=text] { width: 100%; box-sizing: border-box; padding: 9px;
+           border: 1px solid #d0d3d9; border-radius: 6px; font-size: 14px; }
+  textarea { min-height: 84px; resize: vertical; }
+  .acts { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+  .act { border: 1px solid #eef0f3; border-radius: 8px; padding: 12px; margin-top: 10px; }
+  .act-h { font-weight: 600; font-size: 14px; margin-bottom: 8px; }
+  .nav { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+  .nav a { display: inline-block; padding: 10px 14px; background: #fff; border-radius: 8px;
+           border: 1px solid #dfe3e8; text-decoration: none; color: #1f2329; font-size: 15px; }
+  .nav a:hover { border-color: #2f6fed; color: #2f6fed; }
+  a { color: #2f6fed; }
+  .foot { margin-top: 18px; font-size: 13px; }
+"""
+
+OOL_INBOX_NAV: list[tuple[str, str]] = [
+    ("content", "内容决策"),
+    ("cs", "客服决策"),
+    ("feedback", "反馈决策"),
+    ("knowledge", "知识决策"),
+]
+
+
+def _ool_page(title: str, body: str) -> str:
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{escape(title)}</title>
+<style>{OOL_STYLE}</style>
+</head>
+<body>
+<div class="wrap">
+{body}
+</div>
+</body>
+</html>"""
+
+
+def _ool_msg(message: str | None, kind: str) -> str:
+    if not message:
+        return ""
+    return f'<div class="msg msg-{kind}">{escape(message)}</div>'
+
+
+def _ool_hidden(name: str, value: str) -> str:
+    return f'<input type="hidden" name="{escape(name)}" value="{escape(value)}">'
+
+
+def owner_project_picker_html(
+    options: list[Any], *, error: str | None = None, message: str | None = None
+) -> str:
+    """``GET /owner/project-picker`` -- business labels only, one sealed token each."""
+    if options:
+        cards = "\n".join(
+            f"""  <div class="card">
+    <div class="row">
+      <h2>{escape(option.business_label)}</h2>
+      <span class="tag">{escape(option.status_label)}</span>
+    </div>
+    <form method="post" action="/owner/project-pick">
+      {_ool_hidden("select_token", option.select_token)}
+      <div class="acts"><button type="submit">进入这个业务</button></div>
+    </form>
+  </div>"""
+            for option in options
+        )
+    else:
+        cards = '  <div class="card"><p class="empty">目前没有在进行中的业务。</p></div>'
+    body = f"""  <h1>选择你要处理的业务</h1>
+  <p class="sub">先选业务，再看待办。系统只会显示这个业务下需要你决定的事。</p>
+{_ool_msg(error, "error")}{_ool_msg(message, "ok")}
+{cards}
+"""
+    return _ool_page("选择业务 · 待办中心", body)
+
+
+def owner_inbox_hub_html(
+    project_label: str, context_token: str, *, message: str | None = None
+) -> str:
+    """``POST /owner/project-pick`` result -- the four-inbox hub for one project."""
+    ctx = quote(context_token, safe="")
+    links = "\n".join(
+        f'      <a href="/owner/inboxes/{kind}?ctx={ctx}">{escape(title)}</a>'
+        for kind, title in OOL_INBOX_NAV
+    )
+    body = f"""  <h1>{escape(project_label)} · 待办中心</h1>
+  <p class="sub">这里只列出需要你拍板的事。点进任意一类查看。</p>
+{_ool_msg(message, "ok")}
+  <div class="card">
+    <h2>四类待办</h2>
+    <div class="nav">
+{links}
+    </div>
+  </div>
+  <p class="foot"><a href="/owner/project-picker">切换业务</a></p>
+"""
+    return _ool_page(f"{project_label} · 待办中心", body)
+
+
+def owner_inbox_page_html(
+    page: Any, *, message: str | None = None, error: str | None = None
+) -> str:
+    """``GET /owner/inboxes/{kind}?ctx=...`` -- one inbox list."""
+    ctx = quote(page.context_token, safe="")
+    if page.items:
+        cards = "\n".join(
+            f"""  <div class="card">
+    <div class="row">
+      <h2>{escape(item.business_label)}</h2>
+      <span class="tag">{escape(item.status_label)}</span>
+    </div>
+    <div class="ref">{escape(item.detail_ref)}</div>
+    <p class="preview">{escape(item.preview)}</p>
+    <form method="post" action="/owner/inboxes/{escape(page.inbox)}/detail">
+      {_ool_hidden("detail_token", item.token)}
+      {_ool_hidden("ctx", page.context_token)}
+      <div class="acts"><button type="submit" class="ghost">查看并处理</button></div>
+    </form>
+  </div>"""
+            for item in page.items
+        )
+    else:
+        cards = '  <div class="card"><p class="empty">这一类目前没有待办。</p></div>'
+    links = "\n".join(
+        f'      <a href="/owner/inboxes/{kind}?ctx={ctx}">{escape(title)}</a>'
+        for kind, title in OOL_INBOX_NAV
+        if kind != page.inbox
+    )
+    body = f"""  <h1>{escape(page.project_label)} · {escape(page.title)}</h1>
+  <p class="sub">共 {len(page.items)} 条待办。</p>
+{_ool_msg(error, "error")}{_ool_msg(message, "ok")}
+{cards}
+  <div class="card">
+    <h2>其他待办</h2>
+    <div class="nav">
+{links}
+    </div>
+  </div>
+  <p class="foot"><a href="/owner/project-picker">切换业务</a></p>
+"""
+    return _ool_page(f"{page.project_label} · {page.title}", body)
+
+
+_OOL_INPUT_FIELDS: dict[str, str] = {
+    "stage": "stage_label",
+    "canonical": "canonical_choice",
+    "series": "series_choice",
+}
+
+
+def _ool_input_control(option: Any) -> str:
+    """Render the owner's *business* input for one decision (never an internal id)."""
+    kind = option.input_kind
+    if kind == "reason":
+        return '<textarea name="reason" placeholder="填写处理理由（会记入操作记录）"></textarea>'
+    if kind == "body":
+        return '<textarea name="body" placeholder="修改后的正文"></textarea>'
+    if kind == "text":
+        return '<textarea name="text" placeholder="可直接发送，也可以改写后再发送"></textarea>'
+    if kind == "title":
+        return '<input type="text" name="title" placeholder="跟进任务标题">'
+    if kind in _OOL_INPUT_FIELDS:
+        field_name = _OOL_INPUT_FIELDS[kind]
+        opts = "\n".join(
+            f'        <option value="{escape(choice)}">{escape(choice)}</option>'
+            for choice in option.choices
+        )
+        return f'<select name="{field_name}">\n{opts}\n      </select>'
+    if kind == "tags":
+        return "\n".join(
+            '        <label style="font-weight:400; display:block;">'
+            f'<input type="checkbox" name="tag_labels" value="{escape(choice)}"'
+            f' style="width:auto;"> {escape(choice)}</label>'
+            for choice in option.choices
+        )
+    return ""
+
+
+def owner_inbox_detail_html(detail: Any, *, error: str | None = None) -> str:
+    """``POST /owner/inboxes/{kind}/detail`` -- one item plus its valid decisions."""
+    sections = "\n".join(
+        f"""  <div class="sec">
+    <div class="sec-k">{escape(key)}</div>
+    <div class="sec-v">{escape(value)}</div>
+  </div>"""
+        for key, value in detail.sections
+    )
+    if detail.options:
+        actions = "\n".join(
+            f"""  <div class="act">
+    <div class="act-h">{escape(option.label)}</div>
+    <form method="post" action="/owner/inboxes/{escape(detail.inbox)}/decide">
+      {_ool_hidden("action_token", option.token)}
+      {_ool_hidden("ctx", detail.context_token)}
+      {_ool_input_control(option)}
+      <div class="acts"><button type="submit">{escape(option.label)}</button></div>
+    </form>
+  </div>"""
+            for option in detail.options
+        )
+    else:
+        actions = '  <p class="empty">这条目前没有你可以执行的操作。</p>'
+    if detail.audit_entries:
+        audit = "\n".join(
+            f'    <div class="sec-v">{escape(entry)}</div>' for entry in detail.audit_entries
+        )
+    else:
+        audit = '    <p class="empty">暂无操作记录。</p>'
+    ctx = quote(detail.context_token, safe="")
+    body = f"""  <h1>{escape(detail.project_label)} · {escape(detail.title)}</h1>
+  <p class="sub">{escape(detail.detail_ref)}</p>
+{_ool_msg(error, "error")}
+  <div class="card">
+    <div class="row">
+      <h2>{escape(detail.business_label)}</h2>
+      <span class="tag">{escape(detail.status_label)}</span>
+    </div>
+{sections}
+  </div>
+  <div class="card">
+    <h2>你可以做的决定</h2>
+{actions}
+  </div>
+  <div class="card">
+    <h2>操作记录</h2>
+{audit}
+  </div>
+  <p class="foot"><a href="/owner/inboxes/{escape(detail.inbox)}?ctx={ctx}">返回该类待办</a>
+     · <a href="/owner/project-picker">切换业务</a></p>
+"""
+    return _ool_page(f"{detail.project_label} · {detail.title}", body)
+
+
+def owner_inbox_error_html(message: str) -> str:
+    """Uniform owner-facing failure page (§8) -- one business sentence, no internals.
+
+    Deliberately takes nothing but the sentence:
+
+    * **No token is echoed back.** A failure page carrying the submitted context
+      token would differ between "the context was refused" and "the action was
+      refused", re-opening the enumeration channel that the uniform failure
+      class exists to close -- and it would embed a sealed token in a page
+      rendered for a request we just declined to trust.
+    * **One safe recovery action.** The owner returns to the business list and
+      re-enters the inbox with a freshly minted context, so recovery never
+      depends on a token whose validity could not be confirmed.
+    """
+    back = '  <p class="foot"><a href="/owner/project-picker">返回业务列表</a></p>'
+    hint = "收件箱里的内容可能已经变化。刷新后按最新状态重新处理即可，系统不会重复执行。"
+    body = f"""  <h1>这一步没能完成</h1>
+{_ool_msg(message, "error")}
+  <div class="card">
+    <p class="empty">{escape(hint)}</p>
+  </div>
+{back}
+"""
+    return _ool_page("操作未完成", body)

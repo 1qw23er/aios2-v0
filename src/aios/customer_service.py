@@ -448,10 +448,37 @@ class CustomerService:
     ) -> Message:
         if auto_send:
             return self._auto_send(actor, conversation_id, text, suggestion_id)
-        return self._human_send(actor, conversation_id, text)
+        return self._human_send(actor, conversation_id, text, suggestion_id)
+
+    def _assert_facts_fresh(self, sug: CsSuggestion) -> None:
+        """Refuse to send on stale ground (P1-2).
+
+        If any referenced approved fact was revoked, superseded or re-versioned
+        since the suggestion was generated, the copy is no longer backed by the
+        knowledge it was derived from. Shared by the auto-send path and by the
+        owner-confirmed send (plan §3.2 (b)) so both enforce the *same* rule;
+        each caller runs it inside its own single transaction.
+        """
+        for fact_id in sug.knowledge_fact_refs:
+            expected_version = (sug.fact_revisions or {}).get(fact_id)
+            fact = self.session.exec(
+                select(KnowledgeFact)
+                .where(KnowledgeFact.id == fact_id)
+                .execution_options(populate_existing=True)
+            ).first()
+            if (
+                fact is None
+                or fact.status != KnowledgeFactStatus.APPROVED
+                or fact.version != expected_version
+            ):
+                raise ServiceError(409, "stale knowledge fact")
 
     def _human_send(
-        self, actor: ActorContext, conversation_id: str, text: str
+        self,
+        actor: ActorContext,
+        conversation_id: str,
+        text: str,
+        suggestion_id: str | None = None,
     ) -> Message:
         # Human path: ONLY the trusted owner may send arbitrary text (plan §4.3).
         _assert_owner_actor(actor)
@@ -462,6 +489,18 @@ class CustomerService:
 
         self.session.rollback()
         self.session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        # A human send may be raised *against* a specific suggestion. When it
+        # is, that suggestion is bound and consumed in the same transaction, so
+        # the id can no longer be silently dropped -- which previously let one
+        # suggestion back a second outbound message.
+        sug: CsSuggestion | None = None
+        if suggestion_id is not None:
+            sug = self.session.get(CsSuggestion, suggestion_id)
+            if sug is None or sug.conversation_id != conv.id:
+                raise ServiceError(404, "suggestion not found")
+            if sug.consumed:
+                raise ServiceError(409, "suggestion already consumed")
+            sug.consumed = True
         try:
             msg = self.adapter.send_message(
                 self.session,
@@ -469,6 +508,118 @@ class CustomerService:
                 text=text,
                 sender_type=SenderType.OWNER,
                 is_auto_sent=False,
+            )
+            after: dict[str, Any] = {
+                "channel": conv.channel,
+                "direction": "outbound",
+                "is_auto_sent": False,
+                "sender_type": "owner",
+                "body": _bounded_audit_body(text),
+                "message_id": msg.id,
+                "conversation_id": conv.id,
+            }
+            if sug is not None:
+                after["suggestion_id"] = sug.id
+            append_audit(
+                self.session,
+                actor=actor.derive_submitted_by(),
+                action=_AUDIT_OUTBOUND,
+                resource_type="message",
+                resource_id=msg.id,
+                project_id=conv.project_id,
+                task_id=None,
+                before={},
+                after=after,
+                idempotency_key=f"audit:cs:outbound:human:{msg.id}",
+            )
+            self.session.commit()
+        except Exception as exc:
+            # Fail-closed delivery: roll back and surface 502 (contract A).
+            self.session.rollback()
+            raise ServiceError(502, "outbound delivery failed") from exc
+        self.session.refresh(msg)
+        return msg
+
+    def owner_confirm_suggestion(
+        self,
+        actor: ActorContext,
+        *,
+        conversation_id: str,
+        suggestion_id: str,
+        edited_text: str | None = None,
+    ) -> Message:
+        """Owner adopts a ``HUMAN_CONFIRM`` suggestion and sends it (plan §3.2).
+
+        One authoritative domain operation with **one** ``BEGIN IMMEDIATE``
+        transaction covering the guards, the send, the ``consumed`` flip and the
+        audit write. It deliberately does **not** delegate to
+        :meth:`_human_send` / :meth:`_auto_send` (P1-4): both own their own
+        transaction boundary, so calling them from here would nest
+        ``BEGIN IMMEDIATE`` and break the CAS / rollback contract. It calls the
+        adapter primitive directly instead.
+
+        Contract (§3.2 a-g):
+
+        (a) the live ``CsSuggestion`` row is authoritative -- the caller only
+            passes ids unsealed from a token, never owner-typed values;
+        (b) referenced knowledge facts are re-checked for staleness;
+        (c) one-shot: ``consumed`` flips inside the same transaction, so a
+            double click or a concurrent session cannot double-send;
+        (d) terminal replay -> stable ``409 suggestion already consumed``: no
+            second adapter call, no second ``Message``, no second audit row,
+            and *not* a repeat of the previous successful result;
+        (e) adapter failure rolls everything back (``consumed`` stays
+            ``False``) and surfaces ``502``, so a retry is safe;
+        (f) per-project authorization and audit PII redaction unchanged;
+        (g) owner-only, exact current suggestion, exact outbound text binding.
+
+        ``edited_text`` is the *only* way the owner may alter the copy; it is
+        validated here (non-empty, length-bounded) and flagged in the audit.
+        """
+        _assert_owner_actor(actor)
+        conv = self._load_conversation(conversation_id)
+        self._assert_can_act(actor, conv)
+
+        self.session.rollback()
+        self.session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+        # Everything between BEGIN IMMEDIATE and COMMIT must release the write
+        # lock on *every* exit path. These pre-checks reject the common cases
+        # (replay, wrong decision, stale facts, bad body) and each `raise` used
+        # to escape while SQLite still held the reserved lock, which is only
+        # dropped when the connection is later reused or closed -- long enough
+        # to block a concurrent owner action for no reason.
+        try:
+            sug = self.session.get(CsSuggestion, suggestion_id)
+            if sug is None or sug.conversation_id != conv.id:
+                raise ServiceError(404, "suggestion not found")
+            if sug.decision != CsSuggestionDecision.HUMAN_CONFIRM:
+                raise ServiceError(409, "suggestion is not owner-confirmable")
+            if sug.consumed:
+                raise ServiceError(409, "suggestion already consumed")
+            self._assert_facts_fresh(sug)
+
+            edited = edited_text is not None
+            text = _nfc(edited_text if edited_text is not None else sug.text)
+            if not text.strip():
+                raise ServiceError(422, "message body must not be empty")
+            if len(text.encode("utf-8")) > _MAX_BODY_BYTES:
+                raise ServiceError(422, "message body exceeds 16 KiB")
+        except Exception:
+            # Pre-checks are pure reads: rolling back discards nothing and
+            # re-raises the original decision unchanged (no status rewriting).
+            self.session.rollback()
+            raise
+
+        sug.consumed = True
+        try:
+            msg = self.adapter.send_message(
+                self.session,
+                conversation_id=conv.id,
+                text=text,
+                sender_type=SenderType.OWNER,
+                is_auto_sent=False,
+                knowledge_fact_refs=sug.knowledge_fact_refs,
             )
             append_audit(
                 self.session,
@@ -487,12 +638,21 @@ class CustomerService:
                     "body": _bounded_audit_body(text),
                     "message_id": msg.id,
                     "conversation_id": conv.id,
+                    "suggestion_id": sug.id,
+                    "owner_edited": edited,
                 },
-                idempotency_key=f"audit:cs:outbound:human:{msg.id}",
+                # Distinct from CsSuggestion.idempotency_key, which identifies
+                # suggestion *creation*. One owner send == one audit row, and
+                # AuditLog.idempotency_key is globally unique, so a racing
+                # duplicate can never write a second successful-send record.
+                idempotency_key=f"audit:cs:outbound:owner:send:{sug.id}",
             )
             self.session.commit()
         except Exception as exc:
-            # Fail-closed delivery: roll back and surface 502 (contract A).
+            # (e) Fail-closed: the consumed flip rolls back with the send, so
+            # the owner may safely retry -- replay only 409s after a genuine
+            # success. This is a DB-level one-shot; the Mock adapter makes no
+            # exactly-once claim about a real external channel.
             self.session.rollback()
             raise ServiceError(502, "outbound delivery failed") from exc
         self.session.refresh(msg)
@@ -541,19 +701,7 @@ class CustomerService:
 
         # Stale-knowledge re-check: if any referenced fact was revoked /
         # superseded / re-versioned, refuse to auto-send on stale ground (P1-2).
-        for fact_id in sug.knowledge_fact_refs:
-            expected_version = (sug.fact_revisions or {}).get(fact_id)
-            fact = self.session.exec(
-                select(KnowledgeFact)
-                .where(KnowledgeFact.id == fact_id)
-                .execution_options(populate_existing=True)
-            ).first()
-            if (
-                fact is None
-                or fact.status != KnowledgeFactStatus.APPROVED
-                or fact.version != expected_version
-            ):
-                raise ServiceError(409, "stale knowledge fact")
+        self._assert_facts_fresh(sug)
 
         sug.consumed = True
         try:

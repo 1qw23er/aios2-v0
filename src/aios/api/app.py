@@ -33,6 +33,7 @@ from aios.agent_registry import (
     set_agent_enabled,
     upsert_agent,
 )
+from aios.api.owner_inbox_routes import register_owner_inbox_routes
 from aios.api.security import (
     _AGENT_UNAUTH_HEADERS,
     BootstrapClaims,
@@ -2896,6 +2897,11 @@ def create_app() -> FastAPI:
         return RedirectResponse(
             url=f"/owner/board/{target}", status_code=303
         )
+
+    # Owner Operating Layer V0 (Issue #121 / PR #122): the five sealed-token
+    # owner endpoints live in their own module -- they share no state with the
+    # legacy owner console (no project id in any URL, no mutable session).
+    register_owner_inbox_routes(application)
 
     return application
 

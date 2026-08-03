@@ -37,6 +37,14 @@ from aios.schemas import (
 class ServiceError(Exception):
     status_code: int
     detail: str
+    untrusted: bool = False
+    """Marks a failure whose *cause* was determined by untrustworthy client input.
+
+    Owner-facing surfaces MUST render every ``untrusted`` failure with one
+    byte-identical response body, so the cause cannot be recovered from the
+    reply (OOL V0 plan §4.1 rule 6 / §8 -- no enumeration oracle). Defaults to
+    ``False`` so every existing raise site keeps its current behaviour.
+    """
 
 
 def request_fingerprint(request: BaseModel) -> str:

@@ -810,3 +810,213 @@ def test_unscoped_agent_blocked_on_suggest(session, project, owner):
             text="what is the price",
         )
     assert exc.value.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# T-S2 / T-S3 / T-S9 / T-CC2: owner_confirm_suggestion (OOL V0 plan §3.2)
+#
+# The owner-confirmed send is the CS "adopt and send" decision reached from the
+# Owner Operating Layer inbox. It is one authoritative domain operation with a
+# single BEGIN IMMEDIATE transaction; it must never delegate to _human_send /
+# _auto_send (P1-4), and its replay contract is 409 already-handled -- never a
+# second outbound message.
+# ---------------------------------------------------------------------------
+
+
+def _human_confirm_suggestion(session, project, owner):
+    """Produce a live HUMAN_CONFIRM suggestion bound to one approved fact."""
+    artifact = _seed_artifact(session, project)
+    _partial_fact(session, project, artifact)
+    cs = CustomerService(session)
+    conv = cs.create_conversation(owner, project_id=project.id)
+    sug = cs.generate_suggestion(
+        owner,
+        conversation_id=conv.id,
+        inbound_message_id=None,
+        text="apple banana cherry",
+    )
+    assert sug.decision == "human_confirm"
+    assert sug.knowledge_fact_refs, "suggestion must bind the fact it was derived from"
+    return cs, conv, sug
+
+
+def _outbound_audits(session):
+    return session.exec(select(AuditLog).where(AuditLog.action == "cs.outbound_send")).all()
+
+
+def test_owner_confirm_sends_and_consumes(session, project, owner):
+    """T-S2: one send, consumed under the same transaction, one audit row."""
+    cs, conv, sug = _human_confirm_suggestion(session, project, owner)
+    msg = cs.owner_confirm_suggestion(owner, conversation_id=conv.id, suggestion_id=sug.id)
+    assert msg.sender_type == "owner"
+    assert msg.is_auto_sent is False
+    assert msg.body == sug.text
+    session.refresh(sug)
+    assert sug.consumed is True
+    audits = _outbound_audits(session)
+    assert len(audits) == 1
+    after = audits[0].after_snapshot
+    assert after["suggestion_id"] == sug.id
+    assert after["owner_edited"] is False
+    assert audits[0].idempotency_key == f"audit:cs:outbound:owner:send:{sug.id}"
+
+
+def test_owner_confirm_replay_is_409_and_never_sends_twice(session, project, owner):
+    """T-S3 / §3.2 (d): terminal replay -> 409, no second Message, no second audit."""
+    cs, conv, sug = _human_confirm_suggestion(session, project, owner)
+    cs.owner_confirm_suggestion(owner, conversation_id=conv.id, suggestion_id=sug.id)
+    with pytest.raises(ServiceError) as exc:
+        cs.owner_confirm_suggestion(owner, conversation_id=conv.id, suggestion_id=sug.id)
+    assert exc.value.status_code == 409
+    assert "already consumed" in exc.value.detail
+    session.rollback()
+    outbound = session.exec(
+        select(Message).where(
+            Message.conversation_id == conv.id,
+            Message.sender_type == "owner",
+        )
+    ).all()
+    assert len(outbound) == 1
+    assert len(_outbound_audits(session)) == 1
+
+
+def test_owner_confirm_edited_text_is_bound_and_audited(session, project, owner):
+    """T-S9: the owner edit travels as edited_text; it is sent and flagged."""
+    cs, conv, sug = _human_confirm_suggestion(session, project, owner)
+    edited = "您好，这里是人工客服，" + sug.text
+    msg = cs.owner_confirm_suggestion(
+        owner, conversation_id=conv.id, suggestion_id=sug.id, edited_text=edited
+    )
+    assert msg.body == edited
+    audit = _outbound_audits(session)[0]
+    assert audit.after_snapshot["owner_edited"] is True
+    session.refresh(sug)
+    assert sug.consumed is True
+    # The stored suggestion copy is untouched -- the edit is the sent message.
+    assert sug.text != edited
+
+
+def test_owner_confirm_rejects_empty_edit(session, project, owner):
+    cs, conv, sug = _human_confirm_suggestion(session, project, owner)
+    with pytest.raises(ServiceError) as exc:
+        cs.owner_confirm_suggestion(
+            owner, conversation_id=conv.id, suggestion_id=sug.id, edited_text="   "
+        )
+    assert exc.value.status_code == 422
+    session.rollback()
+    session.refresh(sug)
+    assert sug.consumed is False
+    assert _outbound_audits(session) == []
+
+
+def test_owner_confirm_rejects_oversized_edit(session, project, owner):
+    cs, conv, sug = _human_confirm_suggestion(session, project, owner)
+    with pytest.raises(ServiceError) as exc:
+        cs.owner_confirm_suggestion(
+            owner,
+            conversation_id=conv.id,
+            suggestion_id=sug.id,
+            edited_text="x" * (16 * 1024 + 1),
+        )
+    assert exc.value.status_code == 422
+    session.rollback()
+    session.refresh(sug)
+    assert sug.consumed is False
+
+
+def test_owner_confirm_rejects_stale_knowledge(session, project, owner):
+    """§3.2 (b): the same stale-fact rule the auto-send path enforces."""
+    cs, conv, sug = _human_confirm_suggestion(session, project, owner)
+    fact = session.get(KnowledgeFact, sug.knowledge_fact_refs[0])
+    fact.status = KnowledgeFactStatus.SUPERSEDED
+    session.add(fact)
+    session.commit()
+    with pytest.raises(ServiceError) as exc:
+        cs.owner_confirm_suggestion(owner, conversation_id=conv.id, suggestion_id=sug.id)
+    assert exc.value.status_code == 409
+    assert "stale" in exc.value.detail
+    session.rollback()
+    session.refresh(sug)
+    assert sug.consumed is False
+
+
+def test_owner_confirm_rejects_non_human_confirm_suggestion(session, project, owner):
+    cs, conv, sug = _auto_suggestion(session, project, owner)
+    with pytest.raises(ServiceError) as exc:
+        cs.owner_confirm_suggestion(owner, conversation_id=conv.id, suggestion_id=sug.id)
+    assert exc.value.status_code == 409
+    session.rollback()
+    session.refresh(sug)
+    assert sug.consumed is False
+
+
+def test_owner_confirm_rejects_cross_conversation_suggestion(session, project, owner):
+    cs, conv, sug = _human_confirm_suggestion(session, project, owner)
+    other_conv = cs.create_conversation(owner, project_id=project.id)
+    with pytest.raises(ServiceError) as exc:
+        cs.owner_confirm_suggestion(owner, conversation_id=other_conv.id, suggestion_id=sug.id)
+    assert exc.value.status_code == 404
+    session.rollback()
+    session.refresh(sug)
+    assert sug.consumed is False
+
+
+def test_owner_confirm_is_owner_only(session, project, owner, agent):
+    cs, conv, sug = _human_confirm_suggestion(session, project, owner)
+    with pytest.raises(ServiceError) as exc:
+        cs.owner_confirm_suggestion(agent, conversation_id=conv.id, suggestion_id=sug.id)
+    assert exc.value.status_code == 403
+    session.rollback()
+    session.refresh(sug)
+    assert sug.consumed is False
+    assert _outbound_audits(session) == []
+
+
+def test_owner_confirm_rolls_back_consumed_on_adapter_failure(session, project, owner):
+    """§3.2 (e): a failed delivery leaves the suggestion re-sendable."""
+    cs, conv, sug = _human_confirm_suggestion(session, project, owner)
+
+    class _BrokenAdapter(MockWeComAdapter):
+        def send_message(self, *args, **kwargs):
+            raise RuntimeError("transport down")
+
+    cs.adapter = _BrokenAdapter()
+    with pytest.raises(ServiceError) as exc:
+        cs.owner_confirm_suggestion(owner, conversation_id=conv.id, suggestion_id=sug.id)
+    assert exc.value.status_code == 502
+    session.refresh(sug)
+    assert sug.consumed is False
+    assert _outbound_audits(session) == []
+    # Recovery: a retry on a healthy adapter still succeeds exactly once.
+    cs.adapter = MockWeComAdapter()
+    cs.owner_confirm_suggestion(owner, conversation_id=conv.id, suggestion_id=sug.id)
+    session.refresh(sug)
+    assert sug.consumed is True
+    assert len(_outbound_audits(session)) == 1
+
+
+def test_human_send_binds_and_consumes_a_suggestion(session, project, owner):
+    """Repairs the pre-existing gap: a bound suggestion_id is no longer dropped."""
+    cs, conv, sug = _human_confirm_suggestion(session, project, owner)
+    msg = cs.send_message(
+        owner,
+        conversation_id=conv.id,
+        text="人工改写后的回复",
+        auto_send=False,
+        suggestion_id=sug.id,
+    )
+    assert msg.sender_type == "owner"
+    session.refresh(sug)
+    assert sug.consumed is True
+    audit = _outbound_audits(session)[0]
+    assert audit.after_snapshot["suggestion_id"] == sug.id
+    # Replay against the same suggestion is refused instead of sending twice.
+    with pytest.raises(ServiceError) as exc:
+        cs.send_message(
+            owner,
+            conversation_id=conv.id,
+            text="人工改写后的回复",
+            auto_send=False,
+            suggestion_id=sug.id,
+        )
+    assert exc.value.status_code == 409
