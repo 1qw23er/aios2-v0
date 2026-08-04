@@ -1709,6 +1709,75 @@ class OwnerInboxService:
             purposes,
         )
 
+    # -- audit-history presentation (defect D2, Issue #118 / #130) ----------
+    # The owner-facing audit history must never show raw gateway/audit
+    # identifiers. These closed allow-lists translate the stored ``actor`` /
+    # ``action`` strings to bounded business Chinese. The AuditLog *storage* is
+    # never rewritten -- no migration, no identity change, no weakened
+    # auditability. Anything outside the allow-list collapses to a safe
+    # fallback rather than leaking.
+    _AUDIT_ACTION_LABELS: dict[str, str] = {
+        # content
+        "content_draft.create": "内容已创建",
+        "content_draft.update": "内容已更新",
+        "content_draft.independent_review": "独立复审完成",
+        "content_draft.approve": "内容已批准",
+        "content_draft.reject": "内容已驳回",
+        "content.review_metric": "评分已记录",
+        # customer service
+        "cs.outbound_send": "外呼已发送",
+        "cs.escalation": "已升级处理",
+        "cs.lead_stage": "线索阶段已更新",
+        # feedback
+        "feedback.create": "反馈已创建",
+        "feedback.amend": "反馈已修订",
+        "feedback.stage_transition": "反馈阶段已流转",
+        "feedback.submit_for_approval": "已提交审定",
+        "feedback.owner_approve": "反馈已审定",
+        "feedback.owner_reject": "反馈已退回",
+        "feedback.invalidate_pending": "待定反馈已作废",
+        "feedback.cluster_summary": "聚类摘要已生成",
+        # knowledge
+        "knowledge.candidate.created": "知识候选已创建",
+        "knowledge.candidate.rejected": "知识候选已驳回",
+        "knowledge.candidate.classified": "知识候选已分类",
+        "knowledge.fact.approved": "知识事实已批准",
+        "knowledge.fact.superseded": "知识事实已被更替",
+        "knowledge.fact.deactivated": "知识事实已停用",
+        "knowledge.fact.classified": "知识事实已分类",
+        # agent interoperability gateway (#57)
+        "agent.discover": "发现智能体",
+        "agent.delegate": "委派任务",
+        "agent.result_received": "已收到结果",
+        "artifact.validated": "制品已校验",
+        "delegation.failed": "委派失败",
+        "delegation.cancelled": "委派已取消",
+    }
+
+    @staticmethod
+    def _translate_audit_actor(raw: str) -> str:
+        """Closed allow-list for the audit ``actor`` column (D2).
+
+        The only owner in the OOL is the authenticated owner, addressed as
+        "你". Agents are "AI 助手". The system and every internal component
+        (gateway / scheduler / orchestrator / bootstrap / unknown) collapse to
+        "系统" -- never the raw identifier.
+        """
+        if raw == "owner" or raw.startswith("owner:"):
+            return "你"
+        if raw == "agent" or raw.startswith("agent:"):
+            return "AI 助手"
+        return "系统"
+
+    @staticmethod
+    def _translate_audit_action(raw: str) -> str:
+        """Closed allow-list for the audit ``action`` column (D2).
+
+        Unknown actions fall back to the bounded "状态已更新" rather than the
+        raw dotted identifier.
+        """
+        return OwnerInboxService._AUDIT_ACTION_LABELS.get(raw, "状态已更新")
+
     def _audit_entries(self, kind: str, row: Any, project_id: str) -> list[str]:
         resource_type = {
             "artifact": "artifact",
@@ -1729,7 +1798,10 @@ class OwnerInboxService:
         )
         ordered = sorted(rows, key=lambda item: (item.created_at, item.id))
         return [
-            f"{item.created_at.isoformat()} — {item.actor} — {item.action}" for item in ordered
+            f"{item.created_at.isoformat()} — "
+            f"{self._translate_audit_actor(item.actor)} — "
+            f"{self._translate_audit_action(item.action)}"
+            for item in ordered
         ]
 
     # -- decisions (§2.1.2d + §7 action adapters) ---------------------------

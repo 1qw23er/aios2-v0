@@ -33,6 +33,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 from aios.actor import ActorContext
+from aios.audit import append_audit
 from aios.content_draft import ContentDraftService
 from aios.customer_service import CustomerService
 from aios.db import get_database_url, get_engine, run_migrations
@@ -906,3 +907,208 @@ def test_cs_adopt_and_send_replay_never_sends_twice(
     )
     assert_normalized_failure(replay, seed=seed)
     assert len(_outbound_messages(cs_seed.conversation_id)) == 1
+
+
+# --------------------------------------------------------------------------
+# 6. owner audit-history presentation (defect D2, Issue #118 / #130)
+#
+#    The owner audit history rendered on every inbox detail view must never
+#    surface raw internal identifiers -- ``owner:owner-1``, ``agent:...``,
+#    ``knowledge.fact.approved``, ``cs.outbound_send``, ``feedback.*`` and
+#    similar gateway/audit strings. They are translated to bounded business
+#    Chinese at the presentation layer only; the AuditLog *storage* is never
+#    rewritten (no migration, no identity change, no weakened auditability).
+#
+#    The render path (OwnerInbox._audit_entries -> console escape) is identical
+#    for every inbox kind, so the single closed allow-list is exercised here
+#    across all four chains' action vocabularies plus the four actor classes.
+# --------------------------------------------------------------------------
+
+# Raw internal identifiers that must NEVER reach the owner surface. If any of
+# these appears in a rendered detail page the audit history is leaking.
+_AUDIT_LEAK_MARKERS = (
+    "owner:owner-1",
+    "owner:",
+    "agent:",
+    "agent:agent-7",
+    "agent:agent-9",
+    "agent:agent-3",
+    "gateway",
+    "distribution",
+    "unknown-actor-xyz",
+    "content_draft.",
+    "content_draft.approve",
+    "content_draft.reject",
+    "knowledge.fact.",
+    "knowledge.fact.approved",
+    "knowledge.candidate.",
+    "knowledge.candidate.rejected",
+    "cs.outbound",
+    "cs.outbound_send",
+    "cs.escalation",
+    "cs.lead_stage",
+    "feedback.",
+    "feedback.owner_approve",
+    "feedback.stage_transition",
+    "some.future.action",
+)
+
+# Bounded business Chinese that MUST be present after the fix (and is absent
+# before it, which is what makes the test RED first).
+_AUDIT_BUSINESS_LABELS = (
+    "你",              # owner:* actor
+    "AI 助手",         # agent:* actor
+    "内容已批准",       # content_draft.approve
+    "内容已驳回",       # content_draft.reject
+    "知识事实已批准",     # knowledge.fact.approved
+    "知识候选已驳回",     # knowledge.candidate.rejected
+    "外呼已发送",       # cs.outbound_send
+    "已升级处理",       # cs.escalation
+    "反馈已审定",       # feedback.owner_approve
+    "反馈阶段已流转",     # feedback.stage_transition
+    "状态已更新",       # unknown action (fallback)
+)
+
+
+def _insert_audit(
+    *,
+    actor: str,
+    action: str,
+    resource_type: str,
+    resource_id: str,
+    project_id: str,
+    seq: int,
+) -> None:
+    with Session(get_engine(get_database_url())) as session:
+        append_audit(
+            session,
+            actor=actor,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            project_id=project_id,
+            task_id=None,
+            before={},
+            after={},
+            idempotency_key=f"idem-d2-audit-{seq}",
+        )
+        session.commit()
+
+
+def _content_detail_page(client: TestClient, ctx: str):
+    detail = client.post(
+        "/owner/inboxes/content/detail",
+        auth=AUTH,
+        data={"detail_token": _detail_token(client, ctx), "ctx": ctx},
+    )
+    assert detail.status_code == 200, detail.text[:400]
+    return detail
+
+
+def _cs_detail_page(client: TestClient, ctx: str):
+    listing = client.get("/owner/inboxes/cs", auth=AUTH, params={"ctx": ctx})
+    assert listing.status_code == 200, listing.text[:400]
+    detail_match = re.search(r'name="detail_token" value="([^"]+)"', listing.text)
+    assert detail_match is not None, "cs inbox listed no actionable conversation"
+    detail = client.post(
+        "/owner/inboxes/cs/detail",
+        auth=AUTH,
+        data={"detail_token": detail_match.group(1), "ctx": ctx},
+    )
+    assert detail.status_code == 200, detail.text[:400]
+    return detail
+
+
+def _assert_audit_presentation_clean(html: str, *, expect_labels: tuple[str, ...]) -> None:
+    for marker in _AUDIT_LEAK_MARKERS:
+        assert marker not in html, f"owner surface leaked raw audit id {marker!r}"
+    for label in expect_labels:
+        assert label in html, f"owner surface missing translated label {label!r}"
+
+
+def test_owner_audit_history_never_leaks_raw_identifiers_across_chains(
+    client: TestClient, seed: Seed
+) -> None:
+    """D2 RED-before-GREEN (Issue #130).
+
+    The single content artifact detail view carries a representative audit trail
+    spanning all four chains' action vocabularies (content / knowledge / cs /
+    feedback) plus every actor class. Before the presentation fix the raw
+    ``owner:`` / ``agent:`` / ``knowledge.fact.`` / ``cs.outbound_send`` /
+    ``feedback.*`` strings render verbatim -> the leak assertions fail (RED).
+    After the closed allow-list translation they are replaced by bounded
+    business Chinese -> the test turns GREEN.
+    """
+    _insert_audit(
+        actor="owner:owner-1", action="content_draft.approve",
+        resource_type="artifact", resource_id=seed.draft_id, project_id=seed.project_id, seq=1,
+    )
+    _insert_audit(
+        actor="agent:agent-7", action="knowledge.fact.approved",
+        resource_type="artifact", resource_id=seed.draft_id, project_id=seed.project_id, seq=2,
+    )
+    _insert_audit(
+        actor="system", action="cs.outbound_send",
+        resource_type="artifact", resource_id=seed.draft_id, project_id=seed.project_id, seq=3,
+    )
+    _insert_audit(
+        actor="gateway", action="feedback.owner_approve",
+        resource_type="artifact", resource_id=seed.draft_id, project_id=seed.project_id, seq=4,
+    )
+    _insert_audit(
+        actor="owner:owner-1", action="knowledge.candidate.rejected",
+        resource_type="artifact", resource_id=seed.draft_id, project_id=seed.project_id, seq=5,
+    )
+    _insert_audit(
+        actor="agent:agent-9", action="content_draft.reject",
+        resource_type="artifact", resource_id=seed.draft_id, project_id=seed.project_id, seq=6,
+    )
+    _insert_audit(
+        actor="distribution", action="cs.escalation",
+        resource_type="artifact", resource_id=seed.draft_id, project_id=seed.project_id, seq=7,
+    )
+    _insert_audit(
+        actor="owner:owner-1", action="feedback.stage_transition",
+        resource_type="artifact", resource_id=seed.draft_id, project_id=seed.project_id, seq=8,
+    )
+    _insert_audit(
+        actor="unknown-actor-xyz", action="some.future.action",
+        resource_type="artifact", resource_id=seed.draft_id, project_id=seed.project_id, seq=9,
+    )
+
+    ctx = _context_token(client)
+    detail = _content_detail_page(client, ctx)
+    _assert_audit_presentation_clean(detail.text, expect_labels=_AUDIT_BUSINESS_LABELS)
+
+
+def test_owner_audit_history_translates_cs_conversation_chain(
+    client: TestClient, seed: Seed, cs_seed: CsSeed
+) -> None:
+    """D2 RED-before-GREEN for the ``conversation`` resource_type (CS chain).
+
+    The CS detail view renders audit rows filtered by resource_type
+    ``conversation``; this confirms the same closed allow-list is applied on the
+    natural CS resource type, not only on the artifact page above.
+    """
+    _insert_audit(
+        actor="owner:owner-1", action="cs.outbound_send",
+        resource_type="conversation", resource_id=cs_seed.conversation_id,
+        project_id=seed.project_id, seq=10,
+    )
+    _insert_audit(
+        actor="agent:agent-3", action="cs.escalation",
+        resource_type="conversation", resource_id=cs_seed.conversation_id,
+        project_id=seed.project_id, seq=11,
+    )
+    _insert_audit(
+        actor="system", action="cs.lead_stage",
+        resource_type="conversation", resource_id=cs_seed.conversation_id,
+        project_id=seed.project_id, seq=12,
+    )
+
+    ctx = _context_token(client)
+    detail = _cs_detail_page(client, ctx)
+    _assert_audit_presentation_clean(
+        detail.text,
+        expect_labels=("你", "AI 助手", "外呼已发送", "已升级处理", "线索阶段已更新"),
+    )
