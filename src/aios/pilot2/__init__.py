@@ -1,0 +1,77 @@
+"""PILOT-2A pilot2 package: data models + controlled vocabulary (DESIGN-ONLY intent).
+
+Opt-in subpackage: NOT imported by the main ``aios`` package, so it never
+affects production startup, migrations, or schema. Import explicitly via
+``import aios.pilot2``.
+"""
+from aios.pilot2.attribution_head import (
+    AttributionHeadError,
+    current_decision,
+    decision_history,
+    finalize_attribution,
+    replace_attribution,
+    unattached_decisions,
+)
+from aios.pilot2.models import (
+    AttributionLevel,
+    AttributionProposal,
+    Channel,
+    ClickEvent,
+    CohortTag,
+    ContentTaxonomyTerm,
+    ExperimentRegistry,
+    ExperimentStatus,
+    FetchStatus,
+    FinalAttributionDecision,
+    FinalAttributionHead,
+    MiheEndpoint,
+    MiheSnapshot,
+    Pilot2Base,
+    Platform,
+    PlatformMetricSnapshot,
+    PublicationEvent,
+    RegistrationAttributionLevel,
+    RegistrationObservation,
+    pilot2_metadata,
+)
+from aios.pilot2.vocabulary import (
+    CONTENT_TAXONOMY,
+    CONTENT_TAXONOMY_VERSION,
+    TaxonomyDimension,
+    validate_content_record,
+    validate_taxonomy,
+)
+
+__all__ = [
+    "pilot2_metadata",
+    "Pilot2Base",
+    "MiheSnapshot",
+    "PublicationEvent",
+    "ClickEvent",
+    "PlatformMetricSnapshot",
+    "RegistrationObservation",
+    "AttributionProposal",
+    "FinalAttributionDecision",
+    "FinalAttributionHead",
+    "ContentTaxonomyTerm",
+    "ExperimentRegistry",
+    "MiheEndpoint",
+    "FetchStatus",
+    "Channel",
+    "Platform",
+    "CohortTag",
+    "AttributionLevel",
+    "RegistrationAttributionLevel",
+    "ExperimentStatus",
+    "AttributionHeadError",
+    "finalize_attribution",
+    "replace_attribution",
+    "current_decision",
+    "decision_history",
+    "unattached_decisions",
+    "CONTENT_TAXONOMY_VERSION",
+    "TaxonomyDimension",
+    "CONTENT_TAXONOMY",
+    "validate_taxonomy",
+    "validate_content_record",
+]
