@@ -241,10 +241,31 @@ class RegistrationObservation(Pilot2Base, table=True):
     ``cohort_tag`` / ``is_batch`` implement the UNKNOWN_BATCH_COHORT rule
     (design §0.2 / D1): batch accounts are excluded from attribution and
     every business count, retained only for audit.
+
+    PILOT-2A-3 materialization (review fix): the deterministic diff engine
+    persists its result directly into THIS canonical table -- the one every
+    attribution FK points at (``attributionproposal.registration_observation_id``,
+    ``finalattributiondecision.registration_observation_id``,
+    ``finalattributionhead.registration_observation_id``). A disconnected
+    parallel table would strand those FKs, so the engine extends (does NOT
+    redesign) this pilot2 table with the fields it needs:
+
+      * ``observation_hash`` -- deterministic idempotency token (sha256 of the
+        engine's frozen output), so re-running on identical snapshots is a no-op.
+      * ``first_seen_seq`` / ``last_seen_seq`` -- the snapshot sequence window
+        the registration was observed in (first-seen frozen, C7).
+      * ``version`` -- bumped only when a later, materially-different observation
+        is persisted.
+      * ``nickname`` / ``avatar`` / ``phone_masked`` / ``customer_type`` --
+        descriptive evidence retained for the operational observation.
+
+    ``customer_id`` is UNIQUE: one registration per customer (C6). The diff
+    engine writes the raw evidence (``MiheSnapshot``) too, so
+    ``source_snapshot_id`` always references a real row.
     """
 
     id: str = Field(default_factory=lambda: new_id("regob"), primary_key=True)
-    customer_id: str = Field(index=True)
+    customer_id: str = Field(index=True, unique=True)
     registered_at: datetime
     last_login_at: datetime | None = Field(default=None)
     total_recharge: int = Field(default=0)
@@ -254,6 +275,15 @@ class RegistrationObservation(Pilot2Base, table=True):
     is_batch: bool = Field(default=False)
     source_snapshot_id: str = Field(foreign_key="mihesnapshot.id")
     derived_at: datetime = Field(default_factory=now_utc)
+    # --- PILOT-2A-3 diff-engine materialization fields (extension, not redesign) ---
+    observation_hash: str | None = Field(default=None, index=True)
+    first_seen_seq: int = Field(default=0)
+    last_seen_seq: int = Field(default=0)
+    version: int = Field(default=1)
+    nickname: str | None = Field(default=None)
+    avatar: str | None = Field(default=None)
+    phone_masked: str | None = Field(default=None)
+    customer_type: str | None = Field(default=None)
 
 
 # ---------------------------------------------------------------------------
