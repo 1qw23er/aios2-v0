@@ -12,6 +12,11 @@ from aios.pilot2.attribution_head import (
     replace_attribution,
     unattached_decisions,
 )
+from aios.pilot2.attribution_solver import (
+    AttributionSolverError,
+    finalize_solved,
+    solve,
+)
 from aios.pilot2.models import (
     AttributionLevel,
     AttributionProposal,
@@ -33,6 +38,11 @@ from aios.pilot2.models import (
     RegistrationAttributionLevel,
     RegistrationObservation,
     pilot2_metadata,
+)
+from aios.pilot2.owner_report import (
+    DailyReport,
+    build_daily_report,
+    render_report_text,
 )
 from aios.pilot2.registration_diff import (
     MiheCustomer,
@@ -74,6 +84,12 @@ __all__ = [
     "persist_diffs",
     "run_registration_diff",
     "serialize_diffs",
+    "solve",
+    "finalize_solved",
+    "AttributionSolverError",
+    "build_daily_report",
+    "render_report_text",
+    "DailyReport",
     "AttributionProposal",
     "FinalAttributionDecision",
     "FinalAttributionHead",
