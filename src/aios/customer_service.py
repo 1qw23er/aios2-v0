@@ -37,16 +37,26 @@ from aios.models import (
     CsChannel,
     CsSuggestion,
     CsSuggestionDecision,
+    CsSuggestionSalesEvidence,
     KnowledgeFact,
     KnowledgeFactStatus,
     LeadStage,
     Message,
     MessageDirection,
+    SalesScriptFactStatus,
     SenderType,
     Task,
     TaskStatus,
     new_id,
 )
+from aios.sales_playbook.retrieval import (
+    EvidenceRevalidationError,
+    RetrievalResult,
+    assert_within_claim_ceiling,
+    compose_suggestion_text,
+    revalidate_sales_evidence,
+)
+from aios.sales_playbook.retrieval import retrieve as retrieve_sales_playbook
 from aios.services import ServiceError
 
 
@@ -74,6 +84,12 @@ def _load_auto_send_confidence(raw: str | None = None) -> float:
 
 
 CS_AUTO_SEND_CONFIDENCE = _load_auto_send_confidence()
+
+# P1-2: the single business-readable refusal for a send blocked by live
+# SalesPlaybook state. Deliberately carries NO internal identifier (entry id,
+# binding id, generation id) and no internal reason code -- those stay inside
+# ``EvidenceRevalidationError`` for the log, never on the wire.
+_SALES_EVIDENCE_STALE = "引用的官方话术信息已变化，请重新生成建议后再确认发送"
 
 # Outbound body is bounded before entering the audit ``after_snapshot`` (plan §6).
 _MAX_BODY_BYTES = 16 * 1024  # 16 KiB, mirrors feedback field caps
@@ -320,6 +336,21 @@ class CustomerService:
             ).all()
         )
 
+    def _retrieve_sales_playbook(
+        self, text: str, scored_facts: list[tuple[KnowledgeFact, float]]
+    ) -> RetrievalResult:
+        """SalesPlaybook evidence lookup (design §7). Read-only, zero LLM.
+
+        The approved-fact statements are handed over as the third tier of the D7
+        evidence ceiling, so a suggestion may restate an already-approved fact
+        without being treated as fabricating a claim.
+        """
+        return retrieve_sales_playbook(
+            self.session,
+            text,
+            approved_fact_statements=[fact.statement for fact, _ in scored_facts],
+        )
+
     def _assert_can_act(self, actor: ActorContext, conv: Conversation) -> None:
         # Contract B: compute actions (suggestion generation, auto-send) require
         # an actor authorized for the conversation's project.
@@ -362,6 +393,10 @@ class CustomerService:
         best_conf = best[1] if best else 0.0
 
         escalation_categories = _detect_escalation(text)
+        # Genuine, keyword-driven escalation, kept separate from the
+        # "low_confidence" fallback appended further down: only the former may
+        # veto the SalesPlaybook branch.
+        detected_escalation = list(escalation_categories)
         if best is not None:
             fact_refs = [f.id for f, _ in scored]
             fact_revisions = {f.id: f.version for f, _ in scored}
@@ -371,9 +406,31 @@ class CustomerService:
             fact_revisions = {}
             suggestion_text = "（已转人工处理）"
 
+        # -- SalesPlaybook parallel retrieval (design §7, D5/D7/D8) ----------
+        # Runs ALONGSIDE the KnowledgeFact path above, which is untouched. It is
+        # read-only and deterministic, so it also runs on the escalation path --
+        # the evidence rows are audit data that help the human, and they never
+        # change the decision there.
+        playbook = self._retrieve_sales_playbook(text, scored)
+        playbook_engaged = playbook.has_hits or playbook.clarification_required
+        if playbook_engaged and not detected_escalation:
+            playbook_text = compose_suggestion_text(playbook)
+            # D7: the composed body may only restate masked official wording,
+            # VERIFIED_CURRENT spans and approved facts. A fabricated price /
+            # commission / URL / promise fails closed here rather than reaching
+            # a human pre-filled and looking authoritative.
+            assert_within_claim_ceiling(playbook_text, playbook.claim_corpus)
+            if playbook_text:
+                suggestion_text = playbook_text
+
         # Decision derivation -- the single source of truth (plan §4.2.4).
         if escalation_categories:
             decision = CsSuggestionDecision.ESCALATE
+        elif playbook_engaged:
+            # Design §7: any SalesPlaybook engagement forces human review. It
+            # overrides the AUTO_SEND confidence path but can NEVER downgrade an
+            # ESCALATE -- escalation is the stronger safety verdict.
+            decision = CsSuggestionDecision.HUMAN_CONFIRM
         elif best is not None and best_conf >= CS_AUTO_SEND_CONFIDENCE:
             decision = CsSuggestionDecision.AUTO_SEND
         elif best is not None:
@@ -396,6 +453,25 @@ class CustomerService:
         )
         self.session.add(sug)
         self.session.flush()
+
+        # D5: evidence lives in its own association table. ``CsSuggestion`` keeps
+        # every column it had -- no evidence JSON blob was bolted on.
+        for hit in playbook.hits:
+            self.session.add(
+                CsSuggestionSalesEvidence(
+                    suggestion_id=sug.id,
+                    entry_id=hit.entry_id,
+                    rank=hit.rank,
+                    match_reason=hit.match_reason,
+                    fact_safety=hit.fact_safety,
+                )
+            )
+        if playbook.hits:
+            self.session.flush()
+        # P1-2 tamper-proof flag: record that this suggestion was built WITH
+        # SalesPlaybook evidence so the send-time gate can fail CLOSED if those
+        # rows are later deleted, instead of silently skipping revalidation.
+        sug.sales_evidence_cited = bool(playbook.hits)
 
         if decision == CsSuggestionDecision.ESCALATE:
             # Escalation writes an internal escalation Message + audit; it
@@ -473,6 +549,49 @@ class CustomerService:
             ):
                 raise ServiceError(409, "stale knowledge fact")
 
+    def _assert_sales_evidence_still_safe(
+        self, sug: CsSuggestion, outgoing_text: str
+    ) -> None:
+        """Re-verify LIVE SalesPlaybook safety at send time (P1-2).
+
+        The generation-time gates (D6 masking, D7 ceiling) prove the copy was
+        safe when it was BUILT. They prove nothing about the moment the owner
+        clicks confirm, which may be hours later and on the other side of a fact
+        revocation or a package re-import. This reloads the cited evidence and
+        its live bindings and fails closed on any degradation.
+
+        Fail-closed, and business-readable: the caller sees "the referenced
+        official copy changed, regenerate", never an internal id or reason code.
+        """
+        rows = list(
+            self.session.exec(
+                select(CsSuggestionSalesEvidence)
+                .where(CsSuggestionSalesEvidence.suggestion_id == sug.id)
+                .execution_options(populate_existing=True)
+            ).all()
+        )
+        if not rows:
+            # A suggestion generated WITH SalesPlaybook evidence must always carry
+            # its citation rows. If they are gone, the citation was tampered with
+            # (deleted out from under the suggestion) -- fail CLOSED rather than
+            # silently treating it as a KnowledgeFact-only suggestion and sending.
+            if sug.sales_evidence_cited:
+                raise ServiceError(409, _SALES_EVIDENCE_STALE)
+            # KnowledgeFact-only suggestion: nothing from the playbook was cited,
+            # so there is nothing to revalidate. That path is untouched.
+            return
+        recorded = {
+            row.entry_id: SalesScriptFactStatus(row.fact_safety) for row in rows
+        }
+        try:
+            revalidate_sales_evidence(
+                self.session,
+                recorded_fact_safety=recorded,
+                outgoing_text=outgoing_text,
+            )
+        except EvidenceRevalidationError as exc:
+            raise ServiceError(409, _SALES_EVIDENCE_STALE) from exc
+
     def _human_send(
         self,
         actor: ActorContext,
@@ -500,6 +619,10 @@ class CustomerService:
                 raise ServiceError(404, "suggestion not found")
             if sug.consumed:
                 raise ServiceError(409, "suggestion already consumed")
+            # P1-2: the generic human-send path binds a suggestion too, so it
+            # must enforce the SAME live-safety gate as ``owner_confirm_suggestion``
+            # -- otherwise it is a trivial bypass of that gate.
+            self._assert_sales_evidence_still_safe(sug, text)
             sug.consumed = True
         try:
             msg = self.adapter.send_message(
@@ -605,6 +728,12 @@ class CustomerService:
                 raise ServiceError(422, "message body must not be empty")
             if len(text.encode("utf-8")) > _MAX_BODY_BYTES:
                 raise ServiceError(422, "message body exceeds 16 KiB")
+            # (b') P1-2: the SalesPlaybook half of "fresh ground". Runs on the
+            # EXACT body about to leave the system -- including an owner edit --
+            # so a human cannot re-introduce a value the live state no longer
+            # verifies. Placed last among the pre-checks because it is the only
+            # one that needs the final text.
+            self._assert_sales_evidence_still_safe(sug, text)
         except Exception:
             # Pre-checks are pure reads: rolling back discards nothing and
             # re-raises the original decision unchanged (no status rewriting).
@@ -702,6 +831,11 @@ class CustomerService:
         # Stale-knowledge re-check: if any referenced fact was revoked /
         # superseded / re-versioned, refuse to auto-send on stale ground (P1-2).
         self._assert_facts_fresh(sug)
+        # Defence in depth: any SalesPlaybook engagement forces HUMAN_CONFIRM, so
+        # an AUTO_SEND suggestion carries no evidence rows and this is a no-op
+        # today. It is wired anyway so the gate cannot be bypassed if that
+        # routing is ever loosened.
+        self._assert_sales_evidence_still_safe(sug, text)
 
         sug.consumed = True
         try:

@@ -35,8 +35,14 @@ from aios.models import (
 )
 from alembic import command
 
-HEAD = "20260731_0001"
+HEAD = "20260812_0001"
 BASE = "20260720_0005"
+# Newest revision a downgrade may still start from. Head (20260812_0001,
+# SalesPlaybook V0) is a deliberate one-way door: its ``downgrade()`` raises
+# unconditionally, so the backwards leg starts at its predecessor. Nothing the
+# assertions below inspect is introduced by the SalesPlaybook revision, which
+# only adds five brand-new tables.
+LAST_DOWNGRADABLE = "20260731_0001"
 
 
 def _config(url: str) -> Config:
@@ -91,7 +97,7 @@ def test_migration_round_trip_0005_0006_0005_0006(tmp_path) -> None:
         assert "review_assignment" not in _tables(session)
 
     # Upgrade to 0006: review binding + unique constraints appear.
-    command.upgrade(cfg, HEAD)
+    command.upgrade(cfg, LAST_DOWNGRADABLE)
     with Session(engine) as session:
         assert "review_assignment" in _tables(session)
         idx = _indexes(session)

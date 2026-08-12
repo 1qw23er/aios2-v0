@@ -5,7 +5,20 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Column, ForeignKey, LargeBinary, String, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    Column,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    LargeBinary,
+    String,
+    UniqueConstraint,
+    false,
+    text,
+)
 from sqlmodel import Field, SQLModel
 
 
@@ -912,5 +925,395 @@ class CsSuggestion(SQLModel, table=True):
     knowledge_fact_refs: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     fact_revisions: dict[str, int] = Field(default_factory=dict, sa_column=Column(JSON))
     consumed: bool = Field(default=False)
+    # P1-2 tamper-proof flag: True iff this suggestion was generated WITH
+    # SalesPlaybook evidence rows. The send-time gate fails CLOSED (409) when
+    # these rows are absent, instead of silently skipping revalidation and
+    # treating a tampered suggestion as KnowledgeFact-only.
+    sales_evidence_cited: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, server_default=false(), nullable=False),
+    )
     idempotency_key: str = Field(unique=True, index=True)
     created_at: datetime = Field(default_factory=now_utc)
+
+
+# ---------------------------------------------------------------------------
+# SalesPlaybook V0 -- read-only official sales-script evidence source
+# ---------------------------------------------------------------------------
+# Five new tables adapt the extracted Mihe YiWaiWai EBF sales scripts into AIOS
+# as a READ-ONLY evidence source for the existing customer-service pipeline
+# (``CustomerService.generate_suggestion`` -> ``CsSuggestion`` ->
+# ``HUMAN_CONFIRM``). This is NOT a CRM, NOT auto-send and NOT auto-sales.
+#
+# Reuse boundary (design §0): ``Conversation`` / ``Message`` / ``CsSuggestion``
+# / ``Artifact`` / ``KnowledgeCandidate`` / ``KnowledgeFact`` are used as-is and
+# none of their columns change. Images reuse ``Artifact(type=IMAGE)`` with the
+# existing ``ArtifactReviewStatus`` -- no new Artifact column or enum member.
+#
+# STORAGE NOTE: unlike ``aios.pilot2.models`` (plain enum annotations ->
+# ``sqlalchemy.Enum`` -> persists the member NAME), every enum column here is
+# declared as ``Column(String)``, matching the surrounding main-schema style
+# (see ``Conversation.channel``). A ``StrEnum`` member is a ``str``, so the
+# persisted representation is the member VALUE (``'mihe_1_0'``). All SQL gates
+# below therefore compare VALUES, and ``tests/test_sales_playbook_models.py``
+# pins that representation so an ORM change cannot silently disable them.
+
+
+def _enum_values_sql(enum_cls: type[StrEnum]) -> str:
+    """SQL literal list of the *values* an enum-backed VARCHAR column may hold."""
+    return ", ".join(f"'{member.value}'" for member in enum_cls)
+
+
+def _sql_literal_list(values: tuple[str, ...]) -> str:
+    return ", ".join(f"'{value}'" for value in values)
+
+
+class SalesScriptScope(StrEnum):
+    """Persisted product-version domain of a script entry / fact binding."""
+
+    MIHE_1_0 = "mihe_1_0"
+    MIHE_2_0 = "mihe_2_0"
+    COMMON = "common"
+
+
+class SalesScriptSourceStatus(StrEnum):
+    """Generation lifecycle of an imported source package (design D1)."""
+
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    INACTIVE = "inactive"
+
+
+class SalesScriptSegmentType(StrEnum):
+    """Kind of one ordered fragment of an entry (design D2)."""
+
+    TEXT = "text"
+    IMAGE = "image"
+
+
+class SalesScriptFactClass(StrEnum):
+    """The mutable-policy fact classes covered by the safety contract (D6)."""
+
+    PRICE = "price"
+    COMMISSION = "commission"
+    MEMBERSHIP = "membership"
+    CAPABILITY = "capability"
+    URL = "url"
+    PROMO = "promo"
+    OTHER = "other"
+
+
+class SalesScriptFactStatus(StrEnum):
+    """Verification state of one dynamic fact occurrence (design §6)."""
+
+    VERIFIED_CURRENT = "verified_current"
+    NEEDS_REVIEW = "needs_review"
+    STALE = "stale"
+    VERSION_1_ONLY = "version_1_only"
+
+
+class SalesScriptQueryScope(StrEnum):
+    """RUNTIME query classification (design §5) -- deliberately NOT persisted.
+
+    ``COMPARE_1_0_2_0`` exists so a legitimate "how is this different from the
+    old Coze one?" question is answerable instead of being forced to UNKNOWN.
+    ``UNKNOWN`` is fail-closed: no version-specific claim may be retrieved.
+    """
+
+    MIHE_1_0 = "mihe_1_0"
+    MIHE_2_0 = "mihe_2_0"
+    COMPARE_1_0_2_0 = "compare_1_0_2_0"
+    UNKNOWN = "unknown"
+
+
+# The evidence row reports the weakest fact state among an entry's bindings. It
+# is deliberately an ALIAS of ``SalesScriptFactStatus`` rather than a second
+# four-member enum, so the two vocabularies can never drift apart (D2: no
+# duplicated truth).
+SalesScriptEvidenceFactSafety = SalesScriptFactStatus
+
+# V0 accepts exactly one source type. Spelled out as data (not derived) so the
+# allow-list stays readable at review time.
+SALES_SCRIPT_SOURCE_TYPE_MIHE_EBF = "mihe_ebf"
+SALES_SCRIPT_SOURCE_TYPES: tuple[str, ...] = (SALES_SCRIPT_SOURCE_TYPE_MIHE_EBF,)
+
+
+class SalesScriptSource(SQLModel, table=True):
+    """One immutable imported generation of the official script package (D1).
+
+    Two INDEPENDENT integrity anchors are stored, because they fail on
+    different corruptions:
+
+    * ``source_file_hash`` = SHA256(raw EBF bytes) -- catches an image whose
+      content changed while its filename did not.
+    * ``extraction_manifest_hash`` = SHA256(canonical export JSON ‖ ordered
+      normalised image SHA256 manifest ‖ image-reference mapping) -- catches a
+      change in the extracted structure or in the image manifest.
+
+    Activation is atomic: a new package is inserted ACTIVE and the previous
+    ACTIVE package of the same ``source_type`` is flipped to SUPERSEDED inside
+    the SAME transaction. ``uq_ssrc_single_active`` (a PARTIAL unique index)
+    makes "two live generations" unrepresentable at the database boundary, so
+    retrieval always resolves exactly one generation and can never mix two.
+    """
+
+    __tablename__ = "sales_script_source"
+
+    id: str = Field(default_factory=lambda: new_id("ssrc"), primary_key=True)
+    source_type: str = Field(default=SALES_SCRIPT_SOURCE_TYPE_MIHE_EBF, index=True)
+    # cleanup B: the raw EBF file and the structured export JSON are two
+    # distinct artifacts and therefore two distinct filename fields.
+    original_ebf_filename: str
+    extracted_manifest_filename: str
+    source_file_hash: str = Field(index=True)
+    extraction_manifest_hash: str = Field(unique=True, index=True)
+    source_version: str
+    status: SalesScriptSourceStatus = Field(sa_column=Column(String, nullable=False))
+    imported_at: datetime = Field(default_factory=now_utc)
+    entry_count: int = Field(default=0)
+    # cleanup A: first-package acceptance statistics are AUDIT DATA for this
+    # package, never importer constants.
+    metadata_json: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column("metadata", JSON)
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN ({_enum_values_sql(SalesScriptSourceStatus)})",
+            name="ck_ssrc_status_gate",
+        ),
+        CheckConstraint(
+            f"source_type IN ({_sql_literal_list(SALES_SCRIPT_SOURCE_TYPES)})",
+            name="ck_ssrc_source_type_gate",
+        ),
+        # D1: at most ONE active generation per source type. A partial unique
+        # index is used rather than a service-layer convention so a rogue raw
+        # -SQL writer cannot create a second live generation either.
+        Index(
+            "uq_ssrc_single_active",
+            "source_type",
+            "status",
+            unique=True,
+            sqlite_where=text(f"status = '{SalesScriptSourceStatus.ACTIVE.value}'"),
+            postgresql_where=text(f"status = '{SalesScriptSourceStatus.ACTIVE.value}'"),
+        ),
+    )
+
+
+class SalesScriptEntry(SQLModel, table=True):
+    """One official script entry, verbatim and immutable (D2).
+
+    The entry deliberately does NOT store a ``segments`` JSON blob: the ordered
+    text/image structure has exactly one authority, :class:`SalesScriptSegment`.
+    ``source_hash`` = SHA256(normalised segments ordered by ``sequence``) is the
+    immutability proof -- recomputing it on re-import must reproduce the stored
+    value byte-for-byte.
+    """
+
+    __tablename__ = "sales_script_entry"
+
+    id: str = Field(default_factory=lambda: new_id("ssent"), primary_key=True)
+    source_id: str = Field(
+        sa_column=Column(
+            String,
+            ForeignKey("sales_script_source.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+    source_entry_id: str = Field(index=True)
+    product_scope: SalesScriptScope = Field(sa_column=Column(String, nullable=False))
+    category: str = Field(index=True)
+    title: str
+    source_hash: str = Field(index=True)
+    imported_at: datetime = Field(default_factory=now_utc)
+
+    __table_args__ = (
+        # One row per official entry id per generation. A duplicate official id
+        # inside one package is a corrupt package, and the importer must fail
+        # closed on it rather than silently keep two rival copies.
+        UniqueConstraint(
+            "source_id", "source_entry_id", name="uq_ss_entry_source_entry"
+        ),
+        # Enables the composite FK from SalesScriptFactBinding below: an entry
+        # is uniquely identified by (id, product_scope), so a binding can only
+        # ever denormalise the scope the entry ACTUALLY has.
+        UniqueConstraint("id", "product_scope", name="uq_ss_entry_id_scope"),
+        CheckConstraint(
+            f"product_scope IN ({_enum_values_sql(SalesScriptScope)})",
+            name="ck_ss_entry_scope_member",
+        ),
+    )
+
+
+class SalesScriptSegment(SQLModel, table=True):
+    """The SOLE authority for an entry's ordered text/image structure (D2).
+
+    Replaces both the former ``SalesScriptEntry.segments`` JSON column and the
+    former ``SalesScriptMedia`` table, so there is exactly one place where the
+    truth lives. Image bytes never enter this table: an IMAGE segment points at
+    an existing ``Artifact(type=IMAGE)`` row (cleanup C).
+
+    The TEXT/IMAGE split is mutually exclusive at the database boundary:
+    ``ck_ssseg_type_nullability`` rejects a TEXT segment carrying an artifact
+    and an IMAGE segment carrying inline text.
+    """
+
+    __tablename__ = "sales_script_segment"
+
+    id: str = Field(default_factory=lambda: new_id("ssseg"), primary_key=True)
+    entry_id: str = Field(
+        sa_column=Column(
+            String,
+            ForeignKey("sales_script_entry.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+    sequence: int
+    segment_type: SalesScriptSegmentType = Field(
+        sa_column=Column(String, nullable=False)
+    )
+    text_content: str | None = Field(default=None)
+    artifact_id: str | None = Field(
+        default=None,
+        sa_column=Column(
+            String,
+            ForeignKey("artifact.id", ondelete="RESTRICT"),
+            nullable=True,
+            index=True,
+        ),
+    )
+    caption: str | None = Field(default=None)
+
+    __table_args__ = (
+        UniqueConstraint("entry_id", "sequence", name="uq_ssseg_entry_sequence"),
+        CheckConstraint(
+            f"segment_type IN ({_enum_values_sql(SalesScriptSegmentType)})",
+            name="ck_ssseg_type_member",
+        ),
+        CheckConstraint(
+            f"(segment_type = '{SalesScriptSegmentType.TEXT.value}'"
+            " AND text_content IS NOT NULL AND artifact_id IS NULL)"
+            f" OR (segment_type = '{SalesScriptSegmentType.IMAGE.value}'"
+            " AND artifact_id IS NOT NULL AND text_content IS NULL)",
+            name="ck_ssseg_type_nullability",
+        ),
+        CheckConstraint("sequence >= 0", name="ck_ssseg_sequence_non_negative"),
+    )
+
+
+class SalesScriptFactBinding(SQLModel, table=True):
+    """ONE occurrence of a mutable-policy fact inside ONE entry (D3).
+
+    Structurally bound to a real entry by foreign key -- never a JSON list of
+    entry ids that nothing validates. ``binding_hash`` =
+    SHA256(entry_id ‖ fact_key ‖ normalised raw_span) is the deterministic
+    idempotency anchor: re-importing the same package produces the same hash and
+    therefore no duplicate row.
+
+    Cross-version binding is impossible, not merely discouraged. ``entry_scope``
+    is denormalised from the entry, but ``fk_ssfb_entry_scope`` is a COMPOSITE
+    foreign key onto ``uq_ss_entry_id_scope``, so the denormalised value is
+    guaranteed to equal the entry's real scope; ``ck_ssfb_scope_compat`` then
+    requires the fact's own scope to be COMMON or exactly that scope. (A plain
+    CHECK cannot reference another table, so the composite FK is what carries
+    the cross-row half of the contract into the database.)
+
+    Import default is ``NEEDS_REVIEW``: a fact is NEVER auto-promoted to
+    ``VERIFIED_CURRENT``; only an explicit owner review may do that.
+    """
+
+    __tablename__ = "sales_script_fact_binding"
+
+    id: str = Field(default_factory=lambda: new_id("ssfb"), primary_key=True)
+    entry_id: str = Field(sa_column=Column(String, nullable=False, index=True))
+    entry_scope: SalesScriptScope = Field(sa_column=Column(String, nullable=False))
+    fact_key: str = Field(index=True)
+    fact_class: SalesScriptFactClass = Field(sa_column=Column(String, nullable=False))
+    raw_span: str
+    scope: SalesScriptScope = Field(sa_column=Column(String, nullable=False))
+    status: SalesScriptFactStatus = Field(sa_column=Column(String, nullable=False))
+    reviewed_at: datetime | None = Field(default=None)
+    reviewed_by: str | None = Field(default=None)
+    binding_hash: str = Field(unique=True, index=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["entry_id", "entry_scope"],
+            ["sales_script_entry.id", "sales_script_entry.product_scope"],
+            name="fk_ssfb_entry_scope",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "entry_id", "fact_key", "raw_span", name="uq_ssfb_entry_fact_span"
+        ),
+        CheckConstraint(
+            f"fact_class IN ({_enum_values_sql(SalesScriptFactClass)})",
+            name="ck_ssfb_class_gate",
+        ),
+        CheckConstraint(
+            f"status IN ({_enum_values_sql(SalesScriptFactStatus)})",
+            name="ck_ssfb_status_gate",
+        ),
+        CheckConstraint(
+            f"scope IN ({_enum_values_sql(SalesScriptScope)})",
+            name="ck_ssfb_scope_member",
+        ),
+        CheckConstraint(
+            f"entry_scope IN ({_enum_values_sql(SalesScriptScope)})",
+            name="ck_ssfb_entry_scope_member",
+        ),
+        # D3: a 1.0 entry may only carry 1.0 / COMMON facts, a 2.0 entry only
+        # 2.0 / COMMON facts.
+        CheckConstraint(
+            f"scope = '{SalesScriptScope.COMMON.value}' OR scope = entry_scope",
+            name="ck_ssfb_scope_compat",
+        ),
+    )
+
+
+class CsSuggestionSalesEvidence(SQLModel, table=True):
+    """Association row linking a ``CsSuggestion`` to the entries it drew on (D5).
+
+    Deliberately a separate table: the existing ``CsSuggestion`` schema is NOT
+    modified (no evidence JSON column), and the double foreign key makes the
+    evidence auditable and joinable in both directions.
+    """
+
+    __tablename__ = "cs_suggestion_sales_evidence"
+
+    id: str = Field(default_factory=lambda: new_id("ssev"), primary_key=True)
+    suggestion_id: str = Field(
+        sa_column=Column(
+            String,
+            ForeignKey("cs_suggestion.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+    entry_id: str = Field(
+        sa_column=Column(
+            String,
+            ForeignKey("sales_script_entry.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+    rank: int
+    match_reason: str
+    # Weakest fact state among the entry's bindings, in the SAME vocabulary as
+    # SalesScriptFactStatus (see the alias above).
+    fact_safety: SalesScriptFactStatus = Field(sa_column=Column(String, nullable=False))
+    created_at: datetime = Field(default_factory=now_utc)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "suggestion_id", "entry_id", name="uq_ssev_suggestion_entry"
+        ),
+        CheckConstraint(
+            f"fact_safety IN ({_enum_values_sql(SalesScriptFactStatus)})",
+            name="ck_ssev_fact_safety_gate",
+        ),
+        CheckConstraint("rank >= 0", name="ck_ssev_rank_non_negative"),
+    )

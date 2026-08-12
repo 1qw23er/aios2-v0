@@ -22,6 +22,13 @@ from aios.models import (
 )
 from alembic import command
 
+# Newest revision a downgrade may still start from. Head (20260812_0001,
+# SalesPlaybook V0 follow-up) is a deliberate one-way door: its ``downgrade()`` raises
+# unconditionally, so round-trip legs below it start at its predecessor. That
+# predecessor already carries every column these ORM models use -- the
+# SalesPlaybook revision only adds five brand-new tables.
+LAST_DOWNGRADABLE = "20260731_0001"
+
 
 def test_knowledge_model_defaults_and_provenance() -> None:
     candidate = KnowledgeCandidate(
@@ -158,8 +165,9 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     # agent_secret slice: 20260730_0001. The round-trip mechanics above already
     # prove the knowledge migrations; this final step only confirms we can
     # return to the current head (#109 customer-service workflow slice
-    # 20260731_0001 extends the chain past the #103 secret-store slice).
-    assert revision() == "20260731_0001"
+    # 20260731_0001, then the SalesPlaybook V0 slice 20260812_0001, extend the
+    # chain past the #103 secret-store slice).
+    assert revision() == "20260812_0001"
 
 
 def test_scope_unique_migration_round_trip(tmp_path: Path) -> None:
@@ -267,12 +275,13 @@ def test_scope_unique_migration_round_trip(tmp_path: Path) -> None:
     assert "knowledge_fact_validate_insert" in trigger_names()
     assert "knowledge_fact_validate_update" in trigger_names()
 
-    # ORM seeding below requires the FULL current schema: the Artifact model
-    # now carries idempotency_key (added by 20260728_0009, purely additive /
-    # nullable), so bring the DB to head before inserting ORM rows. The 0009
-    # columns stay empty here, so its own downgrade leg remains lossless and
-    # the fail-closed assertion below still exercises the 0008 -> 0007 gate.
-    command.upgrade(config, "head")
+    # ORM seeding below requires the full column set the models expect: the
+    # Artifact model now carries idempotency_key (added by 20260728_0009,
+    # purely additive / nullable), so bring the DB up to LAST_DOWNGRADABLE
+    # before inserting ORM rows. Those upper layers stay empty here, so their
+    # downgrade legs remain lossless and the fail-closed assertion below still
+    # exercises the 0008 -> 0007 gate.
+    command.upgrade(config, LAST_DOWNGRADABLE)
 
     # ---- Seed genuine cross-scope coexistence via the service layer ----
     engine = get_engine(url)
@@ -397,11 +406,11 @@ def test_scope_unique_downgrade_fail_closed_two_projects(tmp_path: Path) -> None
             session.refresh(artifact)
             return project, artifact
 
-    # Apply migrations to head: the ORM Artifact model now carries
-    # idempotency_key (20260728_0009, additive/nullable), so ORM seeding needs
-    # the full current schema. 0009 data stays empty, so the downgrade below
-    # still reaches (and is stopped by) the 0008 fail-closed gate.
-    command.upgrade(config, "head")
+    # Apply migrations up to LAST_DOWNGRADABLE: the ORM Artifact model now
+    # carries idempotency_key (20260728_0009, additive/nullable), so ORM
+    # seeding needs that column set. Those upper layers stay empty, so the
+    # downgrade below still reaches (and is stopped by) the 0008 gate.
+    command.upgrade(config, LAST_DOWNGRADABLE)
 
     engine = get_engine(url)
     # Two DISTINCT project scopes for the same series -- NO company row.
@@ -506,10 +515,10 @@ def test_scope_unique_downgrade_lossless_without_cross_scope(tmp_path: Path) -> 
     # sharing (series, version) with a project fact -> downgrade is safe.
     engine = get_engine(url)
 
-    # Apply migrations to head (ORM seeding requires the full current schema;
-    # 20260728_0009 is additive/nullable and its data stays empty here, so the
-    # 0009 downgrade leg is lossless and the 0008 -> 0007 leg is exercised).
-    command.upgrade(config, "head")
+    # Apply migrations up to LAST_DOWNGRADABLE (ORM seeding needs that column
+    # set; 20260728_0009 is additive/nullable and its data stays empty here, so
+    # the 0009 downgrade leg is lossless and the 0008 -> 0007 leg is exercised).
+    command.upgrade(config, LAST_DOWNGRADABLE)
     assert set(constraint_columns()) == {"series_id", "version", "project_id"}
 
     # Seed one project-scoped series only (no company counterpart).

@@ -1,8 +1,10 @@
 """Migration proof for the #109 customer-service implementation (plan §2.4 / §7 T1, T20).
 
 Asserts from several angles:
-* the Alembic head advanced to exactly ``20260731_0001`` (single head);
-* exactly one new migration file was added (chained after ``20260730_0001``);
+* the Alembic tree still has a single head (now ``20260812_0001``, the
+  SalesPlaybook V0 follow-up slice) and the #109 revision is part of that chain;
+* exactly one new migration file was added by #109 (chained after
+  ``20260730_0001``);
 * a freshly migrated DB creates ``conversation`` / ``message`` / ``cs_suggestion``
   with the expected columns;
 * CS enums are stored as plain VARCHAR and round-trip unchanged via raw SQL
@@ -22,7 +24,11 @@ from sqlmodel import Session
 from aios.db import get_engine, run_migrations
 from aios.models import Project
 
-HEAD = "20260731_0001"
+# Current single leaf of the whole tree. Later slices legitimately advance it;
+# what #109 owns is CS_REVISION, which must stay in the chain.
+HEAD = "20260812_0001"
+CS_REVISION = "20260731_0001"
+CS_FILE = "20260731_0001_customer_service.py"
 PREV = "20260730_0001_agent_secret.py"
 
 
@@ -42,6 +48,9 @@ def test_single_alembic_head_advanced():
     _, _, sd = _script_dir()
     assert sd.get_heads() == [HEAD]
     assert sd.get_current_head() == HEAD
+    # The #109 revision is a real link of the single chain, not an orphan leaf.
+    assert sd.get_revision(CS_REVISION) is not None
+    assert CS_REVISION in {rev.revision for rev in sd.walk_revisions()}
 
 
 def test_exactly_one_new_migration_file():
@@ -52,11 +61,13 @@ def test_exactly_one_new_migration_file():
         for p in versions.glob("*.py")
         if not p.name.startswith("_") and p.name != "__init__.py"
     ]
-    assert "20260731_0001_customer_service.py" in files
+    assert CS_FILE in files
     assert all(p.startswith("2026") for p in files)
-    # No migration with a later date stamp was introduced by #109 beyond the one.
-    newer = [p for p in files if p > PREV]
-    assert newer == ["20260731_0001_customer_service.py"]
+    # #109 added exactly one migration. The window is bounded ABOVE by the #109
+    # file itself: later unrelated slices (SalesPlaybook V0, ...) legitimately
+    # extend the chain and must not be counted against this slice.
+    added_by_cs = [p for p in files if PREV < p <= CS_FILE]
+    assert added_by_cs == [CS_FILE]
 
 
 # ---------------------------------------------------------------------------

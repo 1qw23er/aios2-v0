@@ -417,6 +417,12 @@ def test_revoke_visible_to_new_resolve_after_commit(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Newest revision a downgrade may still start from. Head (20260812_0001,
+# SalesPlaybook V0) is a deliberate one-way door: its ``downgrade()`` raises
+# unconditionally, so the legs below it are exercised from its predecessor.
+LAST_DOWNGRADABLE = "20260731_0001"
+
+
 def _alembic_cfg(url: str) -> object:
     from alembic.config import Config
 
@@ -449,7 +455,9 @@ def test_migration_downgrade_fail_closed_with_row(tmp_path: Path) -> None:
     from alembic import command
 
     url = _db_url(tmp_path, "down.db")
-    run_migrations(url)
+    cfg = _alembic_cfg(url)
+    # Stop below the one-way door so the agent_secret leg stays reachable.
+    command.upgrade(cfg, LAST_DOWNGRADABLE)
     engine = create_engine(url)
     with Session(engine) as s:
         s.add(Agent(id="agt_d", name="n", role="r", adapter_type="api"))
@@ -463,7 +471,6 @@ def test_migration_downgrade_fail_closed_with_row(tmp_path: Path) -> None:
         )
         s.commit()
 
-    cfg = _alembic_cfg(url)
     with pytest.raises(RuntimeError):
         command.downgrade(cfg, "20260729_0001")
 
@@ -472,8 +479,9 @@ def test_migration_downgrade_ok_when_empty(tmp_path: Path) -> None:
     from alembic import command
 
     url = _db_url(tmp_path, "down_empty.db")
-    run_migrations(url)
     cfg = _alembic_cfg(url)
+    # Stop below the one-way door so the agent_secret leg stays reachable.
+    command.upgrade(cfg, LAST_DOWNGRADABLE)
     # Empty agent_secret -> lossless downgrade succeeds.
     command.downgrade(cfg, "20260729_0001")
     engine = create_engine(url)

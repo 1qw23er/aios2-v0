@@ -51,8 +51,13 @@ from aios.work_log import (
 )
 from alembic import command
 
-HEAD = "20260731_0001"
+HEAD = "20260812_0001"
 PREV = "20260727_0008"
+# Newest revision a downgrade may still start from. Head (20260812_0001,
+# SalesPlaybook V0) is a deliberate one-way door: its ``downgrade()`` raises
+# unconditionally, so any leg that walks the chain backwards must start at its
+# predecessor. Upgrading all the way to HEAD is still asserted below.
+LAST_DOWNGRADABLE = "20260731_0001"
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +171,8 @@ def test_work_log_migration_round_trip(tmp_path: Path) -> None:
     assert _revision(url) == PREV
     _assert_0009_schema_absent(url)
 
-    command.upgrade(config, HEAD)
-    assert _revision(url) == HEAD
+    command.upgrade(config, LAST_DOWNGRADABLE)
+    assert _revision(url) == LAST_DOWNGRADABLE
     _assert_0009_schema_present(url)
 
     # No 0009 data was written -> downgrade must be lossless and clean.
@@ -1125,7 +1130,7 @@ def test_migration_0009_downgrade_fail_closed_populated(
     revision all remain on 20260728_0009."""
     url = f"sqlite:///{(tmp_path / f'work_log_fc_{populated}.db').as_posix()}"
     config = _config(url)
-    command.upgrade(config, HEAD)
+    command.upgrade(config, LAST_DOWNGRADABLE)
 
     with Session(get_engine(url)) as session:
         if populated == "agent_platform":
@@ -1151,7 +1156,8 @@ def test_migration_0009_downgrade_fail_closed_populated(
         command.downgrade(config, PREV)
 
     # Fail-closed: the 0009 downgrade aborts, so the DB is left exactly on
-    # 0009 (the 20260729_0001 downgrade already committed, but 0009's
+    # 0009 (the empty layers above it -- 20260731_0001 and 20260730_0001 and
+    # 20260729_0001 -- already committed their own clean downgrades, but 0009's
     # downgrade to PREV raised before any DDL). Schema, rows, indexes and
     # revision all remain on 20260728_0009.
     assert _revision(url) == "20260728_0009"
@@ -1180,8 +1186,8 @@ def test_migration_0029_downgrade_empty_is_lossless(tmp_path: Path) -> None:
     lands on 20260728_0009."""
     url = f"sqlite:///{(tmp_path / 'v4_downgrade_empty.db').as_posix()}"
     config = _config(url)
-    command.upgrade(config, HEAD)
-    assert _revision(url) == HEAD
+    command.upgrade(config, LAST_DOWNGRADABLE)
+    assert _revision(url) == LAST_DOWNGRADABLE
     _assert_0029_schema_present(url)
 
     # Empty V4 registration state -> lossless one-step downgrade.
@@ -1201,8 +1207,8 @@ def test_migration_0029_downgrade_fail_closed_when_tokens_consumed(
     single-use permanence)."""
     url = f"sqlite:///{(tmp_path / 'v4_downgrade_fc.db').as_posix()}"
     config = _config(url)
-    command.upgrade(config, HEAD)
-    assert _revision(url) == HEAD
+    command.upgrade(config, LAST_DOWNGRADABLE)
+    assert _revision(url) == LAST_DOWNGRADABLE
 
     # Seed an agent that has consumed a bootstrap token.
     with Session(get_engine(url)) as session:
@@ -1222,9 +1228,10 @@ def test_migration_0029_downgrade_fail_closed_when_tokens_consumed(
         command.downgrade(config, "20260728_0009")
 
     # Fail-closed on the 0029 layer: the consumed-token record and 0029 schema
-    # are intact. (The empty top secret-store layer 20260730_0001 is cleanly
-    # removable on SQLite's per-migration commit semantics, so the chain stops
-    # exactly at the 0029 revision rather than the current head.)
+    # are intact. (The empty layers above it -- 20260731_0001 and the
+    # secret-store 20260730_0001 -- are cleanly removable on SQLite's
+    # per-migration commit semantics, so the chain stops exactly at the 0029
+    # revision rather than at LAST_DOWNGRADABLE.)
     assert _revision(url) == "20260729_0001"
     _assert_0029_schema_present(url)
     with Session(get_engine(url)) as session:

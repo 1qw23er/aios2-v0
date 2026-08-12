@@ -15,8 +15,8 @@ re-implements CAS, transactions or audit. It only
 Hard invariants enforced here (plan §1.3 / §2.1 / §4.1):
 
 * **Zero new models, zero Alembic migration.** Only existing rows are read and
-  existing services are called. The single Alembic head ``20260731_0001`` is
-  untouched.
+  existing services are called. This module adds no revision of its own and
+  leaves whatever the current single Alembic head happens to be untouched.
 * **The owner never relays an internal identity.** ``rid`` / ``project_id`` /
   ``series_id`` / ``version`` / ``checksum`` / ``revision`` / enum values travel
   only *inside* the AEAD ciphertext, never in a URL, HTML, JSON, log or referrer.

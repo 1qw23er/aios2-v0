@@ -30,7 +30,7 @@ from aios.feedback import (
 )
 from aios.models import Artifact, ArtifactType, Event, Project, Task
 
-HEAD = "20260731_0001"
+HEAD = "20260812_0001"
 
 
 # Shared DB fixtures (mirror tests/test_feedback.py; pytest fixtures are
@@ -70,28 +70,36 @@ def test_single_alembic_head_unchanged():
 
 
 def test_no_new_migration_files():
-    """#110 (feedback) introduced zero migrations. The only migration that may
-    exist beyond the V4 secret-store head is the #109 customer-service workflow
-    migration added by this branch."""
+    """#110 (feedback) introduced zero migrations.
+
+    The assertion is scoped to the #110 slice rather than to "no later file
+    exists at all": unrelated later slices legitimately extend the chain (the
+    #109 customer-service migration, then the SalesPlaybook V0 migration), and
+    pinning the absolute tail here would make every future migration look like a
+    feedback regression. What #110 actually promises is that IT added nothing,
+    so we assert nothing was wedged into its window and that no migration
+    anywhere in the tree is a feedback migration.
+    """
     versions = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     heads = [
         p.name
         for p in versions.glob("*.py")
         if not p.name.startswith("_") and p.name != "__init__.py"
     ]
-    # There is exactly one head; any extra migration would create a second leaf
-    # or extend the chain. We assert no file newer than the known #109
-    # customer-service migration exists.
     assert all(p.startswith("2026") for p in heads)
     assert "20260730_0001_agent_secret.py" in heads
     # #109 legitimately adds exactly one migration (customer-service workflow).
     assert "20260731_0001_customer_service.py" in heads
-    # No migration with a later date stamp than the known #109 migration was
-    # introduced by this work (feedback added zero migrations; only #109 added
-    # one, and it is the expected single leaf).
-    assert not any(
-        p > "20260731_0001_customer_service.py" for p in heads
-    )
+    # Nothing sits between the V4 secret-store slice and #109 -- that is the
+    # window in which a #110 migration would have appeared.
+    between = [
+        p
+        for p in heads
+        if "20260730_0001_agent_secret.py" < p < "20260731_0001_customer_service.py"
+    ]
+    assert between == []
+    # And no migration in the whole tree is a feedback migration.
+    assert not any("feedback" in p for p in heads)
 
 
 # ---------------------------------------------------------------------------
