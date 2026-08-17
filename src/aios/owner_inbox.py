@@ -1294,6 +1294,14 @@ class OwnerInboxService:
 
     @staticmethod
     def _content_decisions(status: ArtifactReviewStatus) -> list[str]:
+        # Owner daily flow: an edit-and-resubmit runs update+submit in one
+        # request; the happy path lands REVIEW_PASSED (approve/reject offered),
+        # and a degraded review lands NEEDS_REVISION (edit-and-resubmit offered).
+        # The UNVERIFIED branch (resubmit) is reachable when the row was left in
+        # UNVERIFIED: either pre-set by the content service API at create time,
+        # or left behind by a partial failure (edit committed, submit failed) --
+        # in both cases the owner sees it as a valid retry entry, so the branch
+        # is intentional and required, not dead UI (#128).
         if status == ArtifactReviewStatus.REVIEW_PASSED:
             return [PURPOSE_CONTENT_APPROVE, PURPOSE_CONTENT_REJECT]
         if status == ArtifactReviewStatus.UNVERIFIED:

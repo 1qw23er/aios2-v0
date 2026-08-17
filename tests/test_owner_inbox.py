@@ -179,16 +179,241 @@ def assert_normalized_failure(response, *, seed: Seed | None = None) -> None:
     409 + HTML + business sentence, with no validation diagnostics, no raw
     sealed token and no internal identifier.
     """
-    assert response.status_code == 409, f"{response.status_code}: {response.text[:300]}"
+    # ``TestResponse`` (from the client) exposes ``.text``; a bare
+    # ``HTMLResponse`` (the direct ``_failure`` unit tests) does not in this
+    # Starlette version, so derive the body uniformly.
+    body = getattr(response, "text", None)
+    if body is None:
+        body = response.body.decode()
+    assert response.status_code == 409, f"{response.status_code}: {body[:300]}"
     assert response.headers["content-type"].startswith("text/html")
     for marker in _MACHINE_MARKERS:
-        assert marker not in response.text, f"leaked validation artefact {marker!r}"
-    assert "422" not in response.text
-    assert "Traceback" not in response.text
-    assert "ServiceError" not in response.text
+        assert marker not in body, f"leaked validation artefact {marker!r}"
+    assert "422" not in body
+    assert "Traceback" not in body
+    assert "ServiceError" not in body
     if seed is not None:
-        assert seed.project_id not in response.text
-        assert seed.draft_id not in response.text
+        assert seed.project_id not in body
+        assert seed.draft_id not in body
+
+
+# --------------------------------------------------------------------------
+# 1b. §8 _failure() normalization (issue #126)
+# --------------------------------------------------------------------------
+#
+# §8 says every OOL-level resolution failure reaches the owner surface as the
+# *uniform* 409 page. The business sentence is still tailored per status, but
+# the HTTP status must collapse to 409 so the owner never observes a
+# 422/403/404 distinction (that split is the enumeration signal §4.1 rule 6
+# exists to erase). 5xx, by contrast, is a real infrastructure failure the
+# owner must not mistake for a retry-able input problem, so it is preserved.
+
+
+def test_failure_normalizes_422_to_409() -> None:
+    """A ``ServiceError(422, …)`` must render as 409 on the owner surface (#126)."""
+    from aios.api.owner_inbox_routes import _failure
+    from aios.services import ServiceError
+
+    response = _failure(ServiceError(422, "请选择客户阶段。"))
+    assert_normalized_failure(response)
+
+
+@pytest.mark.parametrize("status_code", [403, 404, 409, 422])
+def test_failure_normalizes_every_4xx_to_409(status_code: int) -> None:
+    """§8: all client (4xx) errors collapse to the single 409 class (#126)."""
+    from aios.api.owner_inbox_routes import _failure
+    from aios.services import ServiceError
+
+    response = _failure(ServiceError(status_code, "提交的信息不完整，请补充后重试。"))
+    assert response.status_code == 409
+    assert response.headers["content-type"].startswith("text/html")
+
+
+def test_failure_preserves_5xx_status() -> None:
+    """5xx is a real infrastructure failure -- must NOT be rewritten to 409 (#126)."""
+    from aios.api.owner_inbox_routes import _failure
+    from aios.services import ServiceError
+
+    response = _failure(ServiceError(503, "downstream unavailable"))
+    assert response.status_code == 503
+    _body = getattr(response, "text", None) or response.body.decode()
+    assert "AIOS_OOL" not in _body
+
+
+def test_decide_422_from_service_normalizes_to_409(
+    client: TestClient, seed: Seed, monkeypatch
+) -> None:
+    """End-to-end: a 422 raised by the service layer on a real OOL decide must
+    reach the owner as the uniform 409 page, not a raw 422 (#126).
+
+    This pins the contract on the *handler* path (``owner_inbox_decide`` ->
+    ``_failure``), not just on the helper, so a future refactor of the handler
+    cannot silently leak a 422 again.
+    """
+    from aios.owner_inbox import OwnerInboxService
+    from aios.services import ServiceError
+
+    def _boom(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise ServiceError(422, "请选择客户阶段。")
+
+    monkeypatch.setattr(OwnerInboxService, "decide", _boom)
+
+    ctx = _context_token(client)
+    token = _action_token(client, ctx)
+    data = {"action_token": token, "ctx": ctx, "reason": "x"}
+    response = client.post("/owner/inboxes/content/decide", auth=AUTH, data=data)
+    assert_normalized_failure(response, seed=seed)
+
+
+# --------------------------------------------------------------------------
+# 1c. §8 audit-translation regression (issue #127 / D2 / #130)
+# --------------------------------------------------------------------------
+#
+# The owner-facing audit history must never show raw gateway / scheduler /
+# orchestrator / bootstrap identifiers (defect D2). The closed allow-lists in
+# ``OwnerInboxService._translate_audit_actor`` / ``_translate_audit_action``
+# translate every stored value to bounded business Chinese; anything outside
+# the list collapses to a safe fallback rather than leaking. These tests pin
+# that guarantee so a future change cannot re-open the enumeration oracle.
+
+
+_INTERNAL_ACTORS = (
+    "gateway",
+    "scheduler",
+    "orchestrator",
+    "bootstrap",
+    "system",
+    "kubernetes",
+    "unknown",
+    "agent-registry",
+)
+
+
+def test_translate_audit_actor_collapses_internal_identifiers() -> None:
+    """No internal component identifier reaches the owner as raw text (#127)."""
+    from aios.owner_inbox import OwnerInboxService
+
+    for raw in _INTERNAL_ACTORS:
+        translated = OwnerInboxService._translate_audit_actor(raw)
+        assert translated == "系统", f"{raw!r} leaked as {translated!r}"
+        assert raw not in translated
+
+
+def test_translate_audit_actor_owner_and_agent_stay_distinct() -> None:
+    """Owner reads as '你', agents as 'AI 助手' -- never the raw id (#127)."""
+    from aios.owner_inbox import OwnerInboxService
+
+    assert OwnerInboxService._translate_audit_actor("owner") == "你"
+    assert OwnerInboxService._translate_audit_actor("owner:abc123") == "你"
+    assert OwnerInboxService._translate_audit_actor("agent") == "AI 助手"
+    assert OwnerInboxService._translate_audit_actor("agent:hermes-9") == "AI 助手"
+
+
+def test_translate_audit_action_falls_back_for_unknown() -> None:
+    """Unknown actions collapse to the bounded fallback, not the raw dotted id (#127)."""
+    from aios.owner_inbox import OwnerInboxService
+
+    raw = "gateway.internal_dispatch_raw"
+    translated = OwnerInboxService._translate_audit_action(raw)
+    assert translated == "状态已更新"
+    assert raw not in translated
+
+
+def test_translate_audit_action_known_labels_preserved() -> None:
+    """Known actions keep their business label (#127)."""
+    from aios.owner_inbox import OwnerInboxService
+
+    assert OwnerInboxService._translate_audit_action("content_draft.approve") == "内容已批准"
+    assert OwnerInboxService._translate_audit_action("cs.outbound_send") == "外呼已发送"
+
+
+def test_owner_surface_audit_history_translates_internal_identifiers(
+    client: TestClient, seed: Seed
+) -> None:
+    """End-to-end: a raw internal audit row on the owner detail surface must
+    render as the safe translation, never the raw identifier (#127)."""
+    from aios.audit import AuditLog
+    from aios.db import Session, get_database_url, get_engine
+
+    with Session(get_engine(get_database_url())) as session:
+        session.add(
+            AuditLog(
+                actor="gateway",
+                action="gateway.internal_dispatch_raw",
+                resource_type="artifact",
+                resource_id=seed.draft_id,
+                project_id=seed.project_id,
+                idempotency_key="reg-audit-127-1",
+            )
+        )
+        session.commit()
+
+    ctx = _context_token(client)
+    detail = client.post(
+        "/owner/inboxes/content/detail",
+        auth=AUTH,
+        data={"detail_token": _detail_token(client, ctx), "ctx": ctx},
+    )
+    assert detail.status_code == 200
+    assert "gateway" not in detail.text
+    assert "gateway.internal_dispatch_raw" not in detail.text
+    assert "系统" in detail.text
+    assert "状态已更新" in detail.text
+
+
+# --------------------------------------------------------------------------
+# 1d. §8 content decisions (issue #128)
+# --------------------------------------------------------------------------
+#
+# ``_content_decisions`` maps an ``ArtifactReviewStatus`` to the owner-action
+# purposes offered on the detail page. The ``UNVERIFIED`` branch (resubmit) is
+# reachable when a row sits in UNVERIFIED: the service API may pre-set it at
+# create time, or a partial failure (edit committed, submit failed) leaves it
+# behind -- in both cases the owner sees a valid retry entry. The owner's daily
+# happy path (edit-and-resubmit) never produces UNVERIFIED; it lands
+# REVIEW_PASSED or NEEDS_REVISION. The branch is therefore intentional and
+# required, and the regression below locks the mapping so a future edit cannot
+# silently repurpose it (#128).
+
+
+def test_content_decisions_owner_needs_revision_offers_edit_and_resubmit() -> None:
+    """Owner daily flow: NEEDS_REVISION -> edit-and-resubmit, never resubmit (#128)."""
+    from aios.models import ArtifactReviewStatus
+    from aios.owner_inbox import (
+        PURPOSE_CONTENT_EDIT_AND_RESUBMIT,
+        OwnerInboxService,
+    )
+
+    assert OwnerInboxService._content_decisions(ArtifactReviewStatus.NEEDS_REVISION) == [
+        PURPOSE_CONTENT_EDIT_AND_RESUBMIT
+    ]
+
+
+def test_content_decisions_review_passed_offers_approve_reject() -> None:
+    """REVIEW_PASSED surfaces the approve / reject pair (#128)."""
+    from aios.models import ArtifactReviewStatus
+    from aios.owner_inbox import (
+        PURPOSE_CONTENT_APPROVE,
+        PURPOSE_CONTENT_REJECT,
+        OwnerInboxService,
+    )
+
+    assert OwnerInboxService._content_decisions(ArtifactReviewStatus.REVIEW_PASSED) == [
+        PURPOSE_CONTENT_APPROVE,
+        PURPOSE_CONTENT_REJECT,
+    ]
+
+
+def test_content_decisions_unverified_is_service_only_resubmit() -> None:
+    """UNVERIFIED -> resubmit: reachable via service pre-set or a partial
+    failure (edit committed, submit failed) -- a valid retry entry, not dead
+    UI; the owner daily happy path never produces it (#128)."""
+    from aios.models import ArtifactReviewStatus
+    from aios.owner_inbox import PURPOSE_CONTENT_RESUBMIT, OwnerInboxService
+
+    assert OwnerInboxService._content_decisions(ArtifactReviewStatus.UNVERIFIED) == [
+        PURPOSE_CONTENT_RESUBMIT
+    ]
 
 
 # --------------------------------------------------------------------------

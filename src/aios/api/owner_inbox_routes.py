@@ -117,7 +117,13 @@ def _business_message(error: ServiceError) -> str:
 
 
 def _failure(error: ServiceError) -> HTMLResponse:
-    """Render the uniform §8 failure page, preserving the normalized status.
+    """Render the uniform §8 failure page.
+
+    §8 collapses *every* client (4xx) resolution failure to the single 409
+    class, so the owner never observes a 422/403/404 distinction -- that split
+    is exactly the enumeration signal §4.1 rule 6 exists to erase. A 5xx, by
+    contrast, is a real infrastructure failure the owner must not mistake for a
+    retry-able input problem, so its status is preserved verbatim.
 
     ``ServiceError.untrusted`` short-circuits translation entirely: a failure
     whose cause was decided by client-supplied input must never be described,
@@ -129,9 +135,10 @@ def _failure(error: ServiceError) -> HTMLResponse:
     """
     if error.untrusted:
         return _untrusted_input()
+    status = 409 if 400 <= error.status_code < 500 else error.status_code
     return HTMLResponse(
         owner_inbox_error_html(_business_message(error)),
-        status_code=error.status_code,
+        status_code=status,
     )
 
 
