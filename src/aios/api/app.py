@@ -22,6 +22,7 @@ from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from aios.actor import ActorContext
+from aios.adapters.factory import build_execution_adapter
 from aios.adapters.wecom import MockWeComAdapter
 from aios.agent_registry import (
     create_agent_via_bootstrap,
@@ -61,7 +62,7 @@ from aios.distribution import (
     is_package_task,
     is_publish_gate_task,
 )
-from aios.execution import LLMExecutionAdapter, execute_task
+from aios.execution import execute_task
 from aios.feedback import FeedbackService, FeedbackTransition, redact_pii
 from aios.knowledge_service import KnowledgeService
 from aios.knowledge_tags import report_unclassified_knowledge
@@ -702,7 +703,7 @@ def create_app() -> FastAPI:
                 status_code=400,
                 detail="打包任务请调用 POST /tasks/{id}/package，不通过部门执行运行。",
             )
-        adapter = LLMExecutionAdapter()
+        adapter = build_execution_adapter(session, task_id)
         try:
             return execute_task(session, task_id, idempotency_key, adapter=adapter, actor="agent")
         except ServiceError as error:
@@ -2554,7 +2555,11 @@ def create_app() -> FastAPI:
             )
         try:
             execute_task(
-                session, task_id, new_id("idem"), adapter=LLMExecutionAdapter(), actor="owner"
+                session,
+                task_id,
+                new_id("idem"),
+                adapter=build_execution_adapter(session, task_id),
+                actor="owner",
             )
         except ServiceError as error:
             return HTMLResponse(

@@ -40,6 +40,16 @@ from aios.models import (
 from aios.services import ServiceError
 
 
+def test_harness_factory_is_disabled_by_default(monkeypatch) -> None:
+    from aios.adapters.factory import build_execution_adapter
+
+    monkeypatch.delenv("AIOS_DEEPSEEK_HARNESS_ENABLED", raising=False)
+
+    adapter = build_execution_adapter(None, "unused")
+
+    assert isinstance(adapter, LLMExecutionAdapter)
+
+
 @pytest.fixture
 def client(trusted_owner_installer, tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setenv("AIOS_DATABASE_URL", f"sqlite:///{tmp_path / 'exec.db'}")

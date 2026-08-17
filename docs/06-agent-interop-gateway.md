@@ -1,5 +1,13 @@
 # ADR 06 — Agent Interoperability Gateway（#57）
 
+## DeepSeek Harness Worker Adapter V1
+
+DeepSeek Harness is an opt-in execution worker behind the existing delegated lifecycle. The layering is `DeepSeekHarnessWorkerClient -> WorkerDelegatedAdapter -> DelegatedExecutionAdapter -> execute_task`; `DelegatedExecutionAdapter` remains responsible for `DelegatedRun`, trust and budget gates, polling, retries, audit, provenance, and result ingestion into the existing Artifact path.
+
+V1 negotiates discovery, submission, status, events, adapter-side terminal-event result aggregation, usage, runtime references, and conditional fail-closed permissions. The vendor-neutral worker interface retains cancellation and checkpoint resume, but this provider advertises `cancellation=false` and `checkpoint_resume=false`; either call returns `unsupported_capability` and never simulates success.
+
+The adapter is disabled unless `AIOS_DEEPSEEK_HARNESS_ENABLED=true` and the assigned Agent has a `deepseek-harness+file://...` configuration reference. The fixed JSON-RPC runner takes its Cordis manifest as the final positional argument while `DSH_CORDIS_CONFIG` wins over argv, so admission requires that final argument to resolve to the exact hash-pinned manifest and the child environment pins `DSH_CORDIS_CONFIG` to the same absolute path. The manifest's enabled top-level plugin rows, not a parallel declaration, must mount `@deepseek-ai/dsh-fs-sandbox` and `@deepseek-ai/dsh-sandbox-policy`; runtime plugin attestation is checked when supplied. The default Harness filesystem composition is not accepted. Any command/path/hash/plugin mismatch stops before credential resolution, process launch, `initialize`, and `session/prompt`.
+
 - 状态：实现中（first slice #103 + 加固 #104 已合并；审计/配置切片见 PR #60；控制台管理 #61、结果溯源持久化 #62 已实现于本分支，待评审合并）
 - 关联：Epic #57，V1 史诗 #26，韧性 #55；范围外 #44（调度阻塞路径）、#53（KnowledgeFact 约束）
 - 安全/成本深潜见 `docs/05-gateway-security-cost.md`（本 ADR 只定契约与规则，不重复细节）
