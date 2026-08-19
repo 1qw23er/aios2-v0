@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from urllib.parse import unquote
 
 import pytest
@@ -49,7 +50,12 @@ from aios.models import (
     Project,
     ProjectStatus,
 )
-from aios.owner_inbox import MSG_TOKEN_INVALID
+from aios.owner_inbox import (
+    INBOX_CONTENT,
+    INBOX_CS,
+    MSG_TOKEN_INVALID,
+    OwnerInboxService,
+)
 
 OWNER_ID = "owner-1"
 OWNER_KEY = "o" * 40
@@ -414,6 +420,406 @@ def test_content_decisions_unverified_is_service_only_resubmit() -> None:
     assert OwnerInboxService._content_decisions(ArtifactReviewStatus.UNVERIFIED) == [
         PURPOSE_CONTENT_RESUBMIT
     ]
+
+
+# --------------------------------------------------------------------------
+# 1e. §6 pagination contract (issue #125)
+# --------------------------------------------------------------------------
+#
+# Deterministic keyset pagination (never offset-over-a-mutating-set), stable
+# total order with an explicit id tiebreaker, a server-side page-size cap,
+# cursor semantics that survive concurrent inserts / state transitions without
+# delivering a row twice or skipping it, and an opaque cursor that never
+# exposes a raw internal id to the owner surface.
+
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 50
+
+
+def _seed_many_drafts(
+    session: Session, project_id: str, count: int, *, prefix: str
+) -> list[str]:
+    """Create ``count`` pending content drafts; return their ids (created order)."""
+    owner = ActorContext(kind="owner", owner_id=OWNER_ID)
+    created: list[str] = []
+    for i in range(count):
+        draft = ContentDraftService(session).create_content_draft(
+            project_id=project_id,
+            actor=owner,
+            topic=f"{prefix} {i}",
+            body=f"正文 {i}",
+            idempotency_key=f"idem-page-{prefix}-{i}",
+        )
+        created.append(draft.id)
+    return created
+
+
+def _ool_service(session: Session) -> OwnerInboxService:
+    return OwnerInboxService(session)
+
+
+def test_page_size_defaults_to_20(client: TestClient, seed: Seed) -> None:
+    """No page_size -> deterministic default of 20, never unbounded (#125)."""
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        _seed_many_drafts(session, seed.project_id, 25, prefix="默认")
+        page = _ool_service(session).list_inbox(
+            ActorContext(kind="owner", owner_id=OWNER_ID), ctx, INBOX_CONTENT
+        )
+    assert len(page.items) == DEFAULT_PAGE_SIZE
+    assert page.has_more is True
+    assert page.next_token is not None
+    assert page.page_size == DEFAULT_PAGE_SIZE
+
+
+def test_page_size_capped_at_server_max(client: TestClient, seed: Seed) -> None:
+    """Client-supplied sizes above the hard cap are clamped, never honoured (#125)."""
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        _seed_many_drafts(session, seed.project_id, 55, prefix="封顶")
+        page = _ool_service(session).list_inbox(
+            ActorContext(kind="owner", owner_id=OWNER_ID),
+            ctx,
+            INBOX_CONTENT,
+            page_size=10_000,
+        )
+    assert len(page.items) == MAX_PAGE_SIZE
+    assert page.page_size == MAX_PAGE_SIZE
+    assert page.has_more is True
+
+
+def test_page_size_non_positive_falls_back_to_default(client: TestClient, seed: Seed) -> None:
+    """0 / negative page sizes resolve deterministically to the default (#125)."""
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        _seed_many_drafts(session, seed.project_id, 5, prefix="回退")
+        for bad in (0, -1, -42):
+            page = _ool_service(session).list_inbox(
+                ActorContext(kind="owner", owner_id=OWNER_ID),
+                ctx,
+                INBOX_CONTENT,
+                page_size=bad,
+            )
+            # 1 seeded draft + 5 created = 6 pending rows, all served on one page.
+            assert len(page.items) == 6
+            assert page.page_size == len(page.items)
+
+
+def test_pagination_walks_all_pages_no_dup_no_skip(client: TestClient, seed: Seed) -> None:
+    """Keyset paging over a stable snapshot: every row exactly once, no repeats (#125)."""
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        _seed_many_drafts(session, seed.project_id, 25, prefix="遍历")
+        seen: list[str] = []
+        cursor = None
+        pages = 0
+        while True:
+            page = _ool_service(session).list_inbox(
+                ActorContext(kind="owner", owner_id=OWNER_ID),
+                ctx,
+                INBOX_CONTENT,
+                page_size=10,
+                cursor_token=cursor,
+            )
+            seen.extend(item.detail_ref for item in page.items)
+            pages += 1
+            if not page.has_more or page.next_token is None:
+                assert page.next_token is None
+                break
+            cursor = page.next_token
+        assert pages == 3  # 10 + 10 + 6 (26 rows: 25 created + 1 seeded)
+        assert len(seen) == 26
+        assert len(set(seen)) == 26  # no duplicates
+
+
+def test_tiebreaker_orders_same_timestamp_rows_stably(
+    client: TestClient, seed: Seed
+) -> None:
+    """Equal timestamps never reorder: the id tiebreaker is a total order (#125).
+
+    All rows share one ``created_at`` so the keyset cursor has nothing but the
+    id to split page boundaries on. Walking pages of 2 must deliver every row
+    exactly once in the same id order as a single unbounded read -- without the
+    id tiebreaker the equal-ts slice could reorder or drop rows across pages.
+    """
+    ctx = _context_token(client)
+    from aios.models import Artifact, ArtifactType
+
+    fixed_ts = datetime(2026, 1, 2, 3, 4, 5)
+    with Session(get_engine(get_database_url())) as session:
+        _seed_many_drafts(session, seed.project_id, 5, prefix="同刻")
+        rows = session.exec(
+            select(Artifact).where(
+                Artifact.project_id == seed.project_id,
+                Artifact.type == ArtifactType.CONTENT_DRAFT,
+            )
+        ).all()
+        assert len(rows) == 6  # 1 seed draft + 5 created
+        for row in rows:
+            row.created_at = fixed_ts
+            session.add(row)
+        session.commit()
+
+        # Reference order: single unbounded read, id tiebreaker ascending.
+        whole = _ool_service(session).list_inbox(
+            ActorContext(kind="owner", owner_id=OWNER_ID), ctx, INBOX_CONTENT, page_size=50
+        )
+        expected_refs = [item.detail_ref for item in whole.items]
+        assert len(expected_refs) == 6
+
+        # Walk pages of 2 across the equal-ts block.
+        seen: list[str] = []
+        cursor = None
+        pages = 0
+        while True:
+            page = _ool_service(session).list_inbox(
+                ActorContext(kind="owner", owner_id=OWNER_ID),
+                ctx,
+                INBOX_CONTENT,
+                page_size=2,
+                cursor_token=cursor,
+            )
+            seen.extend(item.detail_ref for item in page.items)
+            pages += 1
+            if page.next_token is None:
+                assert not page.has_more
+                break
+            cursor = page.next_token
+    assert pages == 3  # 2 + 2 + 2
+    assert len(seen) == 6
+    assert len(set(seen)) == 6  # no dup, no skip
+    # Stable across both walks: same order (id tiebreaker is the total order).
+    assert seen == expected_refs
+
+
+def test_cursor_token_never_exposes_internal_ids(client: TestClient, seed: Seed) -> None:
+    """The next-page cursor is an opaque sealed token: no raw draft id in it (#125)."""
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        created = _seed_many_drafts(session, seed.project_id, 25, prefix="不泄")
+        page = _ool_service(session).list_inbox(
+            ActorContext(kind="owner", owner_id=OWNER_ID), ctx, INBOX_CONTENT, page_size=10
+        )
+        cursor = page.next_token
+    assert cursor is not None
+    for draft_id in created:
+        assert draft_id not in cursor
+    assert seed.draft_id not in cursor
+
+
+def test_cursor_from_one_inbox_rejected_on_another(client: TestClient, seed: Seed) -> None:
+    """A content cursor replayed against the cs inbox is refused (untrusted) (#125)."""
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        _seed_many_drafts(session, seed.project_id, 25, prefix="跨箱")
+        content_page = _ool_service(session).list_inbox(
+            ActorContext(kind="owner", owner_id=OWNER_ID), ctx, INBOX_CONTENT, page_size=10
+        )
+        service = _ool_service(session)
+        with pytest.raises(Exception) as excinfo:
+            service.list_inbox(
+                ActorContext(kind="owner", owner_id=OWNER_ID),
+                ctx,
+                INBOX_CS,
+                cursor_token=content_page.next_token,
+            )
+    assert "untrusted" in str(excinfo.value).lower() or "409" in str(excinfo.value)
+
+
+def test_cursor_minted_for_another_project_is_rejected(
+    client: TestClient, seed: Seed
+) -> None:
+    """A cursor sealed under project A cannot page project B: replaying it
+    against B's context would silently skip B rows, so it must be refused
+    with the same untrusted class (#125 audit P2-1)."""
+    from aios.owner_inbox import PURPOSE_INBOX_NEXT, TOKEN_TYPE_INBOX_CURSOR
+
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        other = Project(name="另一项目", objective="测试", status=ProjectStatus.ACTIVE)
+        session.add(other)
+        session.commit()
+        session.refresh(other)
+        other_id = other.id
+        # A *validly shaped* cursor whose operating_project / resource_scope
+        # point at the other project.
+        foreign_cursor = _mint(
+            token_type=TOKEN_TYPE_INBOX_CURSOR,
+            owner=OWNER_ID,
+            operating_project=other_id,
+            resource_scope=other_id,
+            inbox=INBOX_CONTENT,
+            purpose=PURPOSE_INBOX_NEXT,
+            sort_ts="2026-01-01T00:00:00",
+            sort_id="art_other",
+        )
+        service = _ool_service(session)
+        with pytest.raises(Exception) as excinfo:
+            service.list_inbox(
+                ActorContext(kind="owner", owner_id=OWNER_ID),
+                ctx,
+                INBOX_CONTENT,
+                cursor_token=foreign_cursor,
+            )
+    assert "untrusted" in str(excinfo.value).lower() or "409" in str(excinfo.value)
+
+
+def test_state_change_between_pages_never_delivers_twice(
+    client: TestClient, seed: Seed, monkeypatch
+) -> None:
+    """A row processed between pages leaves the pending snapshot; it never
+    reappears on a later page and is never delivered twice (#125)."""
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        _seed_many_drafts(session, seed.project_id, 15, prefix="状态")
+        page1 = _ool_service(session).list_inbox(
+            ActorContext(kind="owner", owner_id=OWNER_ID), ctx, INBOX_CONTENT, page_size=5
+        )
+        # Process the *last* pending artifact in total order (created_at desc,
+        # id desc) -- it sorts after page 1, so it was not yet delivered.
+        # Marking it APPROVED makes it leave the pending snapshot before the
+        # remaining pages are read: it must never appear, and the walk must
+        # deliver exactly the other 15 rows once. (Fixing a flake: previously
+        # the row was picked by random UUID order, so ~1/3 of runs it already
+        # sat on page 1 and the count drifted to 16.)
+        from aios.models import Artifact, ArtifactReviewStatus, ArtifactType
+
+        row = session.exec(
+            select(Artifact)
+            .where(
+                Artifact.project_id == seed.project_id,
+                Artifact.type == ArtifactType.CONTENT_DRAFT,
+            )
+            .order_by(Artifact.created_at.desc(), Artifact.id.desc())
+        ).first()
+        assert row is not None
+        row.review_status = ArtifactReviewStatus.APPROVED
+        session.add(row)
+        session.commit()
+        page2 = _ool_service(session).list_inbox(
+            ActorContext(kind="owner", owner_id=OWNER_ID),
+            ctx,
+            INBOX_CONTENT,
+            page_size=5,
+            cursor_token=page1.next_token,
+        )
+        page3 = _ool_service(session).list_inbox(
+            ActorContext(kind="owner", owner_id=OWNER_ID),
+            ctx,
+            INBOX_CONTENT,
+            page_size=10,
+            cursor_token=page2.next_token,
+        )
+    all_items = page1.items + page2.items + page3.items
+    refs = [item.detail_ref for item in all_items]
+    assert len(refs) == len(set(refs))  # no duplicate delivery
+    # 1 seeded + 15 created = 16 pending; one processed away -> 15 delivered.
+    assert len(all_items) == 15
+
+
+def test_insert_between_pages_appears_on_later_pages_only(
+    client: TestClient, seed: Seed
+) -> None:
+    """A row inserted after page 1 shows up on a later page -- never re-delivers
+    rows already seen, never skips the new row (#125)."""
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        _seed_many_drafts(session, seed.project_id, 10, prefix="插入前")
+        # 1 seeded + 10 created = 11 pending rows: page of 10 leaves one behind.
+        page1 = _ool_service(session).list_inbox(
+            ActorContext(kind="owner", owner_id=OWNER_ID), ctx, INBOX_CONTENT, page_size=10
+        )
+        assert len(page1.items) == 10
+        assert page1.has_more is True
+        assert page1.next_token is not None
+        _seed_many_drafts(session, seed.project_id, 3, prefix="插入后")
+        page2 = _ool_service(session).list_inbox(
+            ActorContext(kind="owner", owner_id=OWNER_ID), ctx, INBOX_CONTENT, page_size=20
+        )
+    assert len(page2.items) == 14  # 11 old + 3 new, none duplicated
+    refs = [item.detail_ref for item in page2.items]
+    assert len(refs) == len(set(refs))
+
+
+def test_last_page_has_no_next_token(client: TestClient, seed: Seed) -> None:
+    """The final page carries has_more=False and next_token=None (#125)."""
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        # 1 seeded + 9 created = 10 rows: exactly one page of 10.
+        _seed_many_drafts(session, seed.project_id, 9, prefix="末页")
+        page = _ool_service(session).list_inbox(
+            ActorContext(kind="owner", owner_id=OWNER_ID), ctx, INBOX_CONTENT, page_size=10
+        )
+    assert len(page.items) == 10
+    assert page.has_more is False
+    assert page.next_token is None
+
+
+def test_empty_inbox_has_no_next_token(client: TestClient, seed: Seed) -> None:
+    """An empty pending list: zero items, no cursor, no more (#125)."""
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        # Remove the seeded draft from the pending set so the inbox is truly empty.
+        from aios.models import Artifact, ArtifactReviewStatus, ArtifactType
+
+        row = session.exec(
+            select(Artifact).where(
+                Artifact.project_id == seed.project_id,
+                Artifact.type == ArtifactType.CONTENT_DRAFT,
+            )
+        ).first()
+        assert row is not None
+        row.review_status = ArtifactReviewStatus.APPROVED
+        session.add(row)
+        session.commit()
+        page = _ool_service(session).list_inbox(
+            ActorContext(kind="owner", owner_id=OWNER_ID), ctx, INBOX_CONTENT, page_size=10
+        )
+    assert page.items == []
+    assert page.has_more is False
+    assert page.next_token is None
+    assert page.page_size == 0
+
+
+def test_list_route_accepts_page_size_and_renders_next_link(
+    client: TestClient, seed: Seed
+) -> None:
+    """The list route honours page_size and renders a next-page link (#125)."""
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        _seed_many_drafts(session, seed.project_id, 12, prefix="路由")
+    listing = client.get(
+        "/owner/inboxes/content",
+        auth=AUTH,
+        params={"ctx": ctx, "page_size": 5},
+    )
+    assert listing.status_code == 200, listing.text[:400]
+    assert "下一页" in listing.text
+    assert "本页 5 条" in listing.text
+
+
+def test_list_route_cursor_walks_all_pages(client: TestClient, seed: Seed) -> None:
+    """End-to-end: GET with cursor pages through every row without loss (#125)."""
+    ctx = _context_token(client)
+    with Session(get_engine(get_database_url())) as session:
+        _seed_many_drafts(session, seed.project_id, 25, prefix="全路")
+    seen: list[str] = []
+    cursor = None
+    for _ in range(5):
+        params = {"ctx": ctx, "page_size": 10}
+        if cursor is not None:
+            params["cursor"] = cursor
+        listing = client.get("/owner/inboxes/content", auth=AUTH, params=params)
+        assert listing.status_code == 200, listing.text[:400]
+        refs = re.findall(r'<div class="ref">(内容#[0-9]+)</div>', listing.text)
+        seen.extend(refs)
+        match = re.search(r'href="/owner/inboxes/content\?ctx=[^"]*&cursor=([^"]+)"', listing.text)
+        if match is None:
+            break
+        cursor = unquote(match.group(1))
+    # 25 created + 1 seeded = 26 rows over 3 pages (10/10/6).
+    assert len(seen) == 26
+    assert len(set(seen)) == 26
 
 
 # --------------------------------------------------------------------------

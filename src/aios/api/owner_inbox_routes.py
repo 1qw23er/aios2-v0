@@ -269,15 +269,24 @@ def register_owner_inbox_routes(application: FastAPI) -> None:
     def owner_inbox_list(
         kind: str,
         ctx: str = Query(...),
+        page_size: int | None = Query(None),
+        cursor: str | None = Query(None),
         session: Session = Depends(get_session),
         actor: ActorContext = Depends(authenticate_owner),
     ) -> HTMLResponse:
-        """List one inbox for the project frozen inside ``ctx`` (a ``project_context``)."""
+        """List one page of one inbox for the project frozen inside ``ctx``.
+
+        Deterministic keyset pagination (contract #125): ``page_size`` is
+        clamped server-side and ``cursor`` is an opaque sealed next-page token
+        minted by the previous page -- it never carries a raw internal id.
+        """
         if kind not in INBOX_KINDS:
             return _untrusted_input()
         service = OwnerInboxService(session)
         try:
-            page = service.list_inbox(actor, ctx, kind)
+            page = service.list_inbox(
+                actor, ctx, kind, page_size=page_size, cursor_token=cursor
+            )
         except ServiceError as error:
             return _failure(error)
         return HTMLResponse(owner_inbox_page_html(page))

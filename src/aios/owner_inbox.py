@@ -101,6 +101,7 @@ TOKEN_TYPE_PROJECT_SELECT = "project_select"
 TOKEN_TYPE_PROJECT_CONTEXT = "project_context"
 TOKEN_TYPE_DETAIL_VIEW = "detail_view"
 TOKEN_TYPE_INBOX_ACTION = "inbox_action"
+TOKEN_TYPE_INBOX_CURSOR = "inbox_cursor"
 
 TOKEN_TYPES: frozenset[str] = frozenset(
     {
@@ -108,12 +109,20 @@ TOKEN_TYPES: frozenset[str] = frozenset(
         TOKEN_TYPE_PROJECT_CONTEXT,
         TOKEN_TYPE_DETAIL_VIEW,
         TOKEN_TYPE_INBOX_ACTION,
+        TOKEN_TYPE_INBOX_CURSOR,
     }
 )
 
 PURPOSE_PROJECT_SELECT = "project_select"
 PURPOSE_PROJECT_INBOX = "project_inbox"
 PURPOSE_VIEW_DETAIL = "view_detail"
+PURPOSE_INBOX_NEXT = "inbox_next"
+
+# §6 pagination contract (#125): deterministic keyset paging. A page request
+# without an explicit size is served at the default; anything above the hard
+# cap is clamped server-side -- an unbounded page is never honoured.
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 50
 
 # Endpoint identities are PATHS ONLY; the HTTP method is bound separately in
 # ``SchemaSpec.method`` so that PHASE 3 checks both independently.
@@ -659,6 +668,15 @@ _RESOURCE_REQUIRED = frozenset(
     {"operating_project", "resource_scope", "inbox", "kind", "rid", "purpose", "display_binding"}
 )
 _RESOURCE_FORBIDDEN = frozenset({"project_ref", "project_display_binding"})
+# Cursor claims pin the inbox and the last row's sort key. ``kind`` is
+# explicitly forbidden: a cursor's meaning is defined by (inbox, sort key)
+# alone, and a kind claim would invite cross-entity confusion (#125).
+_CURSOR_REQUIRED = frozenset(
+    {"operating_project", "resource_scope", "inbox", "purpose", "sort_ts", "sort_id"}
+)
+_CURSOR_FORBIDDEN = frozenset(
+    {"project_ref", "project_display_binding", "rid", "display_binding", "kind"}
+)
 
 SCHEMAS: dict[str, SchemaSpec] = {
     TOKEN_TYPE_PROJECT_SELECT: SchemaSpec(
@@ -688,6 +706,13 @@ SCHEMAS: dict[str, SchemaSpec] = {
         purposes=ACTION_PURPOSES,
         endpoint=ENDPOINT_INBOX_DECIDE,
         method="POST",
+    ),
+    TOKEN_TYPE_INBOX_CURSOR: SchemaSpec(
+        required=_CURSOR_REQUIRED,
+        forbidden=_CURSOR_FORBIDDEN,
+        purposes=frozenset({PURPOSE_INBOX_NEXT}),
+        endpoint=ENDPOINT_INBOX_LIST,
+        method="GET",
     ),
 }
 
@@ -856,6 +881,21 @@ def resolve_sealed_token(
     claim_kind = claims.get("kind")
     if claim_inbox not in INBOX_KINDS:
         raise _untrusted()
+
+    # Cursor claims carry no resource row (no rid / kind / binding); their
+    # identity is (inbox + sort key). ``sort_ts`` must be an ISO-8601
+    # timestamp; ``sort_id`` the opaque row id of the last item on the page.
+    if token_type == TOKEN_TYPE_INBOX_CURSOR:
+        if inbox is not None and claim_inbox != inbox:
+            raise _untrusted()
+        if not _is_str(claims.get("sort_ts")) or not _is_str(claims.get("sort_id")):
+            raise _untrusted()
+        if not _is_str(claims.get("operating_project")) or not _is_str(
+            claims.get("resource_scope")
+        ):
+            raise _untrusted()
+        return claims
+
     if claim_kind not in INBOX_RESOURCE_KINDS[str(claim_inbox)]:
         raise _untrusted()
     if inbox is not None and claim_inbox != inbox:
@@ -911,6 +951,9 @@ class InboxPage:
     project_label: str
     context_token: str
     items: list[InboxItem]
+    page_size: int = 0
+    has_more: bool = False
+    next_token: str | None = None
 
 
 @dataclass
@@ -956,6 +999,18 @@ def _preview(text: str | None) -> str:
 
 def _iso(value: datetime | None) -> str:
     return value.isoformat() if value is not None else ""
+
+
+def _parse_cursor_timestamp(raw: str) -> datetime:
+    """Parse the ISO-8601 sort timestamp carried by an inbox cursor (#125).
+
+    Unparseable timestamps are refused fail-closed -- a cursor must never be
+    repaired into a guess about where the last page ended.
+    """
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise _untrusted() from exc
 
 
 # --------------------------------------------------------------------------
@@ -1272,24 +1327,177 @@ class OwnerInboxService:
             ring=self.ring,
         )
 
-    # -- inbox listing (§6.1 - §6.4) ----------------------------------------
+    # -- inbox listing (§6.1 - §6.4, pagination contract #125) --------------
 
-    def list_inbox(self, actor: ActorContext, context_token: str, inbox: str) -> InboxPage:
+    @staticmethod
+    def _sort_key(inbox: str) -> str:
+        """Stable total-order sort column per inbox (#125).
+
+        ``Artifact`` (content / feedback) carries no ``updated_at`` column
+        (models.py), so those two inboxes sort on ``created_at``; customer
+        service and knowledge sort on ``updated_at``. In every case the row id
+        is the explicit tiebreaker, so equal timestamps never reorder between
+        requests.
+        """
+        if inbox in (INBOX_CONTENT, INBOX_FEEDBACK):
+            return "created_at"
+        return "updated_at"
+
+    @staticmethod
+    def _normalize_page_size(page_size: int | None) -> int:
+        """Deterministic page-size policy (#125): missing / non-positive sizes
+        resolve to the default; anything above the hard cap is clamped."""
+        if page_size is None or page_size <= 0:
+            return DEFAULT_PAGE_SIZE
+        return min(page_size, MAX_PAGE_SIZE)
+
+    @staticmethod
+    def _cursor_after(
+        row: Any, sort_field: str, cursor_ts: datetime, cursor_id: str
+    ) -> bool:
+        """Keyset comparison: strictly after ``(cursor_ts, cursor_id)`` (#125)."""
+        ts = getattr(row, sort_field)
+        if ts > cursor_ts:
+            return True
+        if ts < cursor_ts:
+            return False
+        return str(row.id) > cursor_id
+
+    def _snapshot(
+        self,
+        rows: list[Any],
+        inbox: str,
+        cursor: tuple[datetime, str] | None,
+        limit: int,
+    ) -> tuple[list[Any], bool]:
+        """Stable sort + keyset slice for one inbox (#125).
+
+        Returns ``(page_rows, has_more)`` where ``page_rows`` holds at most
+        ``limit`` rows and ``has_more`` reports whether rows remain. Rows
+        inserted after the cursor land on later pages; rows whose state leaves
+        the pending set simply stop being returned -- nothing is delivered
+        twice.
+        """
+        sort_field = self._sort_key(inbox)
+        ordered = sorted(rows, key=lambda row: (getattr(row, sort_field), str(row.id)))
+        if cursor is not None:
+            cursor_ts, cursor_id = cursor
+            ordered = [
+                row
+                for row in ordered
+                if self._cursor_after(row, sort_field, cursor_ts, cursor_id)
+            ]
+        page_rows = ordered[:limit]
+        return page_rows, len(ordered) > limit
+
+    def _mint_cursor_token(
+        self,
+        actor: ActorContext,
+        *,
+        operating_project: str,
+        scope: str,
+        inbox: str,
+        sort_ts: str,
+        sort_id: str,
+    ) -> str:
+        return seal_token(
+            {
+                "token_type": TOKEN_TYPE_INBOX_CURSOR,
+                "owner": actor.owner_id or "",
+                "operating_project": operating_project,
+                "resource_scope": scope,
+                "inbox": inbox,
+                "purpose": PURPOSE_INBOX_NEXT,
+                "sort_ts": sort_ts,
+                "sort_id": sort_id,
+            },
+            ring=self.ring,
+        )
+
+    def _resolve_cursor(
+        self, actor: ActorContext, cursor_token: str | None, inbox: str, project_id: str
+    ) -> tuple[datetime, str] | None:
+        """Resolve an opaque next-page cursor to ``(sort_ts, sort_id)`` (#125).
+
+        The sealed token is validated against the *requested* inbox (PHASE 3),
+        so a cursor minted for one inbox can never page another one. Its
+        ``operating_project`` / ``resource_scope`` claims must also equal the
+        project being listed: a cursor minted under project A must not be
+        replayed against project B's context token (which would silently skip
+        B rows and break the no-skip guarantee).
+        """
+        if cursor_token is None or cursor_token == "":
+            return None
+        claims = resolve_sealed_token(
+            cursor_token,
+            actor=actor,
+            endpoint=ENDPOINT_INBOX_LIST,
+            method="GET",
+            ring=self.ring,
+            inbox=inbox,
+        )
+        if not secrets.compare_digest(str(claims.get("operating_project")), project_id) or (
+            not secrets.compare_digest(str(claims.get("resource_scope")), project_id)
+        ):
+            raise _untrusted()
+        return _parse_cursor_timestamp(str(claims["sort_ts"])), str(claims["sort_id"])
+
+    def list_inbox(
+        self,
+        actor: ActorContext,
+        context_token: str,
+        inbox: str,
+        *,
+        page_size: int | None = None,
+        cursor_token: str | None = None,
+    ) -> InboxPage:
+        """One page of one inbox (pagination contract #125).
+
+        Deterministic keyset paging: a page is the slice of the stable total
+        order strictly after the sealed cursor (or the head of the list for the
+        first page), capped at the server-side maximum. ``has_more`` and the
+        opaque ``next_token`` define the owner-facing "下一页" semantics; an
+        empty page means no pending items; re-visiting a page re-evaluates the
+        cursor against live state so already-handled rows never reappear.
+        """
         project, ctx = self.resolve_project_context(actor, context_token, inbox)
+        limit = self._normalize_page_size(page_size)
+        cursor = self._resolve_cursor(actor, cursor_token, inbox, project.id)
         if inbox == INBOX_CONTENT:
-            items = self._content_items(actor, project)
+            items, has_more, last_row = self._content_items(
+                actor, project, limit=limit, cursor=cursor
+            )
         elif inbox == INBOX_CS:
-            items = self._cs_items(actor, project)
+            items, has_more, last_row = self._cs_items(
+                actor, project, limit=limit, cursor=cursor
+            )
         elif inbox == INBOX_FEEDBACK:
-            items = self._feedback_items(actor, project)
+            items, has_more, last_row = self._feedback_items(
+                actor, project, limit=limit, cursor=cursor
+            )
         else:
-            items = self._knowledge_items(actor, project)
+            items, has_more, last_row = self._knowledge_items(
+                actor, project, limit=limit, cursor=cursor
+            )
+        next_token = None
+        if has_more and last_row is not None:
+            next_token = self._mint_cursor_token(
+                actor,
+                operating_project=project.id,
+                scope=project.id,
+                inbox=inbox,
+                sort_ts=_iso(getattr(last_row, self._sort_key(inbox))),
+                sort_id=str(last_row.id),
+            )
         return InboxPage(
             inbox=inbox,
             title=INBOX_TITLES[inbox],
             project_label=project.name,
             context_token=ctx,
             items=items,
+            page_size=len(items),
+            has_more=has_more,
+            next_token=next_token,
         )
 
     @staticmethod
@@ -1310,14 +1518,22 @@ class OwnerInboxService:
             return [PURPOSE_CONTENT_EDIT_AND_RESUBMIT]
         return []
 
-    def _content_items(self, actor: ActorContext, project: Project) -> list[InboxItem]:
+    def _content_items(
+        self,
+        actor: ActorContext,
+        project: Project,
+        *,
+        limit: int,
+        cursor: tuple[datetime, str] | None,
+    ) -> tuple[list[InboxItem], bool, Any]:
         rows = self._content_rows(project.id)
         pending = [row for row in rows if row.review_status in CONTENT_PENDING_STATUSES]
+        page_rows, has_more = self._snapshot(pending, INBOX_CONTENT, cursor, limit)
         items: list[InboxItem] = []
         # ``Artifact`` has no ``updated_at`` column (models.py) -- an edit bumps
         # ``revision_count`` / ``checksum`` instead, which the display binding
         # already covers. Order (and show) the immutable ``created_at``.
-        for artifact in sorted(pending, key=lambda row: (row.created_at, row.id)):
+        for artifact in page_rows:
             metadata = dict(artifact.metadata_json or {})
             topic = str(metadata.get("topic") or "未命名内容")
             status_label = CONTENT_STATUS_LABELS.get(str(artifact.review_status), "待处理")
@@ -1340,7 +1556,7 @@ class OwnerInboxService:
                     updated_at=_iso(artifact.created_at),
                 )
             )
-        return items
+        return items, has_more, (page_rows[-1] if page_rows else None)
 
     def _pending_suggestion(self, conversation_id: str) -> CsSuggestion | None:
         rows = list(
@@ -1374,16 +1590,29 @@ class OwnerInboxService:
         decisions.append(PURPOSE_CS_CREATE_FOLLOWUP)
         return decisions
 
-    def _cs_items(self, actor: ActorContext, project: Project) -> list[InboxItem]:
+    def _cs_items(
+        self,
+        actor: ActorContext,
+        project: Project,
+        *,
+        limit: int,
+        cursor: tuple[datetime, str] | None,
+    ) -> tuple[list[InboxItem], bool, Any]:
         rows = list(
             self.session.exec(select(Conversation).where(Conversation.project_id == project.id))
         )
-        items: list[InboxItem] = []
-        for conversation in sorted(rows, key=lambda row: (row.updated_at, row.id)):
+        visible: list[Conversation] = []
+        for conversation in rows:
             pending = self._pending_suggestion(conversation.id)
             escalated = self._has_escalation(conversation.id)
             if pending is None and not escalated:
                 continue
+            visible.append(conversation)
+        page_rows, has_more = self._snapshot(visible, INBOX_CS, cursor, limit)
+        items: list[InboxItem] = []
+        for conversation in page_rows:
+            pending = self._pending_suggestion(conversation.id)
+            escalated = self._has_escalation(conversation.id)
             ref = conversation.customer_ref or f"{self._seq(rows, conversation.id)}"
             if pending is not None:
                 confidence = int(round((pending.confidence or 0.0) * 100))
@@ -1416,16 +1645,27 @@ class OwnerInboxService:
                     updated_at=_iso(conversation.updated_at),
                 )
             )
-        return items
+        return items, has_more, (page_rows[-1] if page_rows else None)
 
-    def _feedback_items(self, actor: ActorContext, project: Project) -> list[InboxItem]:
+    def _feedback_items(
+        self,
+        actor: ActorContext,
+        project: Project,
+        *,
+        limit: int,
+        cursor: tuple[datetime, str] | None,
+    ) -> tuple[list[InboxItem], bool, Any]:
         rows = self._feedback_rows(project.id)
+        awaiting = [
+            row
+            for row in rows
+            if dict(row.metadata_json or {}).get("stage") == FEEDBACK_AWAIT_OWNER_APPROVE
+        ]
+        page_rows, has_more = self._snapshot(awaiting, INBOX_FEEDBACK, cursor, limit)
         items: list[InboxItem] = []
         # Same as the content inbox: ``Artifact`` carries no ``updated_at``.
-        for artifact in sorted(rows, key=lambda row: (row.created_at, row.id)):
+        for artifact in page_rows:
             metadata = dict(artifact.metadata_json or {})
-            if metadata.get("stage") != FEEDBACK_AWAIT_OWNER_APPROVE:
-                continue
             items.append(
                 InboxItem(
                     token=self._mint_detail_token(
@@ -1451,7 +1691,7 @@ class OwnerInboxService:
                     updated_at=_iso(artifact.created_at),
                 )
             )
-        return items
+        return items, has_more, (page_rows[-1] if page_rows else None)
 
     @staticmethod
     def _candidate_decisions(
@@ -1465,69 +1705,103 @@ class OwnerInboxService:
             return [PURPOSE_KNOWLEDGE_CLASSIFY_CANDIDATE, PURPOSE_KNOWLEDGE_REJECT_CANDIDATE]
         return [PURPOSE_KNOWLEDGE_APPROVE_CANDIDATE, PURPOSE_KNOWLEDGE_REJECT_CANDIDATE]
 
-    def _knowledge_items(self, actor: ActorContext, project: Project) -> list[InboxItem]:
-        items: list[InboxItem] = []
+    def _knowledge_items(
+        self,
+        actor: ActorContext,
+        project: Project,
+        *,
+        limit: int,
+        cursor: tuple[datetime, str] | None,
+    ) -> tuple[list[InboxItem], bool, Any]:
         candidates = self._candidate_rows(project.id)
-        for candidate in sorted(candidates, key=lambda row: (row.updated_at, row.id)):
-            if candidate.status != KnowledgeCandidateStatus.DRAFT:
-                continue
-            scope = candidate.project_id or COMPANY_SCOPE
-            decisions = self._candidate_decisions(candidate, scope, project.id)
-            status_label = "需先分类" if is_legacy_unclassified(candidate.tags) else "待你审定"
-            if scope == COMPANY_SCOPE:
-                status_label = "公司级知识（只读）"
-            items.append(
-                InboxItem(
-                    token=self._mint_detail_token(
-                        actor,
-                        operating_project=project.id,
-                        scope=scope,
-                        inbox=INBOX_KNOWLEDGE,
-                        kind="candidate",
-                        rid=candidate.id,
-                        binding=knowledge_candidate_display_binding(
-                            candidate, self._head_version(candidate)
-                        ),
-                    ),
-                    business_label=f"知识候选：{_preview(candidate.statement)}",
-                    status_label=status_label,
-                    detail_ref=f"知识候选#{self._seq(candidates, candidate.id)}",
-                    preview=_preview(candidate.statement),
-                    decisions=decisions,
-                    updated_at=_iso(candidate.updated_at),
-                )
-            )
-
         facts = self._fact_rows(project.id)
+        # Unified pending snapshot: DRAFT candidates + APPROVED facts, sorted
+        # together on the knowledge inbox's stable key (updated_at, id).
+        unified: list[tuple[str, Any]] = [
+            ("candidate", candidate)
+            for candidate in candidates
+            if candidate.status == KnowledgeCandidateStatus.DRAFT
+        ]
+        unified.extend(
+            ("fact", fact) for fact in facts if fact.status == KnowledgeFactStatus.APPROVED
+        )
+        sort_field = self._sort_key(INBOX_KNOWLEDGE)
+        ordered = sorted(
+            unified, key=lambda item: (getattr(item[1], sort_field), str(item[1].id))
+        )
+        if cursor is not None:
+            cursor_ts, cursor_id = cursor
+            ordered = [
+                item
+                for item in ordered
+                if self._cursor_after(item[1], sort_field, cursor_ts, cursor_id)
+            ]
+        page_rows = ordered[:limit]
+        has_more = len(ordered) > limit
+        items: list[InboxItem] = []
         series_labels = self._series_labels(project.id)
-        for fact in sorted(facts, key=lambda row: (row.updated_at, row.id)):
-            if fact.status != KnowledgeFactStatus.APPROVED:
-                continue
-            scope = fact.project_id or COMPANY_SCOPE
-            decisions = [PURPOSE_KNOWLEDGE_DEACTIVATE_FACT] if scope == project.id else []
-            items.append(
-                InboxItem(
-                    token=self._mint_detail_token(
-                        actor,
-                        operating_project=project.id,
-                        scope=scope,
-                        inbox=INBOX_KNOWLEDGE,
-                        kind="fact",
-                        rid=fact.id,
-                        binding=knowledge_fact_display_binding(fact),
-                    ),
-                    business_label=(
-                        f"知识事实（{series_labels.get(fact.series_id, '系列')}）："
-                        f"{_preview(fact.statement)}"
-                    ),
-                    status_label="公司级知识（只读）" if scope == COMPANY_SCOPE else "待你停用",
-                    detail_ref=f"知识事实#{self._seq(facts, fact.id)}",
-                    preview=_preview(fact.statement),
-                    decisions=decisions,
-                    updated_at=_iso(fact.updated_at),
+        for kind, row in page_rows:
+            if kind == "candidate":
+                candidate = row
+                scope = candidate.project_id or COMPANY_SCOPE
+                decisions = self._candidate_decisions(candidate, scope, project.id)
+                status_label = (
+                    "需先分类"
+                    if is_legacy_unclassified(candidate.tags)
+                    else "待你审定"
                 )
-            )
-        return items
+                if scope == COMPANY_SCOPE:
+                    status_label = "公司级知识（只读）"
+                items.append(
+                    InboxItem(
+                        token=self._mint_detail_token(
+                            actor,
+                            operating_project=project.id,
+                            scope=scope,
+                            inbox=INBOX_KNOWLEDGE,
+                            kind="candidate",
+                            rid=candidate.id,
+                            binding=knowledge_candidate_display_binding(
+                                candidate, self._head_version(candidate)
+                            ),
+                        ),
+                        business_label=f"知识候选：{_preview(candidate.statement)}",
+                        status_label=status_label,
+                        detail_ref=f"知识候选#{self._seq(candidates, candidate.id)}",
+                        preview=_preview(candidate.statement),
+                        decisions=decisions,
+                        updated_at=_iso(candidate.updated_at),
+                    )
+                )
+            else:
+                fact = row
+                scope = fact.project_id or COMPANY_SCOPE
+                decisions = [PURPOSE_KNOWLEDGE_DEACTIVATE_FACT] if scope == project.id else []
+                items.append(
+                    InboxItem(
+                        token=self._mint_detail_token(
+                            actor,
+                            operating_project=project.id,
+                            scope=scope,
+                            inbox=INBOX_KNOWLEDGE,
+                            kind="fact",
+                            rid=fact.id,
+                            binding=knowledge_fact_display_binding(fact),
+                        ),
+                        business_label=(
+                            f"知识事实（{series_labels.get(fact.series_id, '系列')}）："
+                            f"{_preview(fact.statement)}"
+                        ),
+                        status_label=(
+                            "公司级知识（只读）" if scope == COMPANY_SCOPE else "待你停用"
+                        ),
+                        detail_ref=f"知识事实#{self._seq(facts, fact.id)}",
+                        preview=_preview(fact.statement),
+                        decisions=decisions,
+                        updated_at=_iso(fact.updated_at),
+                    )
+                )
+        return items, has_more, (page_rows[-1][1] if page_rows else None)
 
     # -- detail view (§2.1.2c) ----------------------------------------------
 

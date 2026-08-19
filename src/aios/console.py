@@ -1088,10 +1088,22 @@ def owner_inbox_page_html(
         for kind, title in OOL_INBOX_NAV
         if kind != page.inbox
     )
+    # Pagination (contract #125): only the *current page* size is shown -- the
+    # total count is never exposed (§8 no-leakage) -- and "下一页" carries the
+    # opaque sealed cursor from this page, never a raw internal id.
+    if page.has_more and page.next_token:
+        next_href = (
+            f"/owner/inboxes/{escape(page.inbox)}?ctx={ctx}"
+            f"&cursor={quote(page.next_token, safe='')}"
+        )
+        next_link = f'    <p class="pager"><a href="{next_href}">下一页</a></p>'
+    else:
+        next_link = ""
     body = f"""  <h1>{escape(page.project_label)} · {escape(page.title)}</h1>
-  <p class="sub">共 {len(page.items)} 条待办。</p>
+  <p class="sub">本页 {len(page.items)} 条待办。</p>
 {_ool_msg(error, "error")}{_ool_msg(message, "ok")}
 {cards}
+{next_link}
   <div class="card">
     <h2>其他待办</h2>
     <div class="nav">
