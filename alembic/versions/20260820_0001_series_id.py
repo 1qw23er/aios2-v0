@@ -21,7 +21,18 @@ Backfill (deterministic, restartable -- every statement is guarded by
 
 Fail-closed semantics: any row whose series cannot be derived keeps
 ``series_id = NULL`` and is treated as ungrouped by the owner surface; NULL is
-NEVER guessed into a group.
+NEVER guessed into a group. Consumers MUST group only on ``series_id IS NOT
+NULL`` rows -- a NULL series_id is a deliberate "ungrouped" sentinel, not a
+value to be coerced into any bucket. (Follow-up #3 / DSH audit.)
+
+Transaction boundary: ``run_migrations_online`` wraps the whole ``upgrade`` in
+a single ``context.begin_transaction()``, so all three ADD COLUMNs, the three
+CREATE INDEXes, and the three backfill UPDATEs apply atomically. If the
+migration is interrupted (process kill, connection drop), SQLite rolls back the
+entire transaction on the next restart and the migration re-runs from scratch
+-- there is no partial-head state to repair by hand. This is what makes the
+backfill safely "restartable" (every statement is NULL-guarded, see below).
+(Follow-up #6 / DSH audit.)
 
 Reversible: downgrade drops the three indexes + columns (single head kept).
 """

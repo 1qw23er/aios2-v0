@@ -438,6 +438,18 @@ class Artifact(SQLModel, table=True):
     idempotency_key: str | None = Field(default=None)
     created_at: datetime = Field(default_factory=now_utc)
 
+    # NOTE (PR #124 / Design B): ``series_id`` exists as a raw SQL column on the
+    # ``artifact`` table (added by migration 20260820_0001_series_id) but is
+    # DELIBERATELY NOT mapped here. Reasons:
+    #   * Mapping it would make SQLModel emit the column on every ORM flush
+    #     (SELECT/INSERT), which breaks the zero-external-side-effect contract
+    #     and the ``test_knowledge_models`` seed at the prior head.
+    #   * It is a *queryable* grouping key only -- never written via ORM. Writes
+    #     happen once, at backfill time, via raw SQL in the migration.
+    # Reads must go through raw SQL / ``getattr(row, "series_id", "")`` and never
+    # assume an ORM attribute exists. Do NOT add ``series_id`` here. (Follow-up
+    # #9 / DSH audit -- mapping-regression guard.)
+
 
 class DelegatedRun(SQLModel, table=True):
     """One remote execution of a task delegated to an external agent (#57).
@@ -724,6 +736,15 @@ class KnowledgeCandidate(SQLModel, table=True):
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
 
+    # NOTE (PR #124 / Design B): ``series_id`` exists as a raw SQL column on the
+    # ``knowledge_candidate`` table (added by migration 20260820_0001_series_id)
+    # but is DELIBERATELY NOT mapped here. It is a *queryable* grouping key only;
+    # the backfill inherits it from the source artifact via raw SQL. Never written
+    # via ORM. Reads go through raw SQL / ``getattr(row, "series_id", "")``.
+    # Do NOT add ``series_id`` here. (Follow-up #9 / DSH audit -- mapping-regression
+    # guard. Contrast with ``KnowledgeFact.series_id``, which IS mapped because it
+    # is a first-class, ORM-written grouping key.)
+
 
 class KnowledgeReviewDecision(SQLModel, table=True):
     __tablename__ = "knowledge_review_decision"
@@ -935,6 +956,14 @@ class CsSuggestion(SQLModel, table=True):
     )
     idempotency_key: str = Field(unique=True, index=True)
     created_at: datetime = Field(default_factory=now_utc)
+
+    # NOTE (PR #124 / Design B): ``series_id`` exists as a raw SQL column on the
+    # ``cs_suggestion`` table (added by migration 20260820_0001_series_id) but is
+    # DELIBERATELY NOT mapped here. It is a *queryable* grouping key only; the
+    # backfill derives it deterministically as ``'series:' || conversation_id``
+    # via raw SQL. Never written via ORM. Reads go through raw SQL /
+    # ``getattr(row, "series_id", "")``. Do NOT add ``series_id`` here.
+    # (Follow-up #9 / DSH audit -- mapping-regression guard.)
 
 
 # ---------------------------------------------------------------------------

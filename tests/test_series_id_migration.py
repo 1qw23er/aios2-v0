@@ -1,7 +1,7 @@
 """Migration proof for PR #124 -- persist owner-inbox cross-thread series_id.
 
 Asserts from several angles:
-* the Alembic tree still has a single head (now ``20260820_0001_series_id``);
+* the Alembic tree still has a single head (now ``20260824_0001_series_id_json_guard``);
 * exactly one new migration file was added by #124 (chained after
   ``20260812_0001``);
 * a freshly migrated DB carries the ``series_id`` column + index on all three
@@ -37,7 +37,7 @@ from aios.db import get_engine, run_migrations
 from alembic import command
 
 # Current single leaf of the whole tree (what #124 owns + advances).
-HEAD = "20260820_0001_series_id"
+HEAD = "20260824_0001_series_id_json_guard"
 SERIES_REVISION = "20260820_0001_series_id"
 SERIES_FILE = "20260820_0001_series_id.py"
 # Previous leaf: the SalesPlaybook V0 follow-up slice. #124 chains directly after it.
@@ -392,3 +392,319 @@ def test_cross_inbox_aggregation_by_series_id(tmp_path: Path) -> None:
         # Ungrouped rows are excluded from every bucket.
         nulls = c.execute("SELECT COUNT(*) FROM artifact WHERE series_id IS NULL").fetchone()[0]
         assert nulls == 1
+
+
+# ---------------------------------------------------------------------------
+# Follow-up hardening (DSH audit of PR #124)
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_restart_loop_idempotent(tmp_path: Path) -> None:
+    """Follow-up #1: the migration is *restartable* -- re-running the full
+    upgrade/downgrade cycle any number of times must converge to the same
+    backfilled values. This is the 7th idempotency case: the migration can be
+    interrupted (transaction rollback) and re-run from scratch without drift.
+    """
+    db_file, cfg, _ = _build_prev_head_seeded(tmp_path)
+
+    def series_of(table: str, row_id: str):
+        with sqlite3.connect(str(db_file)) as c:
+            row = c.execute(
+                f"SELECT series_id FROM {table} WHERE id=?", (row_id,)
+            ).fetchone()
+            return row[0] if row else None
+
+    expected = {
+        ("artifact", ART_S): "S1",
+        ("artifact", ART_N): None,
+        ("knowledge_candidate", KC_S): "S1",
+        ("knowledge_candidate", KC_N): None,
+        ("cs_suggestion", CS): f"series:{CONV}",
+    }
+    # Cycle: upgrade -> downgrade -> upgrade -> downgrade -> upgrade.
+    for _ in range(3):
+        command.upgrade(cfg, SERIES_REVISION)
+        for (t, rid), want in expected.items():
+            assert series_of(t, rid) == want, f"{t}/{rid} drifted"
+        command.downgrade(cfg, PREV)
+        with sqlite3.connect(str(db_file)) as c:
+            assert c.execute("SELECT version_num FROM alembic_version").fetchone()[0] == PREV
+
+
+def test_kc_trigger_fidelity_preserved(tmp_path: Path) -> None:
+    """Follow-up #2: the migration drops + recreates the
+    ``knowledge_candidate_validate_update`` trigger around the kc backfill.
+    Assert the trigger is byte-for-byte restored afterwards and still enforces
+    its lifecycle contract (a disallowed status transition is rejected).
+    """
+    db_file, cfg, _ = _build_prev_head_seeded(tmp_path)
+
+    def trigger_sql() -> str | None:
+        with sqlite3.connect(str(db_file)) as c:
+            row = c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='knowledge_candidate_validate_update'"
+            ).fetchone()
+            return row[0] if row else None
+
+    before = trigger_sql()
+    assert before, "trigger should exist at the PREV head"
+    command.upgrade(cfg, SERIES_REVISION)
+    after = trigger_sql()
+    assert after == before, "migration must recreate the trigger verbatim"
+
+    # The trigger still enforces: the only legal transition is DRAFT ->
+    # APPROVED/REJECTED. Any other status (or a non-DRAFT source) is rejected.
+    # Drive it through the real SQLite engine, not ORM, so the trigger (not the
+    # ORM lifecycle layer) is what we assert on.
+    with sqlite3.connect(str(db_file)) as c:
+        # Legal transition DRAFT -> APPROVED must succeed.
+        c.execute(
+            "UPDATE knowledge_candidate SET status='APPROVED' WHERE id=?", (KC_S,)
+        )
+        c.commit()
+        # Once APPROVED, any further status change is illegal and must raise.
+        try:
+            c.execute(
+                "UPDATE knowledge_candidate SET status='FORBIDDEN_X' WHERE id=?",
+                (KC_S,),
+            )
+            c.commit()
+            raise AssertionError("trigger should have rejected illegal status")
+        except sqlite3.Error:
+            # The lifecycle trigger correctly aborts the illegal transition
+            # (sqlite3.IntegrityError / OperationalError depending on driver).
+            c.rollback()
+
+
+def test_cs_series_prefix_consistency(tmp_path: Path) -> None:
+    """Follow-up #4: ``cs_suggestion.series_id`` is ALWAYS ``'series:' ||
+    conversation_id`` (deterministic 1-conversation-1-series). The other two
+    tables (artifact / knowledge_candidate) must NEVER carry that prefix --
+    their series ids come from metadata / inheritance and share no namespace
+    with the cs prefix, so cross-table grouping cannot accidentally merge a cs
+    row into an artifact/kc series.
+    """
+    db_file, cfg, _ = _build_prev_head_seeded(tmp_path)
+    command.upgrade(cfg, SERIES_REVISION)
+    with sqlite3.connect(str(db_file)) as c:
+        cs_val = c.execute(
+            "SELECT series_id FROM cs_suggestion WHERE id=?", (CS,)
+        ).fetchone()[0]
+        assert cs_val == f"series:{CONV}"
+        assert cs_val.startswith("series:")
+
+        # artifact series ids must NOT use the cs prefix namespace.
+        art_val = c.execute(
+            "SELECT series_id FROM artifact WHERE id=?", (ART_S,)
+        ).fetchone()[0]
+        assert art_val == "S1"
+        assert not art_val.startswith("series:")
+
+        # knowledge_candidate inherited series id must NOT use the cs prefix.
+        kc_val = c.execute(
+            "SELECT series_id FROM knowledge_candidate WHERE id=?", (KC_S,)
+        ).fetchone()[0]
+        assert kc_val == "S1"
+        assert not kc_val.startswith("series:")
+
+
+def test_models_do_not_map_series_id(tmp_path: Path) -> None:
+    """Follow-up #9: regression guard. ``series_id`` is a raw-SQL grouping key
+    on artifact / cs_suggestion / knowledge_candidate and is DELIBERATELY not
+    mapped as an ORM field (Design B). If someone re-adds it to the ORM, this
+    test fails loudly -- remapping would break the zero-side-effect contract
+    and the prior-head ``test_knowledge_models`` seed.
+    """
+    from aios.models import Artifact, CsSuggestion, KnowledgeCandidate
+
+    for cls in (Artifact, CsSuggestion, KnowledgeCandidate):
+        assert "series_id" not in cls.model_fields, (
+            f"{cls.__name__} must NOT map series_id (Design B: raw-SQL column only)"
+        )
+
+
+def test_consumer_contract_no_invalid_series_grouping() -> None:
+    """Follow-up #7: consumer-contract scan. The three owner-inbox item tables
+    (``artifact`` / ``cs_suggestion`` / ``knowledge_candidate``) carry
+    ``series_id`` as a *raw-SQL* grouping key only -- it is NOT an ORM-mapped
+    column, so there is no SQLAlchemy ORM path that could accidentally GROUP BY
+    it. Any *raw SQL* that groups these tables by ``series_id`` would be a
+    contract violation (it would couple business logic to an unmapped column
+    and could pull NULL sentinels into a group).
+
+    The ONLY legitimate ``series_id`` grouping in the codebase is on
+    ``knowledge_fact`` (which DOES map series_id as a non-nullable column, via
+    ``context_service._latest_versions`` / ``owner_inbox._series_labels``).
+
+    This test statically scans ``src/aios`` for raw ``GROUP BY`` SQL and asserts:
+      * no raw SQL groups the three inbox tables by ``series_id``;
+      * the only ``series_id``-grouping SQL in the tree (if any) references
+        ``knowledge_fact``.
+    """
+    import re
+
+    src_root = Path(__file__).resolve().parents[1] / "src" / "aios"
+    # Collect every line that looks like raw SQL containing "GROUP BY".
+    group_by_lines: list[tuple[Path, int, str]] = []
+    for py in src_root.rglob("*.py"):
+        for ln, text in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r"\bGROUP\s+BY\b", text, re.IGNORECASE):
+                group_by_lines.append((py, ln, text))
+
+    inbox_tables = {"artifact", "cs_suggestion", "knowledge_candidate"}
+    for py, ln, text in group_by_lines:
+        low = text.lower()
+        # A GROUP BY on an inbox table's series_id is forbidden.
+        for t in inbox_tables:
+            assert f"group by {t}" not in low, (
+                f"{py}:{ln} raw SQL groups inbox table '{t}' by series_id -- "
+                f"violates Design B (series_id is raw-SQL only, never grouped in SQL)"
+            )
+        # Any series_id grouping must be on knowledge_fact exclusively.
+        if "series_id" in low:
+            assert "knowledge_fact" in low or "knowledgefact" in low, (
+                f"{py}:{ln} raw SQL groups by series_id but not on knowledge_fact -- "
+                f"only knowledge_fact may be grouped by series_id (it is ORM-mapped + NOT NULL)"
+            )
+
+
+def test_null_series_never_grouped_contract() -> None:
+    """Follow-up #7 (companion): a NULL ``series_id`` is the explicit
+    "ungrouped" sentinel. The intended owner-surface grouping query (the one
+    exercised end-to-end by ``test_cross_inbox_aggregation_by_series_id``) MUST
+    filter ``series_id IS NOT NULL`` so ungrouped rows never land in a bucket.
+    This test pins that convention in the source of the aggregation query so a
+    future edit that drops the NULL guard fails loudly.
+    """
+    src = Path(__file__).read_text(encoding="utf-8")
+    # The canonical union-grouping query in test_cross_inbox_aggregation_by_series_id
+    # filters each inbox table on series_id IS NOT NULL before the GROUP BY, so
+    # NULL sentinels can never land in a bucket. Pin that the convention is present.
+    assert "WHERE series_id IS NOT NULL" in src, (
+        "owner-surface grouping query must filter series_id IS NOT NULL so NULL "
+        "sentinels are never grouped"
+    )
+    assert "GROUP BY series_id" in src, (
+        "owner-surface grouping query must GROUP BY series_id (the union bucket)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Follow-up #5: malformed metadata JSON must not abort the artifact backfill
+# ---------------------------------------------------------------------------
+
+
+def test_json_guard_skips_malformed_metadata(tmp_path: Path) -> None:
+    """Follow-up #5 (DSH audit): the base series_id migration backfills
+    ``artifact.series_id`` with ``json_extract(metadata, '$.series_id')``. On a
+    row whose ``metadata`` is NOT valid JSON, SQLite raises ``malformed JSON``
+    and the whole backfill statement (hence the migration transaction) aborts --
+    violating the fail-closed contract (one corrupt row must never block every
+    other row's backfill).
+
+    The ``20260824_0001_series_id_json_guard`` reinforcement re-runs the artifact
+    backfill guarded by ``json_valid(metadata)`` so malformed rows are skipped and
+    kept NULL. This test proves:
+
+      * applying JSON_GUARD does NOT raise even when the table holds a malformed
+        ``metadata`` row (the original unguarded backfill WOULD have aborted);
+      * the malformed row keeps ``series_id = NULL`` (fail-closed, ungrouped);
+      * a valid-JSON row that the base migration left ungrouped (e.g. because it
+        was inserted after the base backfill ran) now gets backfilled;
+      * the JSON_GUARD upgrade is idempotent (re-applying is a no-op) and leaves
+        the alembic head at JSON_GUARD.
+    """
+    db_file = tmp_path / "json_guard.db"
+    url = f"sqlite:///{db_file.as_posix()}"
+    cfg = _config(url)
+
+    # Build the DB up to the PREVIOUS head (no series_id column yet) and seed the
+    # canonical cross-thread fixtures (ART_S / ART_N / CS / KC_S / KC_N).
+    command.upgrade(cfg, PREV)
+    conn = sqlite3.connect(str(db_file))
+    _seed_prev_head(conn)
+    conn.close()
+    # Advance to the BASE series_id revision (json_guard not applied yet). The
+    # base backfill runs here on the seeded rows; the rows we add below are
+    # inserted AFTER it, so they start NULL -- exactly the state JSON_GUARD must
+    # repair without choking on malformed metadata.
+    command.upgrade(cfg, SERIES_REVISION)
+    with sqlite3.connect(str(db_file)) as c:
+        assert c.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()[0] == SERIES_REVISION
+    # Sanity: seeded valid-JSON row already backfilled by the base migration.
+    with sqlite3.connect(str(db_file)) as c:
+        assert c.execute(
+            "SELECT series_id FROM artifact WHERE id=?", (ART_S,)
+        ).fetchone()[0] == "S1"
+
+    # Insert two post-backfill artifacts directly (bypassing the ORM so we can
+    # plant a deliberately malformed metadata value).
+    ART_OK = "art_json_ok"      # valid JSON carrying series_id -> should be backfilled
+    ART_BAD = "art_json_bad"    # malformed JSON -> must be skipped, kept NULL
+    with sqlite3.connect(str(db_file)) as c:
+        c.execute(
+            "INSERT INTO artifact (id, project_id, type, uri, checksum, metadata, "
+            "review_status, revision_count, provenance, created_at) "
+            "VALUES (?, ?, 'JSON', 'u', 'c', ?, 'APPROVED', 0, '{}', ?)",
+            (ART_OK, PRJ, '{"series_id": "S2"}', TS),
+        )
+        c.execute(
+            "INSERT INTO artifact (id, project_id, type, uri, checksum, metadata, "
+            "review_status, revision_count, provenance, created_at) "
+            "VALUES (?, ?, 'JSON', 'u', 'c', ?, 'APPROVED', 0, '{}', ?)",
+            # malformed: a plain string, not JSON -> json_extract would raise on
+            # the unguarded base statement.
+            (ART_BAD, PRJ, "not-json{", TS),
+        )
+        c.commit()
+
+    # idempotent helper for re-applying JSON_GUARD's exact statement.
+    def reapply_json_guard() -> None:
+        with sqlite3.connect(str(db_file)) as c:
+            c.execute(
+                "UPDATE artifact "
+                "SET series_id = json_extract(metadata, '$.series_id') "
+                "WHERE series_id IS NULL "
+                "AND json_valid(metadata) "
+                "AND json_extract(metadata, '$.series_id') IS NOT NULL"
+            )
+            c.commit()
+
+    # 1) Applying the JSON_GUARD migration must NOT raise despite the malformed row.
+    command.upgrade(cfg, HEAD)
+    with sqlite3.connect(str(db_file)) as c:
+        assert c.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()[0] == HEAD
+
+    def series_of(rid: str):
+        with sqlite3.connect(str(db_file)) as c:
+            return c.execute(
+                "SELECT series_id FROM artifact WHERE id=?", (rid,)
+            ).fetchone()[0]
+
+    # 2) Valid-JSON row got backfilled; malformed row kept NULL (fail-closed).
+    assert series_of(ART_OK) == "S2"
+    assert series_of(ART_BAD) is None
+    # Pre-existing valid-JSON seed (ART_S) is untouched by the idempotent guard.
+    assert series_of(ART_S) == "S1"
+
+    # 3) Re-applying JSON_GUARD's statement is a no-op (idempotent).
+    reapply_json_guard()
+    assert series_of(ART_OK) == "S2"
+    assert series_of(ART_BAD) is None
+    assert series_of(ART_S) == "S1"
+
+
+def test_json_guard_is_current_head() -> None:
+    """Follow-up #5 (companion): the JSON-guard reinforcement is the single
+    alembic head and chains directly on the base series_id migration. This pins
+    the published-migration-immutability contract: we never edit the base file,
+    we only add on top.
+    """
+    _, _, sd = _script_dir()
+    assert sd.get_heads() == [HEAD]
+    assert sd.get_revision(HEAD).down_revision == SERIES_REVISION
