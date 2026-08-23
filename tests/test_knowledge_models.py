@@ -167,7 +167,7 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     # return to the current head (#109 customer-service workflow slice
     # 20260731_0001, then the SalesPlaybook V0 slice 20260812_0001, extend the
     # chain past the #103 secret-store slice).
-    assert revision() == "20260812_0001"
+    assert revision() == "20260820_0001_series_id"
 
 
 def test_scope_unique_migration_round_trip(tmp_path: Path) -> None:

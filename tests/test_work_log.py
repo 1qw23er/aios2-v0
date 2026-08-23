@@ -51,7 +51,7 @@ from aios.work_log import (
 )
 from alembic import command
 
-HEAD = "20260812_0001"
+HEAD = "20260820_0001_series_id"
 PREV = "20260727_0008"
 # Newest revision a downgrade may still start from. Head (20260812_0001,
 # SalesPlaybook V0) is a deliberate one-way door: its ``downgrade()`` raises
