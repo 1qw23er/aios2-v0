@@ -37,6 +37,12 @@ Design note (follow-up #5 / DSH audit):
   ``conversation_id`` (never JSON) and ``knowledge_candidate.series_id`` is
   inherited from ``artifact.series_id`` (never parsed from JSON), so neither can
   raise ``malformed JSON``.
+* Follow-up #2 (DSH audit) -- ``AND`` evaluation-order dependency: SQLite
+  short-circuits ``AND`` left-to-right, so ``json_valid(metadata)`` MUST precede
+  ``json_extract(metadata, '$.series_id')`` in the WHERE chain; otherwise SQLite
+  may evaluate ``json_extract`` on a malformed value and raise ``malformed
+  JSON``. The order-independent, fully safe form (prefer for any future reuse)
+  is ``CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.series_id') END``.
 * No column/index changes -- this migration only repairs data, so downgrade is a
   deliberate no-op (we must not silently *drop* backfilled series_ids that a
   re-run of the base migration would re-derive; the data is now authoritative).
@@ -60,6 +66,11 @@ def upgrade() -> None:
     # Re-run the artifact backfill, but only on rows whose metadata is valid
     # JSON. Malformed rows are skipped and kept NULL (fail-closed). The
     # NULL-guard makes this idempotent with the base migration.
+    # NOTE (follow-up #2): ``json_valid(metadata)`` sits BEFORE
+    # ``json_extract(...)`` so SQLite's left-to-right ``AND`` short-circuit never
+    # evaluates ``json_extract`` on a malformed value. Prefer the order-independent
+    # ``CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.series_id') END``
+    # form if this predicate is ever copy-pasted into a new migration.
     op.execute(
         "UPDATE artifact "
         "SET series_id = json_extract(metadata, '$.series_id') "

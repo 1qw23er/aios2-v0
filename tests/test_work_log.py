@@ -53,10 +53,15 @@ from alembic import command
 
 HEAD = "20260824_0001_series_id_json_guard"
 PREV = "20260727_0008"
-# Newest revision a downgrade may still start from. Head (20260812_0001,
-# SalesPlaybook V0) is a deliberate one-way door: its ``downgrade()`` raises
-# unconditionally, so any leg that walks the chain backwards must start at its
-# predecessor. Upgrading all the way to HEAD is still asserted below.
+# Lowest revision these ORM-seeding tests upgrade to. The migrations above it
+# form a chain of one-way doors:
+#   * 20260810_0001 (SalesPlaybook V0)            -> downgrade() raises unconditionally
+#   * 20260812_0001 (cs_suggestion evidence flag) -> downgrade() raises unconditionally
+#   * 20260820_0001 (series_id)                   -> downgrade() DROPs the column (data-losing)
+#   * 20260824_0001 (series_id_json_guard, head)  -> downgrade() is a deliberate no-op pass
+# The two ``raise``-on-downgrade revisions (20260810, 20260812) are the genuine
+# one-way doors; the head is NOT (its downgrade is a no-op). This floor already
+# carries every column the ORM models below depend on.
 LAST_DOWNGRADABLE = "20260731_0001"
 
 

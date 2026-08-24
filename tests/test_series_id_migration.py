@@ -545,28 +545,35 @@ def test_consumer_contract_no_invalid_series_grouping() -> None:
     import re
 
     src_root = Path(__file__).resolve().parents[1] / "src" / "aios"
-    # Collect every line that looks like raw SQL containing "GROUP BY".
-    group_by_lines: list[tuple[Path, int, str]] = []
-    for py in src_root.rglob("*.py"):
-        for ln, text in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
-            if re.search(r"\bGROUP\s+BY\b", text, re.IGNORECASE):
-                group_by_lines.append((py, ln, text))
-
+    # Hardened scan (follow-up #3, DSH audit): a ``GROUP BY`` split across
+    # multiple physical lines -- e.g. two adjacent string literals
+    # ``"FROM artifact " "GROUP BY series_id"`` -- must NOT evade the check.
+    # We collapse all intra-statement whitespace (newlines included) BEFORE
+    # matching so a multi-line literal becomes one logical SQL string, then we
+    # split into statements on ';' and re-scan each flattened statement.
     inbox_tables = {"artifact", "cs_suggestion", "knowledge_candidate"}
-    for py, ln, text in group_by_lines:
-        low = text.lower()
-        # A GROUP BY on an inbox table's series_id is forbidden.
-        for t in inbox_tables:
-            assert f"group by {t}" not in low, (
-                f"{py}:{ln} raw SQL groups inbox table '{t}' by series_id -- "
-                f"violates Design B (series_id is raw-SQL only, never grouped in SQL)"
-            )
-        # Any series_id grouping must be on knowledge_fact exclusively.
-        if "series_id" in low:
-            assert "knowledge_fact" in low or "knowledgefact" in low, (
-                f"{py}:{ln} raw SQL groups by series_id but not on knowledge_fact -- "
-                f"only knowledge_fact may be grouped by series_id (it is ORM-mapped + NOT NULL)"
-            )
+    for py in src_root.rglob("*.py"):
+        text = py.read_text(encoding="utf-8")
+        for stmt in text.split(";"):
+            flat = re.sub(r"\s+", " ", stmt).lower()
+            if "group by" not in flat:
+                continue
+            # (A) A GROUP BY on an inbox table's series_id is forbidden.
+            for t in inbox_tables:
+                assert f"group by {t}" not in flat, (
+                    f"{py} raw SQL groups inbox table '{t}' by series_id -- "
+                    f"violates Design B (series_id is raw-SQL only, never grouped in SQL)"
+                )
+            # (B) Any series_id grouping must be on knowledge_fact exclusively.
+            # This is what catches the cross-line evasion: after flattening,
+            # "FROM artifact GROUP BY series_id" carries both 'series_id' and
+            # 'group by' but no 'knowledge_fact', so it fails here.
+            if "series_id" in flat:
+                assert "knowledge_fact" in flat or "knowledgefact" in flat, (
+                    f"{py} raw SQL groups by series_id but not on knowledge_fact -- "
+                    f"only knowledge_fact may be grouped by series_id "
+                    f"(it is ORM-mapped + NOT NULL)"
+                )
 
 
 def test_null_series_never_grouped_contract() -> None:

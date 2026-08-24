@@ -15,7 +15,7 @@ from sqlmodel import Session, text
 from aios.db import get_engine
 from alembic import command
 
-HEAD = "20260720_0005"
+SLICE_HEAD = "20260720_0005"
 BASE = "20260719_0003"
 SENTINEL = "__legacy_unclassified__"
 
@@ -53,7 +53,7 @@ def test_migration_round_trip_0003_0005_0003(tmp_path) -> None:
         assert "reviewer_kind" not in _columns(session, "knowledge_review_decision")
 
     # Upgrade to the slice head (0005): columns + augmented triggers appear.
-    command.upgrade(cfg, HEAD)
+    command.upgrade(cfg, SLICE_HEAD)
     with Session(engine) as session:
         cols = _columns(session, "knowledge_fact")
         assert "tags" in cols
@@ -80,7 +80,7 @@ def test_migration_round_trip_0003_0005_0003(tmp_path) -> None:
         assert "knowledge_review_validate_insert" not in _triggers(session)
 
     # Re-upgrade to 0005: idempotent re-application works (round-trip complete).
-    command.upgrade(cfg, HEAD)
+    command.upgrade(cfg, SLICE_HEAD)
     with Session(engine) as session:
         assert "tags" in _columns(session, "knowledge_fact")
         assert "knowledge_review_validate_insert" in _triggers(session)
@@ -94,7 +94,7 @@ def test_backfill_sentinel_is_json_safe(tmp_path) -> None:
     """
     url = f"sqlite:///{(tmp_path / 'kp_backfill.db').as_posix()}"
     cfg = _config(url)
-    command.upgrade(cfg, HEAD)
+    command.upgrade(cfg, SLICE_HEAD)
     engine = get_engine(url)
 
     with Session(engine) as session:
