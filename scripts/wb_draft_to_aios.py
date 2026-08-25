@@ -37,9 +37,11 @@ import sys
 from pathlib import Path
 
 from aios.actor import resolve_agent_actor
+from aios.agent_registry import get_agent
 from aios.attribution import build_aimi_signup_url
 from aios.content_draft import DEFAULT_SERIES_ID, ContentDraftService
 from aios.db import make_session
+from aios.known_agents import WORKBUDDY_AGENT_ID
 
 
 def _parse_ae_sections(text: str) -> dict[str, str]:
@@ -116,14 +118,15 @@ def create_draft(
     session = make_session()
     try:
         svc = ContentDraftService(session)
-        # Trust boundary (LOCAL CLI ONLY): we hardcode the agent identity here and
-        # do NOT route through the Agent Interop Gateway, so no registry
-        # re-validation of "workbuddy" occurs. This is acceptable ONLY because the
-        # trusted party is the operator running this script, never an external /
-        # gateway request. Do not reuse this path from any untrusted context --
-        # the gateway's resolve_agent_actor already guarantees a registry-validated
-        # agent_id.
-        actor = resolve_agent_actor("workbuddy", project_id)
+        # Registry-validated identity (fail-closed): confirm WORKBUDDY_AGENT_ID
+        # ("workbuddy") exists in the Agent registry before minting an agent
+        # actor. This upgrades the previously free-text identity into a
+        # registry-backed one; get_agent raises ServiceError(404) if the row is
+        # absent, so an unseeded or tampered registry refuses to produce a draft.
+        # The LOCAL CLI trust boundary still holds -- only the operator running
+        # this script reaches this path, never an external / gateway request.
+        get_agent(session, WORKBUDDY_AGENT_ID)
+        actor = resolve_agent_actor(WORKBUDDY_AGENT_ID, project_id)
         artifact = svc.create_content_draft(
             project_id=project_id,
             actor=actor,

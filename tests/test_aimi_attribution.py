@@ -29,6 +29,7 @@ from aios.attribution import (
 )
 from aios.audit import AuditLog
 from aios.db import get_engine
+from aios.known_agents import seed_known_agents
 from aios.models import Artifact, ArtifactType, Project, ProjectStatus
 
 PROJECT_ID = "proj_test_aimi_attr"
@@ -62,6 +63,8 @@ def db_url(tmp_path: Path, monkeypatch) -> str:
             )
         )
         s.commit()
+    with Session(engine) as s:
+        seed_known_agents(s)
     yield url
     # Dispose the pooled connections so Windows releases the sqlite file locks
     # (WAL/SHM siblings) and pytest's tmp_path cleanup can delete the temp DB.
