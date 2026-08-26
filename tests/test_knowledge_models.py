@@ -27,7 +27,7 @@ from alembic import command
 #   * 20260810_0001 (SalesPlaybook V0)            -> downgrade() raises unconditionally
 #   * 20260812_0001 (cs_suggestion evidence flag) -> downgrade() raises unconditionally
 #   * 20260820_0001 (series_id)                   -> downgrade() DROPs the column (data-losing)
-#   * 20260824_0001 (series_id_json_guard, head)  -> downgrade() is a deliberate no-op pass
+#   * 20260824_0001 (series_id_json_guard, former head)  -> downgrade() is a deliberate no-op pass
 # The two ``raise``-on-downgrade revisions (20260810, 20260812) are the genuine
 # one-way doors; the head is NOT (its downgrade is a no-op). This floor already
 # carries every column the ORM models below depend on.
@@ -170,8 +170,9 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     # prove the knowledge migrations; this final step only confirms we can
     # return to the current head (#109 customer-service workflow slice
     # 20260731_0001, then the SalesPlaybook V0 slice 20260812_0001, extend the
-    # chain past the #103 secret-store slice).
-    assert revision() == "20260824_0001_series_id_json_guard"
+    # chain past the #103 secret-store slice, and the Workforce Management W1
+    # core slice (#gap-2 W1): 20260825_0001_workforce_core.
+    assert revision() == "20260825_0001_workforce_core"
 
 
 def test_scope_unique_migration_round_trip(tmp_path: Path) -> None:

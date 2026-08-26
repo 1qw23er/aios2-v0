@@ -26,7 +26,7 @@ from precheck_series_id_metadata import (  # noqa: E402
     run_precheck,
 )
 
-HEAD = "20260824_0001_series_id_json_guard"
+HEAD = "20260825_0001_workforce_core"
 
 
 def _config(url: str) -> Config:
