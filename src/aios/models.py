@@ -1346,3 +1346,165 @@ class CsSuggestionSalesEvidence(SQLModel, table=True):
         ),
         CheckConstraint("rank >= 0", name="ck_ssev_rank_non_negative"),
     )
+
+
+# ===========================================================================
+# Workforce Management -- W1 core entities (V1.1 Workforce Architecture Proposal)
+# ---------------------------------------------------------------------------
+# Scope boundary (explicit, enforced by design -- see V1.1 §Explicit Non-Goals):
+#   * These 5 entities implement the minimum closed loop
+#     "business goal -> required work -> job -> job version -> capability
+#     requirement". They are *definition-time* objects only.
+#   * Candidate / Evaluation / Match / Trial / Employee and the
+#     Hire/Replace/Terminate/Promote/Transfer approvals are INTENTIONALLY out of
+#     scope for W1 (W2+). No speculative columns/tables/fields for them are added.
+#   * CapabilityRequirement references the Alpha-1 Capability SSoT ONLY (by
+#     capability.id). A second capability vocabulary is NEVER created here.
+#   * Agent / Capability / Task / Project / Scheduler / Budget / Knowledge /
+#     Context are NOT modified by W1.
+#   * Job is the first-class citizen of the Workforce domain: RequiredWork,
+#     JobVersion and CapabilityRequirement all hang off Job.
+#   * JobVersion is an immutable snapshot. Every change to a job's title/role or
+#     required capabilities mints a new JobVersion, giving full historical
+#     traceability of *what the role demanded at any point in time*.
+# ===========================================================================
+
+
+class BusinessGoalStatus(StrEnum):
+    PROPOSED = "proposed"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    ACHIEVED = "achieved"
+    ABANDONED = "abandoned"
+
+
+class RequiredWorkStatus(StrEnum):
+    PROPOSED = "proposed"
+    PLANNED = "planned"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+    CANCELLED = "cancelled"
+
+
+class JobStatus(StrEnum):
+    OPEN = "open"
+    FILLED = "filled"  # a candidate has been appointed to this job (W2+)
+    CLOSED = "closed"
+    ON_HOLD = "on_hold"
+
+
+class BusinessGoal(SQLModel, table=True):
+    """Root of the workforce planning chain -- a single owner's business objective.
+
+    The owner is anchored here (single-owner model: there is no Company table).
+    Everything else in the W1 chain descends from a BusinessGoal.
+    """
+
+    __tablename__ = "business_goal"
+
+    id: str = Field(default_factory=lambda: new_id("biz"), primary_key=True)
+    owner: str = Field(default="human_ceo")
+    title: str
+    description: str = ""
+    # What "done" looks like for this goal -- used to derive RequiredWork later.
+    target_outcome: str = ""
+    status: BusinessGoalStatus = Field(default=BusinessGoalStatus.PROPOSED)
+    priority: int = Field(default=50, ge=0, le=100)
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class RequiredWork(SQLModel, table=True):
+    """A unit of work needed to serve a BusinessGoal (one goal -> many required works)."""
+
+    __tablename__ = "required_work"
+
+    id: str = Field(default_factory=lambda: new_id("req"), primary_key=True)
+    business_goal_id: str = Field(
+        foreign_key="business_goal.id", ondelete="CASCADE", index=True
+    )
+    title: str
+    description: str = ""
+    # Why this work is needed to serve the parent goal (derivation rationale).
+    rationale: str = ""
+    status: RequiredWorkStatus = Field(default=RequiredWorkStatus.PROPOSED)
+    priority: int = Field(default=50, ge=0, le=100)
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class Job(SQLModel, table=True):
+    """A defined position -- the first-class citizen of the Workforce domain.
+
+    A Job carries stable identity (id/title/description) and always points at its
+    currently-active ``JobVersion`` via ``head_version_id``. The actual *required
+    capabilities* live on JobVersion (not on Job), so a Job can evolve its
+    requirements over time without losing the history of what it demanded before.
+    """
+
+    __tablename__ = "job"
+
+    id: str = Field(default_factory=lambda: new_id("job"), primary_key=True)
+    required_work_id: str = Field(
+        foreign_key="required_work.id", ondelete="CASCADE", index=True
+    )
+    # Back-reference to the active version. Plain FK (no cascade): JobVersion rows
+    # are never individually deleted, so this is always resolvable.
+    head_version_id: str | None = Field(default=None, foreign_key="job_version.id")
+    title: str
+    description: str = ""
+    role_summary: str = ""
+    status: JobStatus = Field(default=JobStatus.OPEN)
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class JobVersion(SQLModel, table=True):
+    """Immutable snapshot of one Job's definition + required-capability set.
+
+    A new JobVersion is minted whenever the job's title/role or required
+    capabilities change. ``version`` is monotonic per job. CapabilityRequirement
+    rows belong to a JobVersion, so reading one version reconstructs the exact
+    requirement set in force at that time.
+    """
+
+    __tablename__ = "job_version"
+
+    id: str = Field(default_factory=lambda: new_id("jv"), primary_key=True)
+    job_id: str = Field(foreign_key="job.id", ondelete="CASCADE", index=True)
+    version: int = Field(default=1, ge=1)
+    title_snapshot: str
+    description_snapshot: str = ""
+    role_summary_snapshot: str = ""
+    created_at: datetime = Field(default_factory=now_utc)
+
+    __table_args__ = (
+        UniqueConstraint("job_id", "version", name="uq_job_version_per_job"),
+    )
+
+
+class CapabilityRequirement(SQLModel, table=True):
+    """A single required capability for one JobVersion.
+
+    References the Alpha-1 Capability SSoT by ``capability_id`` ONLY. The service
+    layer resolves a caller-supplied capability *name* slug to a capability_id
+    and fails closed (422) if the slug is unknown -- no second capability
+    vocabulary is ever created here. ``capability_name`` is a denormalized,
+    display-only snapshot; the authoritative link is ``capability_id``.
+    """
+
+    __tablename__ = "capability_requirement"
+
+    id: str = Field(default_factory=lambda: new_id("cr"), primary_key=True)
+    job_version_id: str = Field(
+        foreign_key="job_version.id", ondelete="CASCADE", index=True
+    )
+    capability_id: str = Field(
+        foreign_key="capability.id", ondelete="CASCADE", index=True
+    )
+    capability_name: str
+    # Required proficiency level on the Alpha-1 capability scale (1..100).
+    min_proficiency: int = Field(default=50, ge=1, le=100)
+    required: bool = True
+    notes: str = ""
+    created_at: datetime = Field(default_factory=now_utc)
