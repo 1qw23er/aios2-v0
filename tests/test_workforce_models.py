@@ -25,9 +25,15 @@ from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, func, select
 
+from aios.audit import AuditLog
 from aios.db import get_engine, run_migrations
 from aios.models import (
+    AdapterType,
+    Agent,
+    AgentCapability,
     BusinessGoal,
+    Candidate,
+    CandidateStatus,
     Capability,
     CapabilityRequirement,
     Job,
@@ -36,13 +42,17 @@ from aios.models import (
 )
 from aios.services import ServiceError
 from aios.workforce import (
+    CandidateLifecycle,
     add_capability_requirement,
     create_business_goal,
     create_job,
     create_job_version,
     create_required_work,
+    discover_candidates,
     list_capability_requirements,
     list_job_versions,
+    reject_candidate,
+    repool_candidate,
 )
 
 
@@ -56,6 +66,23 @@ def _seed_capability(session: Session, name: str) -> Capability:
     session.add(cap)
     session.flush()
     return cap
+
+
+def _seed_agent(session: Session, name: str, *capability_names: str) -> Agent:
+    """Register an enabled agent that declares ``capability_names`` (via AgentCapability)."""
+    agent = Agent(name=name, role=name, adapter_type=AdapterType.EXTERNAL)
+    session.add(agent)
+    session.flush()
+    for cap_name in capability_names:
+        cap = session.exec(
+            select(Capability).where(Capability.name == cap_name)
+        ).first()
+        assert cap is not None, f"capability must be seeded first: {cap_name}"
+        session.add(
+            AgentCapability(agent_id=agent.id, capability_id=cap.id, enabled=True)
+        )
+    session.flush()
+    return agent
 
 
 def _build_chain(session: Session, *capability_names: str) -> tuple[
@@ -335,7 +362,7 @@ def test_alembic_single_head_is_capreq_hardening() -> None:
     cfg.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
-    assert heads == ["20260827_0001_workforce_capreq_hardening"]
+    assert heads == ["20260827_0002_workforce_candidate"]
 
 
 def test_migration_creates_workforce_tables_additively(tmp_path: Path) -> None:
@@ -352,7 +379,250 @@ def test_migration_creates_workforce_tables_additively(tmp_path: Path) -> None:
         "capability_requirement",
     ):
         assert t in tables, f"missing table: {t}"
+    # ...the W2 candidate pool table is present (additive, on top of W1)...
+    assert "candidate" in tables
     # ...and the Alpha-1 SSoT table is untouched (proves additivity).
     assert "capability" in tables
-    # No second capability vocabulary table was created.
+    # No second capability vocabulary table was created (W1 + W2 both reuse Alpha-1).
     assert not any(t.startswith("workforce_capability") for t in tables)
+    # The candidate table references the Agent Registry SSoT by id only -- it does
+    # NOT copy agent columns (no agent_name / agent_role / capabilities blob).
+    cols = {c["name"] for c in inspect(engine).get_columns("candidate")}
+    assert {
+        "id",
+        "agent_id",
+        "job_id",
+        "job_version_id",
+        "evaluation_context",
+        "status",
+        "discovered_by",
+        "created_at",
+        "updated_at",
+    } <= cols
+    assert not cols & {"agent_name", "agent_role", "agent_capabilities"}
+
+
+# ---------------------------------------------------------------------------
+# 9. W2 Candidate Discovery (pool only; no evaluation / match / trial)
+# ---------------------------------------------------------------------------
+
+
+def test_discover_pools_only_fully_matching_agents(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'disc.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        _seed_capability(session, "research")
+
+        # Three agents: full match / partial / none.
+        a_full = _seed_agent(session, "A-full", "writing", "research")
+        _seed_agent(session, "B-partial", "writing")
+        _seed_agent(session, "C-none")
+
+        _, _, job, head = _build_chain(session, "writing", "research")
+        cands = discover_candidates(session, head.id)
+        session.commit()
+
+        # Only the agent declaring BOTH required capabilities is pooled.
+        assert len(cands) == 1
+        c = cands[0]
+        assert c.agent_id == a_full.id
+        assert c.job_id == job.id
+        assert c.job_version_id == head.id
+        assert c.status == CandidateStatus.POOLED
+        # evaluation_context is reserved for W3 and empty in W2.
+        assert c.evaluation_context == {}
+
+
+def test_discover_is_idempotent(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'idem.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        _seed_agent(session, "A", "writing")
+        _, _, job, head = _build_chain(session, "writing")
+
+        first = discover_candidates(session, head.id)
+        session.commit()
+        first_id = first[0].id
+
+        # Re-run discovery: must NOT create a duplicate candidate row.
+        second = discover_candidates(session, head.id)
+        session.commit()
+        assert len(second) == 1
+        assert second[0].id == first_id
+        # Exactly one candidate row exists for this job version.
+        assert (
+            session.exec(
+                select(func.count())
+                .select_from(Candidate)
+                .where(Candidate.job_version_id == head.id)
+            ).first()
+            == 1
+        )
+
+
+def test_discover_unknown_job_version_404(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'unk.db').as_posix()}"
+    with _db(url) as session:
+        with pytest.raises(ServiceError) as exc:
+            discover_candidates(session, "no_such_job_version")
+        assert exc.value.status_code == 404
+
+
+def test_discover_empty_requirements_422(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'empty.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        _seed_agent(session, "A", "writing")
+        # Job with NO capability requirements.
+        _, _, job, head = _build_chain(session)
+        assert list_capability_requirements(session, head.id) == []
+        with pytest.raises(ServiceError) as exc:
+            discover_candidates(session, head.id)
+        assert exc.value.status_code == 422
+
+
+def test_discover_audit_trail_traceable_to_job_version(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'audit.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        a = _seed_agent(session, "A", "writing")
+        _, _, job, head = _build_chain(session, "writing")
+        cands = discover_candidates(session, head.id, discoverer="tester")
+        session.commit()
+        cand_id = cands[0].id
+
+        log = session.exec(
+            select(AuditLog)
+            .where(AuditLog.resource_type == "candidate")
+            .where(AuditLog.action == "candidate.discover")
+            .where(AuditLog.resource_id == cand_id)
+        ).first()
+        assert log is not None
+        assert log.actor == "tester"
+        # Traceable back to the originating job version.
+        assert log.after_snapshot.get("job_version_id") == head.id
+        assert log.after_snapshot.get("agent_id") == a.id
+        assert log.after_snapshot.get("status") == CandidateStatus.POOLED.value
+
+
+def test_discover_does_not_copy_agent_registry_data(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'nocopy.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        a = _seed_agent(session, "A", "writing")
+        _, _, job, head = _build_chain(session, "writing")
+        cands = discover_candidates(session, head.id)
+        session.commit()
+        c = cands[0]
+
+        # Candidate references the agent by id only; it has no agent columns.
+        assert c.agent_id == a.id
+        assert not hasattr(c, "agent_name")
+        # Mutating the registry agent does not move/alter the candidate.
+        a.name = "A-renamed"
+        session.add(a)
+        session.commit()
+        same = session.get(Candidate, c.id)
+        assert same is not None and same.agent_id == a.id
+        assert same.status == CandidateStatus.POOLED
+
+
+def test_candidate_reject_and_repool_boundary(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'rej.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        _seed_agent(session, "A", "writing")
+        _, _, job, head = _build_chain(session, "writing")
+        cands = discover_candidates(session, head.id)
+        session.commit()
+        cand_id = cands[0].id
+
+        # POOLED -> REJECTED is allowed.
+        rej = reject_candidate(session, cand_id, actor="reviewer")
+        session.commit()
+        assert rej.status == CandidateStatus.REJECTED
+
+        # REJECTED -> POOLED (re-pool) is allowed.
+        rep = repool_candidate(session, cand_id)
+        session.commit()
+        assert rep.status == CandidateStatus.POOLED
+
+
+def test_candidate_illegal_transition_rejected_409(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'illegal.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        _seed_agent(session, "A", "writing")
+        _, _, job, head = _build_chain(session, "writing")
+        cands = discover_candidates(session, head.id)
+        session.commit()
+        cand_id = cands[0].id
+
+        # REJECTED -> REJECTED is not a defined transition.
+        reject_candidate(session, cand_id)
+        session.commit()
+        with pytest.raises(ServiceError) as exc:
+            reject_candidate(session, cand_id)  # already REJECTED
+        assert exc.value.status_code == 409
+
+        # The state machine itself rejects re-entering the same state (and any W3
+        # state, which is not representable in W2).
+        with pytest.raises(ServiceError) as exc2:
+            CandidateLifecycle.require_transition(
+                CandidateStatus.POOLED, CandidateStatus.POOLED
+            )
+        assert exc2.value.status_code == 409
+
+
+def test_candidate_cascade_on_job_delete(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'cascade2.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        _seed_agent(session, "A", "writing")
+        _, _, job, head = _build_chain(session, "writing")
+        discover_candidates(session, head.id)
+        session.commit()
+        job_id = job.id
+        assert session.exec(select(func.count()).select_from(Candidate)).first() == 1
+
+        # Deleting the owning Job cascades through JobVersion to its candidates
+        # (hard FK on candidate.job_version_id). Traceability lives *within* the
+        # Job lifecycle, so removing the Job removes its whole candidate pool.
+        session.delete(session.get(Job, job_id))
+        session.commit()
+        assert (
+            session.exec(
+                select(func.count())
+                .select_from(Candidate)
+                .where(Candidate.job_id == job_id)
+            ).first()
+            == 0
+        )
+
+
+def test_candidate_agent_fk_no_action_blocks_agent_delete(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'noaction.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        a = _seed_agent(session, "A", "writing")
+        _, _, job, head = _build_chain(session, "writing")
+        discover_candidates(session, head.id)
+        session.commit()
+        agent_id = a.id
+
+        # Candidate references agent with NO ACTION: deleting the (still-pooled)
+        # agent must FAIL explicitly (IntegrityError), never silently wipe history.
+        with pytest.raises(IntegrityError):
+            session.delete(session.get(Agent, agent_id))
+            session.commit()
+        # The failed delete was rolled back; recover the session before verifying.
+        session.rollback()
+        # Candidate still present afterwards.
+        assert (
+            session.exec(
+                select(func.count())
+                .select_from(Candidate)
+                .where(Candidate.agent_id == agent_id)
+            ).first()
+            == 1
+        )

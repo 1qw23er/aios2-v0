@@ -35,7 +35,7 @@ from aios.models import (
 )
 from alembic import command
 
-HEAD = "20260827_0001_workforce_capreq_hardening"
+HEAD = "20260827_0002_workforce_candidate"
 BASE = "20260720_0005"
 # Lowest revision these ORM-seeding tests upgrade to. The migrations above it
 # form a chain of one-way doors:

@@ -1528,3 +1528,69 @@ class CapabilityRequirement(SQLModel, table=True):
     required: bool = True
     notes: str = ""
     created_at: datetime = Field(default_factory=now_utc)
+
+
+class CandidateStatus(StrEnum):
+    """Minimal lifecycle for a discovered Agent x JobVersion candidate (W2).
+
+    W2 only *discovers* candidates and pools them. The Evaluation/Match/Trial
+    states (EVALUATING -> EVALUATED -> RECOMMENDED) are reserved for W3 and are
+    intentionally NOT enterable in W2 -- see ``workforce.CandidateLifecycle``.
+    """
+
+    POOLED = "pooled"
+    REJECTED = "rejected"
+    # W3+ reserved (not used in W2):
+    # EVALUATING = "evaluating"
+    # EVALUATED = "evaluated"
+    # RECOMMENDED = "recommended"
+
+
+class Candidate(SQLModel, table=True):
+    """A discovered candidate = Agent x Job x Evaluation Context (V1.1, §2).
+
+    Strictly models the cross-product ``Agent x Job x Evaluation Context``:
+
+    * ``agent_id`` is a *soft reference* to the Alpha-1 Agent Registry (SSoT). We
+      store only the id and NEVER copy registry data here; if the agent is later
+      disabled or retired the Candidate keeps pointing at the (still-existing) id
+      and the lifecycle can move it back to POOLED. FK uses ``ondelete="NO ACTION"``
+      so a registry deletion does not silently wipe a discovery's audit trail.
+    * ``job_id`` / ``job_version_id`` are *hard references* with ``ondelete="CASCADE"``.
+      A Job (and its versions) owns its candidate pool; deleting the Job removes its
+      candidates too, which keeps traceability inside the Job's lifecycle.
+    * ``evaluation_context`` is a JSON bag reserved for W3 Evaluation. W2 leaves it
+      empty (``{}``) -- Discovery does NOT evaluate, match, or trial.
+    * The ``(agent_id, job_id, job_version_id)`` triple is UNIQUE, so re-running
+      discovery for the same job version is idempotent (no duplicate rows).
+    """
+
+    __tablename__ = "candidate"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id",
+            "job_id",
+            "job_version_id",
+            name="uq_candidate_agent_job_version",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("cand"), primary_key=True)
+    agent_id: str = Field(
+        foreign_key="agent.id", ondelete="NO ACTION", index=True
+    )
+    job_id: str = Field(
+        foreign_key="job.id", ondelete="CASCADE", index=True
+    )
+    job_version_id: str = Field(
+        foreign_key="job_version.id", ondelete="CASCADE", index=True
+    )
+    # Reserved for W3 Evaluation; W2 always discovers with an empty context.
+    evaluation_context: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON)
+    )
+    status: CandidateStatus = Field(default=CandidateStatus.POOLED, index=True)
+    discovered_by: str = "workforce_discovery"
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)

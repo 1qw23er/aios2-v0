@@ -26,7 +26,7 @@ from precheck_series_id_metadata import (  # noqa: E402
     run_precheck,
 )
 
-HEAD = "20260827_0001_workforce_capreq_hardening"
+HEAD = "20260827_0002_workforce_candidate"
 
 
 def _config(url: str) -> Config:

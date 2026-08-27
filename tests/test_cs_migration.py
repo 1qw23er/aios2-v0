@@ -1,7 +1,7 @@
 """Migration proof for the #109 customer-service implementation (plan §2.4 / §7 T1, T20).
 
 Asserts from several angles:
-* the Alembic tree still has a single head (now ``20260827_0001_workforce_capreq_hardening``, the
+* the Alembic tree still has a single head (now ``20260827_0002_workforce_candidate``, the
   SalesPlaybook V0 follow-up slice) and the #109 revision is part of that chain;
 * exactly one new migration file was added by #109 (chained after
   ``20260730_0001``);
@@ -26,7 +26,7 @@ from aios.models import Project
 
 # Current single leaf of the whole tree. Later slices legitimately advance it;
 # what #109 owns is CS_REVISION, which must stay in the chain.
-HEAD = "20260827_0001_workforce_capreq_hardening"
+HEAD = "20260827_0002_workforce_candidate"
 CS_REVISION = "20260731_0001"
 CS_FILE = "20260731_0001_customer_service.py"
 PREV = "20260730_0001_agent_secret.py"
