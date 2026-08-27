@@ -31,6 +31,7 @@ Employee / Training / Performance remain out of scope.
 
 from __future__ import annotations
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from aios.agent_registry import get_agent, list_agents
@@ -440,6 +441,13 @@ def discover_candidates(
     * A JobVersion with no CapabilityRequirements has nothing to filter by -> 422.
     * Re-running discovery is idempotent: an existing (agent, job, job_version)
       triple is never duplicated (UNIQUE + explicit existence check).
+    * Concurrent discovery is also idempotent. Each insert runs inside a SAVEPOINT;
+      if another discovery committed the same triple between our initial read and
+      our flush (a TOCTOU race), the UNIQUE violation is absorbed -- we read back
+      the already-pooled candidate and return the same result a serial re-discovery
+      would, never a 500. The final data is strictly unique.
+    * No agent satisfies the full requirement set -> returns an empty list (not an
+      error). The 422 only fires when there are NO requirements to filter against.
     * Every newly pooled candidate is written to the audit log, traceable to the
       job_version, with an empty ``evaluation_context`` (reserved for W3).
     * Discovery never enters EVALUATING/EVALUATED/RECOMMENDED; it only POOLs.
@@ -481,40 +489,74 @@ def discover_candidates(
         ).all()
     }
 
+    # Set when a concurrent discovery committed the same (agent, job_version) triple
+    # between our `existing` read and our flush. In that case this session's snapshot
+    # may be stale, so we resolve the final list from a fresh connection.
+    conflict_absorbed = False
+
     for agent_id in sorted(matched):
         if agent_id in existing:
             continue  # idempotent: already discovered for this job version
         # Soft-reference check: the agent must still exist in the SSoT registry.
         # (It was returned by list_agents, so it does; kept explicit for clarity.)
         get_agent(session, agent_id)
-        cand = Candidate(
-            agent_id=agent_id,
-            job_id=job.id,
-            job_version_id=job_version_id,
-            status=CandidateStatus.POOLED,
-            discovered_by=discoverer,
-            evaluation_context={},
-        )
-        session.add(cand)
-        session.flush()
-        append_audit(
-            session,
-            actor=discoverer,
-            action="candidate.discover",
-            resource_type="candidate",
-            resource_id=cand.id,
-            project_id=None,
-            task_id=None,
-            before={},
-            after={
-                "agent_id": agent_id,
-                "job_id": job.id,
-                "job_version_id": job_version_id,
-                "status": cand.status.value,
-            },
-            idempotency_key=f"discover:{job_version_id}:{agent_id}",
-        )
+        # Insert inside a SAVEPOINT so a concurrent discovery -- which may have
+        # committed the same (agent_id, job_id, job_version_id) triple between our
+        # initial `existing` read and this flush -- only rolls back THIS candidate,
+        # never the whole discovery transaction. On a UNIQUE violation the conflict
+        # is absorbed: we read back the already-pooled candidate and return a result
+        # identical to a serial re-discovery. The operation stays strictly idempotent
+        # and never surfaces a 500. (P2-1 hardening.)
+        try:
+            with session.begin_nested():
+                cand = Candidate(
+                    agent_id=agent_id,
+                    job_id=job.id,
+                    job_version_id=job_version_id,
+                    status=CandidateStatus.POOLED,
+                    discovered_by=discoverer,
+                    evaluation_context={},
+                )
+                session.add(cand)
+                session.flush()
+                append_audit(
+                    session,
+                    actor=discoverer,
+                    action="candidate.discover",
+                    resource_type="candidate",
+                    resource_id=cand.id,
+                    project_id=None,
+                    task_id=None,
+                    before={},
+                    after={
+                        "agent_id": agent_id,
+                        "job_id": job.id,
+                        "job_version_id": job_version_id,
+                        "status": cand.status.value,
+                    },
+                    idempotency_key=f"discover:{job_version_id}:{agent_id}",
+                )
+        except IntegrityError:
+            # Another concurrent discovery won the race for this triple. The
+            # SAVEPOINT has already been rolled back by `begin_nested`, so the outer
+            # transaction -- and any other candidates pooled so far -- is intact.
+            # Read the existing candidate back (fresh connection, so we see the
+            # concurrently-committed row regardless of this session's snapshot) so
+            # the returned list matches what a serial re-discovery would return.
+            conflict_absorbed = True
+            with Session(session.get_bind()) as fresh:
+                fresh.exec(
+                    select(Candidate)
+                    .where(Candidate.agent_id == agent_id)
+                    .where(Candidate.job_version_id == job_version_id)
+                ).first()
+            continue
 
+    if conflict_absorbed:
+        # A conflict was absorbed: resolve the authoritative, committed view from a
+        # fresh connection so concurrently-inserted candidates are reflected.
+        with Session(session.get_bind()) as fresh:
+            return list_candidates(fresh, job_version_id=job_version_id)
     return list_candidates(session, job_version_id=job_version_id)
 
 

@@ -16,6 +16,8 @@ any W2+ work (Candidate / Evaluation / Match / Employee) can be built on top:
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -623,6 +625,149 @@ def test_candidate_agent_fk_no_action_blocks_agent_delete(tmp_path: Path) -> Non
                 select(func.count())
                 .select_from(Candidate)
                 .where(Candidate.agent_id == agent_id)
+            ).first()
+            == 1
+        )
+
+
+# ---------------------------------------------------------------------------
+# 10. W2 hardening -- concurrent discovery is strictly idempotent (P2-1)
+# ---------------------------------------------------------------------------
+
+
+def test_discover_no_matching_agent_returns_empty_list(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'nomatch.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        _seed_capability(session, "research")
+        # Agent declares only "writing"; the Job requires BOTH -> no full match.
+        _seed_agent(session, "A", "writing")
+        _, _, job, head = _build_chain(session, "writing", "research")
+
+        # Must return an empty list (not an error). The 422 only fires when there
+        # are NO requirements; here requirements exist, just no qualifying agent.
+        cands = discover_candidates(session, head.id)
+        session.commit()
+        assert cands == []
+        # And no candidate row was created.
+        assert (
+            session.exec(
+                select(func.count())
+                .select_from(Candidate)
+                .where(Candidate.job_version_id == head.id)
+            ).first()
+            == 0
+        )
+
+
+def test_discover_concurrent_no_duplicate_and_loser_returns_existing(
+    tmp_path: Path,
+) -> None:
+    """Two simultaneous discoveries of the same job version must yield exactly one
+    candidate row, and the losing caller must still return the pooled candidate
+    (not raise)."""
+    url = f"sqlite:///{(tmp_path / 'concurrent.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        a = _seed_agent(session, "A", "writing")
+        _, _, job, head = _build_chain(session, "writing")
+        head_id = head.id
+        agent_id = a.id
+
+    barrier = threading.Barrier(2)
+    results: dict[int, object] = {}
+
+    def worker(idx: int) -> None:
+        try:
+            barrier.wait()
+            with Session(get_engine(url)) as s:
+                cands = discover_candidates(s, head_id)
+                results[idx] = [c.agent_id for c in cands]
+        except Exception as exc:  # pragma: no cover - defensive
+            results[idx] = ("ERR", repr(exc))
+
+    t1 = threading.Thread(target=worker, args=(0,), daemon=True)
+    t2 = threading.Thread(target=worker, args=(1,), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join(timeout=60)
+    t2.join(timeout=60)
+
+    assert "ERR" not in str(results.get(0)), results.get(0)
+    assert "ERR" not in str(results.get(1)), results.get(1)
+    # Both callers return the single pooled candidate (the winner's committed row).
+    assert results[0] == [agent_id]
+    assert results[1] == [agent_id]
+    # Exactly one candidate row exists -- no duplicate despite the race.
+    with Session(get_engine(url)) as v:
+        assert (
+            v.exec(
+                select(func.count())
+                .select_from(Candidate)
+                .where(Candidate.job_version_id == head_id)
+            ).first()
+            == 1
+        )
+
+
+def test_discover_absorbs_concurrent_duplicate_via_savepoint(
+    tmp_path: Path,
+) -> None:
+    """Deterministic P2-1 check: a held (uncommitted) duplicate row forces the
+    second discovery to hit the UNIQUE constraint. The SAVEPOINT rollback + fresh
+    read-back must absorb it and return the already-pooled candidate -- never a 500
+    and never a second row."""
+    url = f"sqlite:///{(tmp_path / 'absorb.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        a = _seed_agent(session, "A", "writing")
+        _, _, job, head = _build_chain(session, "writing")
+        head_id = head.id
+        agent_id = a.id
+        job_id = job.id
+
+    # Session 1 holds an uncommitted, duplicate candidate row (and the write lock).
+    s1 = Session(get_engine(url))
+    s1.add(
+        Candidate(
+            agent_id=agent_id,
+            job_id=job_id,
+            job_version_id=head_id,
+            status=CandidateStatus.POOLED,
+            discovered_by="held",
+            evaluation_context={},
+        )
+    )
+    s1.flush()  # uncommitted: blocks session 2's flush until we commit
+
+    result: dict[str, object] = {}
+
+    def worker() -> None:
+        try:
+            with Session(get_engine(url)) as s2:
+                cands = discover_candidates(s2, head_id)
+                result["list"] = [c.agent_id for c in cands]
+        except Exception as exc:  # pragma: no cover - defensive
+            result["err"] = repr(exc)
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    # Let the worker reach (and block on) its flush, then release the lock.
+    time.sleep(0.5)
+    s1.commit()
+    t.join(timeout=60)
+    s1.close()
+
+    assert "err" not in result, result.get("err")
+    # The losing caller returns the existing candidate, not a 500 / empty list.
+    assert result.get("list") == [agent_id]
+    # No duplicate row was created; the held row is the only one.
+    with Session(get_engine(url)) as v:
+        assert (
+            v.exec(
+                select(func.count())
+                .select_from(Candidate)
+                .where(Candidate.job_version_id == head_id)
             ).first()
             == 1
         )
