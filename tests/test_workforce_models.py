@@ -273,17 +273,69 @@ def test_historical_version_is_immutable(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 8. W1 hardening: UNIQUE(job_version_id, capability_id) + RESTRICT on Capability FK
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_capability_requirement_is_rejected(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'dup.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        _, _, job, head = _build_chain(session, "writing")
+        # head already requires "writing" once. A second requirement for the same
+        # capability on the same JobVersion must be rejected by the DB UNIQUE
+        # constraint (the service does NOT de-dup).
+        with pytest.raises(IntegrityError):
+            add_capability_requirement(session, head.id, "writing")
+            session.commit()
+
+
+def test_delete_referenced_capability_is_rejected_restrict(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'restrict.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "writing")
+        _seed_capability(session, "research")
+        _, _, _, head = _build_chain(session, "writing", "research")
+        # "writing" is referenced by a Workforce requirement. Retiring it must
+        # FAIL EXPLICITLY (RESTRICT) -- we must never silently wipe hiring history.
+        referenced = session.exec(
+            select(Capability).where(Capability.name == "writing")
+        ).first()
+        assert referenced is not None
+        with pytest.raises(IntegrityError):
+            session.delete(referenced)
+            session.commit()
+
+
+def test_delete_unreferenced_capability_succeeds(tmp_path: Path) -> None:
+    url = f"sqlite:///{(tmp_path / 'unref.db').as_posix()}"
+    with _db(url) as session:
+        _seed_capability(session, "editing")  # never referenced by any requirement
+        _build_chain(session)  # job with no capability requirements
+        orphan = session.exec(
+            select(Capability).where(Capability.name == "editing")
+        ).first()
+        assert orphan is not None
+        # RESTRICT only blocks when a child row references the capability, so an
+        # unreferenced Capability can be safely retired.
+        session.delete(orphan)
+        session.commit()
+        remaining = session.exec(select(func.count()).select_from(Capability)).first()
+        assert remaining == 0
+
+
+# ---------------------------------------------------------------------------
 # 7. Alembic single-head + additive
 # ---------------------------------------------------------------------------
 
 
-def test_alembic_single_head_is_workforce_core() -> None:
+def test_alembic_single_head_is_capreq_hardening() -> None:
     root = Path(__file__).resolve().parents[1]
     cfg = Config(root / "alembic.ini")
     cfg.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
-    assert heads == ["20260825_0001_workforce_core"]
+    assert heads == ["20260827_0001_workforce_capreq_hardening"]
 
 
 def test_migration_creates_workforce_tables_additively(tmp_path: Path) -> None:
