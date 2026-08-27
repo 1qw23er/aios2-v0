@@ -19,19 +19,27 @@ Design rules (must hold; contract tests assert them):
 4. Referential integrity is enforced at write time (parent-existence checks raise
    ``ServiceError(404)``) and at the DB level (FKs + cascade in the migration).
 
-Out of scope for W1 (W2+): Candidate / Evaluation / Match / Trial / Employee and
-the Hire/Replace/Terminate/Promote/Transfer L4 approvals. Those entities and the
-owner-approval gate are deliberately absent here -- this module is the stable
-foundation they will build on, not the whole system.
+W2 (Candidate Discovery) is implemented in this module as a STRICT SUBSET of the
+V1.1 W2: it only *discovers* and *pools* candidates (Agent x Job x Evaluation
+Context) by filtering the Agent Registry against a JobVersion's CapabilityRequirements.
+It does NOT evaluate, match, score, benchmark, or trial -- those are W3+ and are
+deliberately absent here. The Candidate lifecycle is the minimal W2 state machine
+(POOLED <-> REJECTED); the W3 states (EVALUATING / EVALUATED / RECOMMENDED) are
+reserved and cannot be entered in W2 (``CandidateLifecycle`` rejects them with 409).
+Employee / Training / Performance remain out of scope.
 """
 
 from __future__ import annotations
 
 from sqlmodel import Session, select
 
+from aios.agent_registry import get_agent, list_agents
+from aios.audit import append_audit
 from aios.models import (
     BusinessGoal,
     BusinessGoalStatus,
+    Candidate,
+    CandidateStatus,
     Capability,
     CapabilityRequirement,
     Job,
@@ -39,6 +47,7 @@ from aios.models import (
     JobVersion,
     RequiredWork,
     RequiredWorkStatus,
+    now_utc,
 )
 from aios.services import ServiceError
 
@@ -373,3 +382,224 @@ def list_capability_requirements(
             )
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# W2 -- Candidate Discovery (STRICT SUBSET: pool only, no evaluation/match/trial)
+# ---------------------------------------------------------------------------
+
+
+class CandidateLifecycle:
+    """Explicit, boundary-checked W2 candidate state machine.
+
+    W2 only knows POOLED <-> REJECTED. The W3 states (EVALUATING / EVALUATED /
+    RECOMMENDED) are intentionally NOT part of W2 -- any transition attempting to
+    enter them is rejected with 409, so Discovery can never silently drift into
+    Evaluation territory. A REJECTED candidate may be re-pooled (returned to the
+    pool) since the Agent Registry is the SSoT and the agent may have recovered.
+    """
+
+    ALLOWED: dict[CandidateStatus, set[CandidateStatus]] = {
+        CandidateStatus.POOLED: {CandidateStatus.REJECTED},
+        CandidateStatus.REJECTED: {CandidateStatus.POOLED},
+    }
+
+    @classmethod
+    def can_transition(
+        cls, frm: CandidateStatus, to: CandidateStatus
+    ) -> bool:
+        return to in cls.ALLOWED.get(frm, set())
+
+    @classmethod
+    def require_transition(
+        cls, frm: CandidateStatus, to: CandidateStatus
+    ) -> None:
+        if not cls.can_transition(frm, to):
+            raise ServiceError(
+                409,
+                f"illegal candidate state transition: {frm.value} -> {to.value}",
+            )
+
+
+def discover_candidates(
+    session: Session,
+    job_version_id: str,
+    *,
+    discoverer: str = "workforce_discovery",
+) -> list[Candidate]:
+    """Discover and pool candidates for ``job_version_id`` (W2, no evaluation).
+
+    Discovery reads the JobVersion's CapabilityRequirements, resolves each required
+    capability to the Alpha-1 SSoT, and intersects the set of *enabled* agents that
+    declare *all* required (enabled) capabilities via the Agent Registry. Each
+    matched agent becomes (or already is) a POOLED Candidate referencing the agent
+    by id only -- no Agent Registry data is copied.
+
+    Contracts (asserted by contract tests):
+    * Unknown / non-existent JobVersion -> 404 fail-closed.
+    * A JobVersion with no CapabilityRequirements has nothing to filter by -> 422.
+    * Re-running discovery is idempotent: an existing (agent, job, job_version)
+      triple is never duplicated (UNIQUE + explicit existence check).
+    * Every newly pooled candidate is written to the audit log, traceable to the
+      job_version, with an empty ``evaluation_context`` (reserved for W3).
+    * Discovery never enters EVALUATING/EVALUATED/RECOMMENDED; it only POOLs.
+    """
+    jv = session.get(JobVersion, job_version_id)
+    if jv is None:
+        raise ServiceError(404, f"job version not found: {job_version_id}")
+    job = session.get(Job, jv.job_id)
+    if job is None:
+        raise ServiceError(404, f"job not found: {jv.job_id}")
+
+    reqs = list_capability_requirements(session, job_version_id)
+    if not reqs:
+        # Nothing to filter against -> fail-closed rather than dumping the registry.
+        raise ServiceError(
+            422,
+            "job version has no capability requirements to discover against",
+        )
+
+    # Required capability slugs (denormalized snapshot of the Alpha-1 SSoT names).
+    required_names = [r.capability_name for r in reqs]
+
+    # Intersect enabled agents that declare every required (enabled) capability.
+    # ``list_agents(capability=...)`` already returns enabled agents with an enabled
+    # AgentCapability for that SSoT capability, and fails closed on unknown slugs
+    # (cannot happen here since reqs derive from the same SSoT).
+    matched: set[str] | None = None
+    for name in required_names:
+        ids = {a.id for a in list_agents(session, capability=name)}
+        matched = ids if matched is None else (matched & ids)
+        if not matched:
+            break  # no agent can satisfy the full requirement set
+    matched = matched or set()
+
+    existing = {
+        c.agent_id
+        for c in session.exec(
+            select(Candidate).where(Candidate.job_version_id == job_version_id)
+        ).all()
+    }
+
+    for agent_id in sorted(matched):
+        if agent_id in existing:
+            continue  # idempotent: already discovered for this job version
+        # Soft-reference check: the agent must still exist in the SSoT registry.
+        # (It was returned by list_agents, so it does; kept explicit for clarity.)
+        get_agent(session, agent_id)
+        cand = Candidate(
+            agent_id=agent_id,
+            job_id=job.id,
+            job_version_id=job_version_id,
+            status=CandidateStatus.POOLED,
+            discovered_by=discoverer,
+            evaluation_context={},
+        )
+        session.add(cand)
+        session.flush()
+        append_audit(
+            session,
+            actor=discoverer,
+            action="candidate.discover",
+            resource_type="candidate",
+            resource_id=cand.id,
+            project_id=None,
+            task_id=None,
+            before={},
+            after={
+                "agent_id": agent_id,
+                "job_id": job.id,
+                "job_version_id": job_version_id,
+                "status": cand.status.value,
+            },
+            idempotency_key=f"discover:{job_version_id}:{agent_id}",
+        )
+
+    return list_candidates(session, job_version_id=job_version_id)
+
+
+def get_candidate(session: Session, candidate_id: str) -> Candidate | None:
+    return session.get(Candidate, candidate_id)
+
+
+def list_candidates(
+    session: Session,
+    *,
+    job_id: str | None = None,
+    job_version_id: str | None = None,
+    agent_id: str | None = None,
+    status: CandidateStatus | None = None,
+) -> list[Candidate]:
+    q = select(Candidate)
+    if job_id is not None:
+        q = q.where(Candidate.job_id == job_id)
+    if job_version_id is not None:
+        q = q.where(Candidate.job_version_id == job_version_id)
+    if agent_id is not None:
+        q = q.where(Candidate.agent_id == agent_id)
+    if status is not None:
+        q = q.where(Candidate.status == status)
+    q = q.order_by(Candidate.created_at, Candidate.id)
+    return list(session.exec(q))
+
+
+def reject_candidate(
+    session: Session,
+    candidate_id: str,
+    *,
+    actor: str = "workforce_discovery",
+) -> Candidate:
+    """Move a POOLED candidate to REJECTED (explicit lifecycle boundary)."""
+    cand = session.get(Candidate, candidate_id)
+    if cand is None:
+        raise ServiceError(404, f"candidate not found: {candidate_id}")
+    CandidateLifecycle.require_transition(cand.status, CandidateStatus.REJECTED)
+    before = {"status": cand.status.value}
+    cand.status = CandidateStatus.REJECTED
+    cand.updated_at = now_utc()
+    session.add(cand)
+    session.flush()
+    append_audit(
+        session,
+        actor=actor,
+        action="candidate.reject",
+        resource_type="candidate",
+        resource_id=cand.id,
+        project_id=None,
+        task_id=None,
+        before=before,
+        after={"status": cand.status.value},
+        idempotency_key=f"reject:{candidate_id}",
+    )
+    return cand
+
+
+def repool_candidate(
+    session: Session,
+    candidate_id: str,
+    *,
+    actor: str = "workforce_discovery",
+) -> Candidate:
+    """Return a REJECTED candidate to POOLED (explicit lifecycle boundary)."""
+    cand = session.get(Candidate, candidate_id)
+    if cand is None:
+        raise ServiceError(404, f"candidate not found: {candidate_id}")
+    CandidateLifecycle.require_transition(cand.status, CandidateStatus.POOLED)
+    before = {"status": cand.status.value}
+    cand.status = CandidateStatus.POOLED
+    cand.updated_at = now_utc()
+    session.add(cand)
+    session.flush()
+    append_audit(
+        session,
+        actor=actor,
+        action="candidate.repool",
+        resource_type="candidate",
+        resource_id=cand.id,
+        project_id=None,
+        task_id=None,
+        before=before,
+        after={"status": cand.status.value},
+        idempotency_key=f"repool:{candidate_id}",
+    )
+    return cand
