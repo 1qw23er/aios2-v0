@@ -1491,16 +1491,36 @@ class CapabilityRequirement(SQLModel, table=True):
     and fails closed (422) if the slug is unknown -- no second capability
     vocabulary is ever created here. ``capability_name`` is a denormalized,
     display-only snapshot; the authoritative link is ``capability_id``.
+
+    Hardening constraints (W1 hardening, migration ``20260827_0001_...``):
+
+    * ``(job_version_id, capability_id)`` is UNIQUE -- a single JobVersion may
+      require a given Alpha-1 Capability at most once. Duplicates are rejected at
+      the DB layer (the service ``add_capability_requirement`` does not de-dup),
+      so an IntegrityError surfaces instead of silently accumulating rows.
+    * ``capability_id`` FK uses ``ondelete="RESTRICT"`` (NOT CASCADE). Retiring or
+      deleting an Alpha-1 Capability that is still referenced by any Workforce
+      requirement must FAIL EXPLICITLY -- we never silently wipe Workforce
+      hiring history. Only ``job_version`` (the parent) cascades; a Capability
+      can be safely removed only once no requirement references it.
     """
 
     __tablename__ = "capability_requirement"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "job_version_id",
+            "capability_id",
+            name="uq_capability_requirement_job_version_capability",
+        ),
+    )
 
     id: str = Field(default_factory=lambda: new_id("cr"), primary_key=True)
     job_version_id: str = Field(
         foreign_key="job_version.id", ondelete="CASCADE", index=True
     )
     capability_id: str = Field(
-        foreign_key="capability.id", ondelete="CASCADE", index=True
+        foreign_key="capability.id", ondelete="RESTRICT", index=True
     )
     capability_name: str
     # Required proficiency level on the Alpha-1 capability scale (1..100).
