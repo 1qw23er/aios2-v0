@@ -1346,3 +1346,251 @@ class CsSuggestionSalesEvidence(SQLModel, table=True):
         ),
         CheckConstraint("rank >= 0", name="ck_ssev_rank_non_negative"),
     )
+
+
+# ===========================================================================
+# Workforce Management -- W1 core entities (V1.1 Workforce Architecture Proposal)
+# ---------------------------------------------------------------------------
+# Scope boundary (explicit, enforced by design -- see V1.1 §Explicit Non-Goals):
+#   * These 5 entities implement the minimum closed loop
+#     "business goal -> required work -> job -> job version -> capability
+#     requirement". They are *definition-time* objects only.
+#   * Candidate / Evaluation / Match / Trial / Employee and the
+#     Hire/Replace/Terminate/Promote/Transfer approvals are INTENTIONALLY out of
+#     scope for W1 (W2+). No speculative columns/tables/fields for them are added.
+#   * CapabilityRequirement references the Alpha-1 Capability SSoT ONLY (by
+#     capability.id). A second capability vocabulary is NEVER created here.
+#   * Agent / Capability / Task / Project / Scheduler / Budget / Knowledge /
+#     Context are NOT modified by W1.
+#   * Job is the first-class citizen of the Workforce domain: RequiredWork,
+#     JobVersion and CapabilityRequirement all hang off Job.
+#   * JobVersion is an immutable snapshot. Every change to a job's title/role or
+#     required capabilities mints a new JobVersion, giving full historical
+#     traceability of *what the role demanded at any point in time*.
+# ===========================================================================
+
+
+class BusinessGoalStatus(StrEnum):
+    PROPOSED = "proposed"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    ACHIEVED = "achieved"
+    ABANDONED = "abandoned"
+
+
+class RequiredWorkStatus(StrEnum):
+    PROPOSED = "proposed"
+    PLANNED = "planned"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+    CANCELLED = "cancelled"
+
+
+class JobStatus(StrEnum):
+    OPEN = "open"
+    FILLED = "filled"  # a candidate has been appointed to this job (W2+)
+    CLOSED = "closed"
+    ON_HOLD = "on_hold"
+
+
+class BusinessGoal(SQLModel, table=True):
+    """Root of the workforce planning chain -- a single owner's business objective.
+
+    The owner is anchored here (single-owner model: there is no Company table).
+    Everything else in the W1 chain descends from a BusinessGoal.
+    """
+
+    __tablename__ = "business_goal"
+
+    id: str = Field(default_factory=lambda: new_id("biz"), primary_key=True)
+    owner: str = Field(default="human_ceo")
+    title: str
+    description: str = ""
+    # What "done" looks like for this goal -- used to derive RequiredWork later.
+    target_outcome: str = ""
+    status: BusinessGoalStatus = Field(default=BusinessGoalStatus.PROPOSED)
+    priority: int = Field(default=50, ge=0, le=100)
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class RequiredWork(SQLModel, table=True):
+    """A unit of work needed to serve a BusinessGoal (one goal -> many required works)."""
+
+    __tablename__ = "required_work"
+
+    id: str = Field(default_factory=lambda: new_id("req"), primary_key=True)
+    business_goal_id: str = Field(
+        foreign_key="business_goal.id", ondelete="CASCADE", index=True
+    )
+    title: str
+    description: str = ""
+    # Why this work is needed to serve the parent goal (derivation rationale).
+    rationale: str = ""
+    status: RequiredWorkStatus = Field(default=RequiredWorkStatus.PROPOSED)
+    priority: int = Field(default=50, ge=0, le=100)
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class Job(SQLModel, table=True):
+    """A defined position -- the first-class citizen of the Workforce domain.
+
+    A Job carries stable identity (id/title/description) and always points at its
+    currently-active ``JobVersion`` via ``head_version_id``. The actual *required
+    capabilities* live on JobVersion (not on Job), so a Job can evolve its
+    requirements over time without losing the history of what it demanded before.
+    """
+
+    __tablename__ = "job"
+
+    id: str = Field(default_factory=lambda: new_id("job"), primary_key=True)
+    required_work_id: str = Field(
+        foreign_key="required_work.id", ondelete="CASCADE", index=True
+    )
+    # Back-reference to the active version. Plain FK (no cascade): JobVersion rows
+    # are never individually deleted, so this is always resolvable.
+    head_version_id: str | None = Field(default=None, foreign_key="job_version.id")
+    title: str
+    description: str = ""
+    role_summary: str = ""
+    status: JobStatus = Field(default=JobStatus.OPEN)
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class JobVersion(SQLModel, table=True):
+    """Immutable snapshot of one Job's definition + required-capability set.
+
+    A new JobVersion is minted whenever the job's title/role or required
+    capabilities change. ``version`` is monotonic per job. CapabilityRequirement
+    rows belong to a JobVersion, so reading one version reconstructs the exact
+    requirement set in force at that time.
+    """
+
+    __tablename__ = "job_version"
+
+    id: str = Field(default_factory=lambda: new_id("jv"), primary_key=True)
+    job_id: str = Field(foreign_key="job.id", ondelete="CASCADE", index=True)
+    version: int = Field(default=1, ge=1)
+    title_snapshot: str
+    description_snapshot: str = ""
+    role_summary_snapshot: str = ""
+    created_at: datetime = Field(default_factory=now_utc)
+
+    __table_args__ = (
+        UniqueConstraint("job_id", "version", name="uq_job_version_per_job"),
+    )
+
+
+class CapabilityRequirement(SQLModel, table=True):
+    """A single required capability for one JobVersion.
+
+    References the Alpha-1 Capability SSoT by ``capability_id`` ONLY. The service
+    layer resolves a caller-supplied capability *name* slug to a capability_id
+    and fails closed (422) if the slug is unknown -- no second capability
+    vocabulary is ever created here. ``capability_name`` is a denormalized,
+    display-only snapshot; the authoritative link is ``capability_id``.
+
+    Hardening constraints (W1 hardening, migration ``20260827_0001_...``):
+
+    * ``(job_version_id, capability_id)`` is UNIQUE -- a single JobVersion may
+      require a given Alpha-1 Capability at most once. Duplicates are rejected at
+      the DB layer (the service ``add_capability_requirement`` does not de-dup),
+      so an IntegrityError surfaces instead of silently accumulating rows.
+    * ``capability_id`` FK uses ``ondelete="RESTRICT"`` (NOT CASCADE). Retiring or
+      deleting an Alpha-1 Capability that is still referenced by any Workforce
+      requirement must FAIL EXPLICITLY -- we never silently wipe Workforce
+      hiring history. Only ``job_version`` (the parent) cascades; a Capability
+      can be safely removed only once no requirement references it.
+    """
+
+    __tablename__ = "capability_requirement"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "job_version_id",
+            "capability_id",
+            name="uq_capability_requirement_job_version_capability",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("cr"), primary_key=True)
+    job_version_id: str = Field(
+        foreign_key="job_version.id", ondelete="CASCADE", index=True
+    )
+    capability_id: str = Field(
+        foreign_key="capability.id", ondelete="RESTRICT", index=True
+    )
+    capability_name: str
+    # Required proficiency level on the Alpha-1 capability scale (1..100).
+    min_proficiency: int = Field(default=50, ge=1, le=100)
+    required: bool = True
+    notes: str = ""
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class CandidateStatus(StrEnum):
+    """Minimal lifecycle for a discovered Agent x JobVersion candidate (W2).
+
+    W2 only *discovers* candidates and pools them. The Evaluation/Match/Trial
+    states (EVALUATING -> EVALUATED -> RECOMMENDED) are reserved for W3 and are
+    intentionally NOT enterable in W2 -- see ``workforce.CandidateLifecycle``.
+    """
+
+    POOLED = "pooled"
+    REJECTED = "rejected"
+    # W3+ reserved (not used in W2):
+    # EVALUATING = "evaluating"
+    # EVALUATED = "evaluated"
+    # RECOMMENDED = "recommended"
+
+
+class Candidate(SQLModel, table=True):
+    """A discovered candidate = Agent x Job x Evaluation Context (V1.1, §2).
+
+    Strictly models the cross-product ``Agent x Job x Evaluation Context``:
+
+    * ``agent_id`` is a *soft reference* to the Alpha-1 Agent Registry (SSoT). We
+      store only the id and NEVER copy registry data here; if the agent is later
+      disabled or retired the Candidate keeps pointing at the (still-existing) id
+      and the lifecycle can move it back to POOLED. FK uses ``ondelete="NO ACTION"``
+      so a registry deletion does not silently wipe a discovery's audit trail.
+    * ``job_id`` / ``job_version_id`` are *hard references* with ``ondelete="CASCADE"``.
+      A Job (and its versions) owns its candidate pool; deleting the Job removes its
+      candidates too, which keeps traceability inside the Job's lifecycle.
+    * ``evaluation_context`` is a JSON bag reserved for W3 Evaluation. W2 leaves it
+      empty (``{}``) -- Discovery does NOT evaluate, match, or trial.
+    * The ``(agent_id, job_id, job_version_id)`` triple is UNIQUE, so re-running
+      discovery for the same job version is idempotent (no duplicate rows).
+    """
+
+    __tablename__ = "candidate"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id",
+            "job_id",
+            "job_version_id",
+            name="uq_candidate_agent_job_version",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("cand"), primary_key=True)
+    agent_id: str = Field(
+        foreign_key="agent.id", ondelete="NO ACTION", index=True
+    )
+    job_id: str = Field(
+        foreign_key="job.id", ondelete="CASCADE", index=True
+    )
+    job_version_id: str = Field(
+        foreign_key="job_version.id", ondelete="CASCADE", index=True
+    )
+    # Reserved for W3 Evaluation; W2 always discovers with an empty context.
+    evaluation_context: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON)
+    )
+    status: CandidateStatus = Field(default=CandidateStatus.POOLED, index=True)
+    discovered_by: str = "workforce_discovery"
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)

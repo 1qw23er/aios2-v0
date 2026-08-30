@@ -1,7 +1,7 @@
 """Migration proof for PR #124 -- persist owner-inbox cross-thread series_id.
 
 Asserts from several angles:
-* the Alembic tree still has a single head (now ``20260824_0001_series_id_json_guard``);
+* the Alembic tree still has a single head (now ``20260827_0002_workforce_candidate``);
 * exactly one new migration file was added by #124 (chained after
   ``20260812_0001``);
 * a freshly migrated DB carries the ``series_id`` column + index on all three
@@ -37,7 +37,7 @@ from aios.db import get_engine, run_migrations
 from alembic import command
 
 # Current single leaf of the whole tree (what #124 owns + advances).
-HEAD = "20260824_0001_series_id_json_guard"
+HEAD = "20260827_0002_workforce_candidate"
 SERIES_REVISION = "20260820_0001_series_id"
 SERIES_FILE = "20260820_0001_series_id.py"
 # Previous leaf: the SalesPlaybook V0 follow-up slice. #124 chains directly after it.
@@ -707,11 +707,12 @@ def test_json_guard_skips_malformed_metadata(tmp_path: Path) -> None:
 
 
 def test_json_guard_is_current_head() -> None:
-    """Follow-up #5 (companion): the JSON-guard reinforcement is the single
-    alembic head and chains directly on the base series_id migration. This pins
-    the published-migration-immutability contract: we never edit the base file,
-    we only add on top.
+    """Follow-up #5 (companion): the JSON-guard reinforcement still chains directly
+    on the base series_id migration, and a later migration (e.g. the W1 Workforce
+    core) now sits on top of it as the single alembic head. This pins the
+    published-migration-immutability contract: we never edit the base file, we only
+    add on top.
     """
     _, _, sd = _script_dir()
     assert sd.get_heads() == [HEAD]
-    assert sd.get_revision(HEAD).down_revision == SERIES_REVISION
+    assert sd.get_revision("20260824_0001_series_id_json_guard").down_revision == SERIES_REVISION
