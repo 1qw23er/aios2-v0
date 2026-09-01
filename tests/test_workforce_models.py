@@ -567,13 +567,64 @@ def test_candidate_illegal_transition_rejected_409(tmp_path: Path) -> None:
             reject_candidate(session, cand_id)  # already REJECTED
         assert exc.value.status_code == 409
 
-        # The state machine itself rejects re-entering the same state (and any W3
-        # state, which is not representable in W2).
+        # The state machine itself rejects re-entering the same state.
         with pytest.raises(ServiceError) as exc2:
             CandidateLifecycle.require_transition(
                 CandidateStatus.POOLED, CandidateStatus.POOLED
             )
         assert exc2.value.status_code == 409
+
+        # -- W3-A: edges the evaluation loop ADDED (must be legal) ------------
+        # POOLED -> EVALUATING: entering the evaluation loop.
+        CandidateLifecycle.require_transition(
+            CandidateStatus.POOLED, CandidateStatus.EVALUATING
+        )
+        # EVALUATING -> EVALUATED: the evaluation completed.
+        CandidateLifecycle.require_transition(
+            CandidateStatus.EVALUATING, CandidateStatus.EVALUATED
+        )
+        # EVALUATING -> POOLED: a failed evaluation rolls out of the half-state.
+        CandidateLifecycle.require_transition(
+            CandidateStatus.EVALUATING, CandidateStatus.POOLED
+        )
+        # EVALUATED -> REJECTED: a completed evaluation can still be discarded.
+        CandidateLifecycle.require_transition(
+            CandidateStatus.EVALUATED, CandidateStatus.REJECTED
+        )
+        # REJECTED -> POOLED: re-pool (W2 edge, still the way back in).
+        CandidateLifecycle.require_transition(
+            CandidateStatus.REJECTED, CandidateStatus.POOLED
+        )
+
+        # -- W3-A: edges that stay illegal (409) ------------------------------
+        illegal_edges = [
+            # A rejected candidate must be re-pooled before it can be evaluated.
+            (CandidateStatus.REJECTED, CandidateStatus.EVALUATING),
+            # Evaluation cannot be short-circuited: POOLED must pass EVALUATING.
+            (CandidateStatus.POOLED, CandidateStatus.EVALUATED),
+            # EVALUATED is an immutable snapshot -- no silent rollback to POOLED.
+            # Re-evaluating means EVALUATED -> REJECTED -> POOLED -> EVALUATING.
+            (CandidateStatus.EVALUATED, CandidateStatus.POOLED),
+            # RECOMMENDED remains unreachable until the W3-C/D Match gate lands.
+            (CandidateStatus.EVALUATED, CandidateStatus.RECOMMENDED),
+            (CandidateStatus.POOLED, CandidateStatus.RECOMMENDED),
+            (CandidateStatus.RECOMMENDED, CandidateStatus.POOLED),
+        ]
+        for source, target in illegal_edges:
+            with pytest.raises(ServiceError) as exc3:
+                CandidateLifecycle.require_transition(source, target)
+            assert exc3.value.status_code == 409, f"{source} -> {target} must be 409"
+
+        # No self-loop anywhere in the W3-A state set (an evaluation that
+        # "completes into itself" would erase the crash-recovery signal).
+        for state in (
+            CandidateStatus.EVALUATING,
+            CandidateStatus.EVALUATED,
+            CandidateStatus.RECOMMENDED,
+        ):
+            with pytest.raises(ServiceError) as exc4:
+                CandidateLifecycle.require_transition(state, state)
+            assert exc4.value.status_code == 409, f"{state} -> {state} must be 409"
 
 
 def test_candidate_cascade_on_job_delete(tmp_path: Path) -> None:
