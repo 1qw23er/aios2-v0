@@ -48,7 +48,7 @@ from aios.models import (
 )
 from aios.services import ServiceError
 
-HEAD = "20260827_0002_workforce_candidate"
+HEAD = "20260901_0001_workforce_match_benchmark"
 
 OWNER = ActorContext(kind="owner", owner_id="owner")
 AGENT_PRODUCER = ActorContext(kind="agent", agent_id="producer-1")

@@ -364,7 +364,9 @@ def test_alembic_single_head_is_capreq_hardening() -> None:
     cfg.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
-    assert heads == ["20260827_0002_workforce_candidate"]
+    # Single linear head; W3-B Match/Benchmark advances it past the W2 capreq
+    # hardening head (20260827_0002_workforce_candidate) to 20260901_0001.
+    assert heads == ["20260901_0001_workforce_match_benchmark"]
 
 
 def test_migration_creates_workforce_tables_additively(tmp_path: Path) -> None:
