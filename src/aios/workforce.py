@@ -1,6 +1,6 @@
-"""Workforce Management -- W1 service layer (V1.1 Workforce Architecture).
+"""Workforce Management -- W1/W2/W3-A service layer (V1.1 Workforce Architecture).
 
-This module implements the *definition-time* half of the W1 minimum closed loop:
+This module implements the W1 minimum closed loop (definition time):
 
     BusinessGoal -> RequiredWork -> Job -> JobVersion -> CapabilityRequirement
 
@@ -19,17 +19,36 @@ Design rules (must hold; contract tests assert them):
 4. Referential integrity is enforced at write time (parent-existence checks raise
    ``ServiceError(404)``) and at the DB level (FKs + cascade in the migration).
 
-W2 (Candidate Discovery) is implemented in this module as a STRICT SUBSET of the
-V1.1 W2: it only *discovers* and *pools* candidates (Agent x Job x Evaluation
-Context) by filtering the Agent Registry against a JobVersion's CapabilityRequirements.
-It does NOT evaluate, match, score, benchmark, or trial -- those are W3+ and are
-deliberately absent here. The Candidate lifecycle is the minimal W2 state machine
-(POOLED <-> REJECTED); the W3 states (EVALUATING / EVALUATED / RECOMMENDED) are
-reserved and cannot be entered in W2 (``CandidateLifecycle`` rejects them with 409).
-Employee / Training / Performance remain out of scope.
+W2 (Candidate Discovery) discovers and pools candidates (Agent x Job x Evaluation
+Context) by filtering the Agent Registry against a JobVersion's
+CapabilityRequirements. It does NOT evaluate, match, score, benchmark, or trial.
+
+W3-A (Evaluation) adds the first half of the evaluation loop:
+
+    Candidate(POOLED) -> EVALUATING -> EVALUATED
+
+``evaluate_candidate`` writes its evidence into ``Candidate.evaluation_context``
+(W2's reserved JSON bag -- no new table). Its hard rules:
+
+* The ONLY capability signal is ``AgentCapability.priority`` (Alpha-1 SSoT). The
+  denormalized ``Agent.capabilities`` JSON mirror is never read.
+* ``benchmark`` / ``cost`` / ``reliability`` / ``historical`` have no backing data
+  yet, so they are recorded as ``unknown`` / ``future_capability`` and NEVER as a
+  numeric score. Fabricating a placeholder score is a contract violation.
+* Any failure rolls the candidate back to POOLED with ``evaluation_error`` -- the
+  EVALUATING half-state must never survive the call.
+
+Still absent (later stages): Match/Ranking, Benchmark tables, Recommendation,
+Trial, and ``EVALUATED -> RECOMMENDED`` (blocked until the Match gate). Employee /
+Training / Performance stay out of scope.
+
+Spec: ``docs/Workforce_W3_Evaluation_Matching_Spec_V1.md`` (approved by R7).
+Implementation design: ``docs/Workforce_W3A_Evaluation_Implementation_Design.md``.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
@@ -37,6 +56,7 @@ from sqlmodel import Session, select
 from aios.agent_registry import get_agent, list_agents
 from aios.audit import append_audit
 from aios.models import (
+    AgentCapability,
     BusinessGoal,
     BusinessGoalStatus,
     Candidate,
@@ -391,18 +411,46 @@ def list_capability_requirements(
 
 
 class CandidateLifecycle:
-    """Explicit, boundary-checked W2 candidate state machine.
+    """Explicit, boundary-checked candidate state machine (W2 + W3-A).
 
-    W2 only knows POOLED <-> REJECTED. The W3 states (EVALUATING / EVALUATED /
-    RECOMMENDED) are intentionally NOT part of W2 -- any transition attempting to
-    enter them is rejected with 409, so Discovery can never silently drift into
-    Evaluation territory. A REJECTED candidate may be re-pooled (returned to the
-    pool) since the Agent Registry is the SSoT and the agent may have recovered.
+    W2 owns POOLED <-> REJECTED: a REJECTED candidate may be re-pooled since the
+    Agent Registry is the SSoT and the agent may have recovered.
+
+    W3-A adds the *Evaluation* half of the lifecycle:
+
+        POOLED -> EVALUATING -> EVALUATED
+        EVALUATING -> POOLED          (evaluation failed; rolls back, never a half-state)
+        EVALUATED -> REJECTED         (evaluation is an immutable snapshot)
+
+    Deliberately NOT present in W3-A:
+
+        EVALUATED -> RECOMMENDED      -- requires the W3-C/D Match gate
+        RECOMMENDED -> *              -- zero edges; the state is unreachable
+
+    ``RECOMMENDED`` is a real ``CandidateStatus`` member (stable vocabulary) but
+    it is mapped to an empty edge set here, so every attempted transition into or
+    out of it is rejected with 409. Tests assert this explicitly so the state
+    cannot be wired up ahead of the Match gate.
+
+    Evaluation is treated as immutable history (like W1 JobVersion): re-evaluating
+    requires ``EVALUATED -> REJECTED -> POOLED -> EVALUATING``, which keeps every
+    attempt auditable.
     """
 
     ALLOWED: dict[CandidateStatus, set[CandidateStatus]] = {
-        CandidateStatus.POOLED: {CandidateStatus.REJECTED},
+        CandidateStatus.POOLED: {
+            CandidateStatus.REJECTED,
+            CandidateStatus.EVALUATING,
+        },
         CandidateStatus.REJECTED: {CandidateStatus.POOLED},
+        CandidateStatus.EVALUATING: {
+            CandidateStatus.EVALUATED,
+            CandidateStatus.POOLED,
+        },
+        CandidateStatus.EVALUATED: {CandidateStatus.REJECTED},
+        # EVALUATED -> RECOMMENDED lands with the W3-C/D Match gate. Until then
+        # RECOMMENDED has no inbound and no outbound edge (unreachable by design).
+        CandidateStatus.RECOMMENDED: set(),
     }
 
     @classmethod
@@ -643,5 +691,318 @@ def repool_candidate(
         before=before,
         after={"status": cand.status.value},
         idempotency_key=f"repool:{candidate_id}",
+    )
+    return cand
+
+
+# ---------------------------------------------------------------------------
+# W3-A -- Candidate Evaluation (POOLED -> EVALUATING -> EVALUATED)
+# ---------------------------------------------------------------------------
+
+EVALUATION_CONTEXT_SCHEMA_V1 = "w3a.evaluation.v1"
+"""Version tag stamped into ``Candidate.evaluation_context["schema_version"]``."""
+
+PREFERRED_BONUS_WEIGHT = 0.05
+"""Ceiling on the nudge a *preferred* (non-required) requirement can contribute.
+
+``capability_fit`` is driven by the required requirements; preferred ones add at
+most this share so they can never outvote a hard capability gap (Spec §5.1:
+"微量加成，不喧宾夺主").
+"""
+
+_EVALUATION_ERROR_LIMIT = 500
+"""Truncation applied to the recorded ``evaluation_error.message``."""
+
+
+def _capability_fit_value(agent_priority: int, min_proficiency: int) -> float:
+    """``clamp((p - min) / (100 - min), 0, 1)`` with an zero-division guard.
+
+    ``CapabilityRequirement.min_proficiency`` is ``ge=1, le=100``, so a threshold
+    of 100 makes the denominator zero. That edge is pinned explicitly instead of
+    raising: full marks only at priority 100, otherwise nothing.
+    """
+    if min_proficiency >= 100:
+        return 1.0 if agent_priority >= 100 else 0.0
+    return max(
+        0.0, min(1.0, (agent_priority - min_proficiency) / (100 - min_proficiency))
+    )
+
+
+def _collect_capability_evidence(
+    session: Session,
+    agent_id: str,
+    reqs: list[CapabilityRequirement],
+) -> dict[str, Any]:
+    """Build the capability-fit evidence block from the Alpha-1 SSoT.
+
+    The ONLY signal consulted is ``AgentCapability.priority``. The denormalized
+    ``Agent.capabilities`` JSON mirror is display-only and is never read here.
+    An undeclared or disabled capability counts as priority 0 -- fail-closed,
+    never "unknown, assume average" (Spec §2.2).
+    """
+    rows: list[dict[str, Any]] = []
+    required_fits: list[float] = []
+    preferred_fits: list[float] = []
+    blocked: list[str] = []
+
+    for req in reqs:
+        ac = session.exec(
+            select(AgentCapability)
+            .where(AgentCapability.agent_id == agent_id)
+            .where(AgentCapability.capability_id == req.capability_id)
+        ).first()
+        declared = ac is not None
+        enabled = bool(ac.enabled) if declared else False
+        # Spec §2.2: undeclared OR disabled -> priority 0 -> fail-closed.
+        priority = int(ac.priority) if (declared and enabled) else 0
+        meets = priority >= req.min_proficiency
+        rows.append(
+            {
+                "capability_id": req.capability_id,
+                "capability_name": req.capability_name,
+                "required": bool(req.required),
+                "min_proficiency": int(req.min_proficiency),
+                "agent_priority": priority,
+                "declared": declared,
+                "capability_enabled": enabled,
+                "meets_threshold": meets,
+                "fit": _capability_fit_value(priority, int(req.min_proficiency)),
+            }
+        )
+        if req.required:
+            required_fits.append(rows[-1]["fit"])
+            if not meets:
+                blocked.append(req.id)
+        else:
+            preferred_fits.append(rows[-1]["fit"])
+
+    if not required_fits:
+        # Fail closed: with no hard threshold there is nothing to score, and
+        # inventing a default (e.g. 0.5) would be a fabricated score. Matches
+        # discover_candidates' "nothing to filter against -> 422" discipline.
+        raise ServiceError(
+            422,
+            "job version has no required capability requirements to evaluate against",
+        )
+
+    base = sum(required_fits) / len(required_fits)
+    if preferred_fits:
+        bonus = PREFERRED_BONUS_WEIGHT * (sum(preferred_fits) / len(preferred_fits))
+        capability_fit = min(1.0, base + bonus)
+    else:
+        capability_fit = base
+
+    return {
+        "status": "computed",
+        "requirements": rows,
+        "capability_fit": capability_fit,
+        "threshold_passed": not blocked,
+        "blocked_requirements": blocked,
+    }
+
+
+def _build_evaluation_context(
+    session: Session,
+    cand: Candidate,
+    *,
+    evaluator: str,
+    attempt: int,
+) -> dict[str, Any]:
+    """Assemble the full W3-A evidence bag for ``cand``.
+
+    Only ``capability_evidence`` is genuinely computed here. The other four
+    dimensions have NO backing data in the current model (no benchmark table, no
+    cost schema, no reliability series, no Employee history), so they are recorded
+    as ``unknown`` / ``future_capability`` -- never as a numeric score. That is the
+    "no fabricated scores" contract (Spec §2.5 F3, §3.4, §3.6) and it is asserted
+    by the contract tests.
+    """
+    # Soft reference to the Alpha-1 registry: a retired agent is a hard 404.
+    get_agent(session, cand.agent_id)
+    reqs = list_capability_requirements(session, cand.job_version_id)
+    capability = _collect_capability_evidence(session, cand.agent_id, reqs)
+    return {
+        "schema_version": EVALUATION_CONTEXT_SCHEMA_V1,
+        "attempt": attempt,
+        "evaluated_at": now_utc().isoformat(),
+        "evaluator": evaluator,
+        # Spec §2.1: the components actually computed (drives explainability).
+        "evaluated_fields": ["capability_fit"],
+        "capability_evidence": capability,
+        "benchmark_evidence": {
+            "status": "unknown",
+            "waived": True,
+            "reason": "JobVersion has no benchmark_version binding yet (W3-B)",
+        },
+        "cost_evidence": {
+            "status": "unknown",
+            "reason": "Agent.cost_policy has no defined schema (W5 Budget domain)",
+        },
+        "reliability_evidence": {
+            "status": "future_capability",
+            "reason": "Alpha-1 Agent model has no success-rate / availability series",
+        },
+        "historical_evidence": {
+            "status": "future_capability",
+            "reason": "Employee / Performance data is W4+",
+        },
+        # Spec §2.5 F1: a hard capability gap blocks recommendation. W3-A has no
+        # EVALUATED -> RECOMMENDED edge yet; this field is the forward contract
+        # the W3-C/D Match gate must honour.
+        "recommendation_blocked_reason": (
+            None if capability["threshold_passed"] else "capability_gap"
+        ),
+        "evaluation_error": None,
+    }
+
+
+def evaluate_candidate(
+    session: Session,
+    candidate_id: str,
+    *,
+    evaluator: str = "workforce_evaluation",
+) -> Candidate:
+    """Evaluate a POOLED candidate (W3-A): POOLED -> EVALUATING -> EVALUATED.
+
+    Contracts (asserted by ``tests/test_workforce_evaluation_w3a.py``):
+
+    * An already-EVALUATED candidate is returned unchanged -- replaying the call
+      writes no second audit row and does not bump ``attempt`` (idempotent).
+    * Entering EVALUATING is legal only from POOLED. REJECTED must be re-pooled
+      first and EVALUATED is an immutable snapshot; anything else is a 409.
+    * An EVALUATING candidate (residue of a crashed run) is *resumed*: the call
+      recomputes from scratch and completes it, so no half-state can survive.
+    * Any failure rolls the candidate back to POOLED with ``evaluation_error`` and
+      the exception is re-raised -- the caller always learns the evaluation
+      failed. The EVALUATING half-state never survives the call.
+    * Evidence lands in ``Candidate.evaluation_context``; no table is created.
+    """
+    cand = session.get(Candidate, candidate_id)
+    if cand is None:
+        raise ServiceError(404, f"candidate not found: {candidate_id}")
+
+    if cand.status == CandidateStatus.EVALUATED:
+        # Idempotent replay: an evaluation is an immutable snapshot, so the
+        # existing result IS the answer. No state change, no duplicate audit.
+        return cand
+
+    # EVALUATING is resumable (crash recovery); every other source state must be
+    # a legal transition target check.
+    if cand.status != CandidateStatus.EVALUATING:
+        CandidateLifecycle.require_transition(cand.status, CandidateStatus.EVALUATING)
+
+    attempt = int(cand.evaluation_context.get("attempt", 0)) + 1
+    before = {"status": cand.status.value, "attempt": attempt}
+    # Remembered so a failed *claim* (409) can put the row back exactly where it
+    # was. Without this the candidate would stay EVALUATING in the caller's
+    # session and a caller that swallows the 409 and commits would persist the
+    # half-state -- the same failure mode the evaluation body guards against.
+    prior_status = cand.status
+
+    cand.status = CandidateStatus.EVALUATING
+    cand.updated_at = now_utc()
+    session.add(cand)
+    session.flush()
+    try:
+        with session.begin_nested():
+            append_audit(
+                session,
+                actor=evaluator,
+                action="candidate.evaluate.start",
+                resource_type="candidate",
+                resource_id=cand.id,
+                project_id=None,
+                task_id=None,
+                before=before,
+                after={
+                    "status": CandidateStatus.EVALUATING.value,
+                    "attempt": attempt,
+                },
+                idempotency_key=f"evaluate:start:{candidate_id}:{attempt}",
+            )
+            session.flush()
+    except IntegrityError as exc:
+        # Another evaluation already claimed (candidate, attempt) -- i.e. a
+        # concurrent caller. The SAVEPOINT has rolled back so the outer
+        # transaction is intact; read the authoritative row from a fresh
+        # connection (mirrors the P2-1 pattern in ``discover_candidates``).
+        with Session(session.get_bind()) as fresh:
+            authoritative = fresh.get(Candidate, candidate_id)
+        if (
+            authoritative is not None
+            and authoritative.status == CandidateStatus.EVALUATED
+        ):
+            # The other caller completed the work; adopt its committed result.
+            session.expire(cand)
+            return session.get(Candidate, candidate_id) or cand
+        # Still POOLED / EVALUATING: we must never report success for work we did
+        # not do -- that would be a silent fail-open. Restore the pre-claim status
+        # first so a caller that swallows this 409 and commits still leaves the
+        # row in a legal, resumable state (never an EVALUATING half-state).
+        cand.status = prior_status
+        session.add(cand)
+        session.flush()
+        raise ServiceError(
+            409, f"candidate evaluation already in progress: {candidate_id}"
+        ) from exc
+
+    try:
+        context = _build_evaluation_context(
+            session, cand, evaluator=evaluator, attempt=attempt
+        )
+    except Exception as exc:
+        # Spec §2.4 / F2: never leave the candidate in the EVALUATING half-state.
+        cand.status = CandidateStatus.POOLED
+        cand.evaluation_context = {
+            **cand.evaluation_context,
+            "attempt": attempt,
+            "evaluation_error": {
+                "type": type(exc).__name__,
+                "message": str(exc)[:_EVALUATION_ERROR_LIMIT],
+            },
+        }
+        cand.updated_at = now_utc()
+        session.add(cand)
+        session.flush()
+        append_audit(
+            session,
+            actor=evaluator,
+            action="candidate.evaluate.error",
+            resource_type="candidate",
+            resource_id=cand.id,
+            project_id=None,
+            task_id=None,
+            before=before,
+            after={
+                "status": CandidateStatus.POOLED.value,
+                "attempt": attempt,
+                "error": cand.evaluation_context["evaluation_error"],
+            },
+            idempotency_key=f"evaluate:error:{candidate_id}:{attempt}",
+        )
+        raise
+
+    cand.evaluation_context = context
+    cand.status = CandidateStatus.EVALUATED
+    cand.updated_at = now_utc()
+    session.add(cand)
+    session.flush()
+    append_audit(
+        session,
+        actor=evaluator,
+        action="candidate.evaluate",
+        resource_type="candidate",
+        resource_id=cand.id,
+        project_id=None,
+        task_id=None,
+        before=before,
+        after={
+            "status": CandidateStatus.EVALUATED.value,
+            "attempt": attempt,
+            "evaluated_fields": context["evaluated_fields"],
+            "capability_fit": context["capability_evidence"]["capability_fit"],
+            "recommendation_blocked_reason": context["recommendation_blocked_reason"],
+        },
+        idempotency_key=f"evaluate:{candidate_id}:{attempt}",
     )
     return cand

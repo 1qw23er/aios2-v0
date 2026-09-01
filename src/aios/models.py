@@ -1531,19 +1531,34 @@ class CapabilityRequirement(SQLModel, table=True):
 
 
 class CandidateStatus(StrEnum):
-    """Minimal lifecycle for a discovered Agent x JobVersion candidate (W2).
+    """Lifecycle for a discovered Agent x JobVersion candidate (W2 + W3).
 
-    W2 only *discovers* candidates and pools them. The Evaluation/Match/Trial
-    states (EVALUATING -> EVALUATED -> RECOMMENDED) are reserved for W3 and are
-    intentionally NOT enterable in W2 -- see ``workforce.CandidateLifecycle``.
+    W2 discovers candidates and pools them (POOLED <-> REJECTED). W3-A promotes
+    the three reserved evaluation states to real members:
+
+    * ``EVALUATING`` -- in-progress evaluation. Entered only from POOLED. Any
+      failure rolls the candidate back to POOLED and records
+      ``evaluation_context["evaluation_error"]`` -- it must never linger as a
+      half-state.
+    * ``EVALUATED`` -- evaluation completed; evidence lives in
+      ``Candidate.evaluation_context`` (no separate table in W3 V1).
+    * ``RECOMMENDED`` -- promoted in W3-A as a *real* enum member but
+      deliberately left UNREACHABLE: ``workforce.CandidateLifecycle`` grants it
+      zero inbound and zero outbound edges until the W3-C/D Match gate is
+      implemented. It is declared here so downstream code and migrations see a
+      stable vocabulary, while tests assert it cannot yet be entered.
+
+    NOTE (zero-migration): the ``candidate.status`` column is a plain
+    ``sa.String()`` (migration ``20260827_0002_workforce_candidate``), NOT a DB
+    ENUM -- adding members here therefore requires no schema change.
     """
 
     POOLED = "pooled"
     REJECTED = "rejected"
-    # W3+ reserved (not used in W2):
-    # EVALUATING = "evaluating"
-    # EVALUATED = "evaluated"
-    # RECOMMENDED = "recommended"
+    # W3-A: promoted from the W2 reserved placeholders above.
+    EVALUATING = "evaluating"
+    EVALUATED = "evaluated"
+    RECOMMENDED = "recommended"
 
 
 class Candidate(SQLModel, table=True):
