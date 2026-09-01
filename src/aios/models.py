@@ -1477,6 +1477,15 @@ class JobVersion(SQLModel, table=True):
     description_snapshot: str = ""
     role_summary_snapshot: str = ""
     created_at: datetime = Field(default_factory=now_utc)
+    # W3-B: optional binding to the head BenchmarkVersion for this job version.
+    # Only the head version may be bound (W1 immutable-history principle); historical
+    # versions stay frozen. Unbound => the Benchmark dimension is waived in Match.
+    benchmark_version_id: str | None = Field(
+        default=None,
+        foreign_key="benchmark_version.id",
+        ondelete="CASCADE",
+        index=True,
+    )
 
     __table_args__ = (
         UniqueConstraint("job_id", "version", name="uq_job_version_per_job"),
@@ -1609,3 +1618,187 @@ class Candidate(SQLModel, table=True):
     discovered_by: str = "workforce_discovery"
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
+
+
+# ---------------------------------------------------------------------------
+# W3-B: Match / Ranking & Benchmark (see docs/Workforce_W3B_Match_Benchmark_Spec_V1.md)
+# All additive -- no change to W1/W2/W3-A models above. W3-B does NOT move
+# Candidate.status and does NOT write evaluation_context (W3-A frozen, constraint 1).
+# ---------------------------------------------------------------------------
+
+
+class BenchmarkResultStatus(StrEnum):
+    """Outcome of a single benchmark run (W3-B fail-closed, F2)."""
+
+    RECORDED = "recorded"
+    UNKNOWN = "unknown"  # run failed / output unverifiable -> never a fake score
+
+
+class MatchStatus(StrEnum):
+    """Outcome of a Match computation (W3-B fail-closed, F1)."""
+
+    COMPUTED = "computed"
+    BLOCKED = "blocked"  # capability_gap; still scored to the floor, must not be recommended
+
+
+class Benchmark(SQLModel, table=True):
+    """A benchmark template (exam blueprint): a named, versioned suite of cases.
+
+    Immutable definitions live on ``BenchmarkVersion`` (one row per version). The
+    template itself only carries identity + owner metadata; the version chain is what
+    gets frozen and run. W3-B V1 does NOT wire this to ai-arena or any external LLM
+    adversarial adapter (constraint 8) -- it is the bookkeeping shell that a
+    deterministic internal adapter (and later, an external adapter behind the
+    ``BenchmarkAdapter`` seam) attaches to.
+    """
+
+    __tablename__ = "benchmark"
+
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_benchmark_name"),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("bm"), primary_key=True)
+    name: str
+    description: str = ""
+    # Who defined the benchmark (human/system); intentionally NOT a forced FK.
+    owner: str = "workforce"
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class BenchmarkVersion(SQLModel, table=True):
+    """An immutable versioned snapshot of one Benchmark's definition.
+
+    ``definition_json`` is a frozen snapshot of the cases + scoring rubric + expected
+    output shape. Once written it MUST NOT be UPDATE'd -- changing a benchmark means
+    minting a NEW version row, never mutating the old binding (W3-Spec §4.4 / risk
+    P1-1: prevents silent distortion of historical evaluations). The service layer
+    enforces immutability; the column is writable but the contract forbids re-binding.
+    """
+
+    __tablename__ = "benchmark_version"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "benchmark_id", "version", name="uq_benchmark_version"
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("bv"), primary_key=True)
+    benchmark_id: str = Field(
+        foreign_key="benchmark.id", ondelete="CASCADE", index=True
+    )
+    version: int = Field(default=1, ge=1)
+    definition_json: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON)
+    )
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class BenchmarkResult(SQLModel, table=True):
+    """A recorded run of one agent (via its Candidate) against one BenchmarkVersion.
+
+    Evidence is NOT inlined: ``output_ref`` holds only a reference; the agent snapshot
+    + environment + reproducibility_hash capture provenance for reproducibility
+    (W3-Spec §4.3 / constraint 6 -- "recorded provenance, reproducible, NOT
+    bit-exact").
+
+    fail-closed (F2): if a run cannot produce trustworthy scores, the row is still
+    written with ``status="unknown"`` and ``passed_cases/quality_score=None`` -- we
+    NEVER write 0 or an estimated value.
+    """
+
+    __tablename__ = "benchmark_result"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "candidate_id",
+            "benchmark_version_id",
+            "run_id",
+            name="uq_benchmark_result_run",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("br"), primary_key=True)
+    candidate_id: str = Field(
+        foreign_key="candidate.id", ondelete="CASCADE", index=True
+    )
+    benchmark_version_id: str = Field(
+        foreign_key="benchmark_version.id", ondelete="RESTRICT", index=True
+    )
+    run_id: str
+    # null => status=unknown (fail-closed, never a fake score).
+    passed_cases: int | None = None
+    total_cases: int | None = None
+    quality_score: float | None = None
+    # Content-addressed controlled input (record provenance, not bit-exact).
+    input_hash: str = ""
+    # Reference to output storage (never inlined).
+    output_ref: str | None = None
+    agent_snapshot_json: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON)
+    )
+    environment: str = ""
+    reproducibility_hash: str = ""
+    status: BenchmarkResultStatus = Field(default=BenchmarkResultStatus.UNKNOWN)
+    evaluator: str = "workforce_benchmark"
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class Match(SQLModel, table=True):
+    """A match score for one EVALUATED Candidate against one JobVersion.
+
+    Decoupled from ``Candidate`` (W3-Spec §3.1): recomputation/ranking happens on this
+    table WITHOUT mutating the evaluation snapshot or ``Candidate.status`` (W3-A
+    frozen, constraint 1). The score aggregates ``capability_fit`` (always present,
+    read from W3-A's ``evaluation_context.capability_evidence`` -- W3-B does NOT
+    recompute it) and, when a trusted ``benchmark_result`` exists, ``benchmark_score``
+    (waived otherwise).
+
+    Explainability is mandatory (constraint 5): ``breakdown`` + ``evidence_refs`` are
+    always populated.
+
+    fail-closed (F1): when ``capability_evidence.threshold_passed is False`` the match
+    is still produced (scoring to the floor) but ``status="blocked"`` with
+    ``match_blocked_reason="capability_gap"`` -- W3-C's ``recommend_candidate`` must
+    read this and refuse to recommend.
+    """
+
+    __tablename__ = "match"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "candidate_id",
+            "job_version_id",
+            name="uq_match_candidate_job_version",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("mt"), primary_key=True)
+    candidate_id: str = Field(
+        foreign_key="candidate.id", ondelete="CASCADE", index=True
+    )
+    job_version_id: str = Field(
+        foreign_key="job_version.id", ondelete="CASCADE", index=True
+    )
+    score: float = Field(default=0.0)
+    weights_version: str = "w3b.match.v1"
+    breakdown: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON)
+    )
+    evaluated_fields: list[str] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    evidence_refs: list[str] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    benchmark_version_id: str | None = Field(
+        default=None,
+        foreign_key="benchmark_version.id",
+        ondelete="SET NULL",
+        index=True,
+    )
+    status: MatchStatus = Field(default=MatchStatus.COMPUTED)
+    match_blocked_reason: str | None = None
+    evaluator: str = "workforce_match"
+    created_at: datetime = Field(default_factory=now_utc)

@@ -38,9 +38,26 @@ W3-A (Evaluation) adds the first half of the evaluation loop:
 * Any failure rolls the candidate back to POOLED with ``evaluation_error`` -- the
   EVALUATING half-state must never survive the call.
 
-Still absent (later stages): Match/Ranking, Benchmark tables, Recommendation,
-Trial, and ``EVALUATED -> RECOMMENDED`` (blocked until the Match gate). Employee /
-Training / Performance stay out of scope.
+Still absent (later stages): Recommendation (W3-C), Trial (W3-D), and
+``EVALUATED -> RECOMMENDED`` (the W3-C Match gate, which consumes the W3-B Match and
+must refuse any ``blocked`` one). Employee / Training / Performance stay out of scope.
+
+W3-B (Match / Ranking & Benchmark) adds the *scoring* layer on top of W3-A's frozen
+evaluation snapshot, as a side channel that NEVER mutates ``Candidate.status`` or
+``Candidate.evaluation_context`` (W3-A is frozen, constraint 1):
+
+    EVALUATED --(compute_match)--> Match(score, breakdown, evidence_refs)
+              --(rank_candidates)--> Ranking (query only, no state change)
+              --(run_benchmark)--> BenchmarkResult (provenance evidence only)
+
+``compute_match`` reads W3-A's already-computed ``capability_evidence`` and (when a
+trusted ``benchmark_result`` exists) folds in ``benchmark_score``. It is fail-closed:
+a capability gap marks the Match ``blocked``; an untrusted/absent benchmark waives the
+benchmark dimension instead of writing a fake 0. ``reliability`` / ``historical`` /
+``cost`` remain ``future_capability`` / ``unknown`` and are excluded from the score
+(constraint 2). Benchmark execution is a pluggable ``BenchmarkAdapter`` seam -- V1
+ships a deterministic placeholder that records ``unknown`` (no ai-arena wiring,
+constraint 8); a real adapter is plugged in later behind the same interface.
 
 Spec: ``docs/Workforce_W3_Evaluation_Matching_Spec_V1.md`` (approved by R7).
 Implementation design: ``docs/Workforce_W3A_Evaluation_Implementation_Design.md``.
@@ -48,7 +65,10 @@ Implementation design: ``docs/Workforce_W3A_Evaluation_Implementation_Design.md`
 
 from __future__ import annotations
 
-from typing import Any
+import hashlib
+import json
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
@@ -57,6 +77,10 @@ from aios.agent_registry import get_agent, list_agents
 from aios.audit import append_audit
 from aios.models import (
     AgentCapability,
+    Benchmark,
+    BenchmarkResult,
+    BenchmarkResultStatus,
+    BenchmarkVersion,
     BusinessGoal,
     BusinessGoalStatus,
     Candidate,
@@ -66,6 +90,8 @@ from aios.models import (
     Job,
     JobStatus,
     JobVersion,
+    Match,
+    MatchStatus,
     RequiredWork,
     RequiredWorkStatus,
     now_utc,
@@ -1006,3 +1032,635 @@ def evaluate_candidate(
         idempotency_key=f"evaluate:{candidate_id}:{attempt}",
     )
     return cand
+
+
+# ---------------------------------------------------------------------------
+# W3-B -- Match / Ranking & Benchmark (side channel over W3-A's frozen snapshot)
+# ---------------------------------------------------------------------------
+#
+# W3-B NEVER writes Candidate.status or Candidate.evaluation_context (W3-A frozen,
+# constraint 1). It consumes the capability_evidence W3-A already computed and adds
+# a benchmark provenance layer. All writes go to the four W3-B tables only.
+# ---------------------------------------------------------------------------
+
+MATCH_WEIGHTS_VERSION = "w3b.match.v1"
+"""Version tag stamped into ``Match.weights_version`` and ``Match.breakdown``."""
+
+MATCH_WEIGHTS_V1: dict[str, float] = {
+    "capability_fit": 0.6,
+    "benchmark_score": 0.4,  # only counted when bound AND a trusted result exists
+}
+"""W3-B aggregation weights (defined here, at the point of first use -- D9)."""
+
+
+# ---------------------------------------------------------------------------
+# Benchmark template + version bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def create_benchmark(
+    session: Session,
+    *,
+    name: str,
+    description: str = "",
+    owner: str = "workforce",
+) -> Benchmark:
+    """Create a named benchmark template (the version chain hangs off it)."""
+    bench = Benchmark(name=name, description=description, owner=owner)
+    try:
+        with session.begin_nested():
+            session.add(bench)
+            session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        raise ServiceError(
+            409, f"benchmark name already exists: {name}"
+        ) from exc
+    return bench
+
+
+def create_benchmark_version(
+    session: Session,
+    *,
+    benchmark_id: str,
+    definition_json: dict[str, Any],
+    version: int | None = None,
+) -> BenchmarkVersion:
+    """Mint an immutable BenchmarkVersion.
+
+    ``definition_json`` is frozen on write -- it must NEVER be UPDATE'd (use a new
+    version instead, see ``update_benchmark_version_definition`` which refuses). The
+    service auto-assigns ``version`` (max+1 per benchmark) when omitted.
+    """
+    parent = session.get(Benchmark, benchmark_id)
+    if parent is None:
+        raise ServiceError(404, f"benchmark not found: {benchmark_id}")
+
+    if version is None:
+        current = session.exec(
+            select(BenchmarkVersion.version)
+            .where(BenchmarkVersion.benchmark_id == benchmark_id)
+        ).all()
+        version = (max(current) if current else 0) + 1
+
+    bv = BenchmarkVersion(
+        benchmark_id=benchmark_id,
+        version=version,
+        definition_json=definition_json,
+    )
+    try:
+        with session.begin_nested():
+            session.add(bv)
+            session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        raise ServiceError(
+            409,
+            f"benchmark_version already exists: benchmark={benchmark_id} version={version}",
+        ) from exc
+    return bv
+
+
+def _require_benchmark_version(
+    session: Session, benchmark_version_id: str
+) -> BenchmarkVersion:
+    bv = session.get(BenchmarkVersion, benchmark_version_id)
+    if bv is None:
+        raise ServiceError(
+            404, f"benchmark_version not found: {benchmark_version_id}"
+        )
+    return bv
+
+
+def update_benchmark_version_definition(
+    session: Session, benchmark_version_id: str, new_definition_json: dict[str, Any]
+) -> BenchmarkVersion:
+    """Refuse to mutate a frozen BenchmarkVersion (immutability guard, T-BENCH-1).
+
+    Changing a benchmark MUST mint a new version, never re-bind the old one -- this
+    prevents silent distortion of historical evaluations (W3-Spec §4.4 / risk P1-1).
+    """
+    _require_benchmark_version(session, benchmark_version_id)
+    raise ServiceError(
+        409,
+        "benchmark_version.definition_json is immutable; mint a new version instead",
+    )
+
+
+def bind_job_version_benchmark(
+    session: Session, job_version_id: str, benchmark_version_id: str
+) -> JobVersion:
+    """Bind a (head) JobVersion to a BenchmarkVersion.
+
+    Only the head version should be bound (W1 immutable-history principle); the
+    caller owns that guarantee. Unbinding is ``bind_job_version_benchmark(session,
+    jv_id, None)``.
+    """
+    jv = session.get(JobVersion, job_version_id)
+    if jv is None:
+        raise ServiceError(404, f"job_version not found: {job_version_id}")
+    if benchmark_version_id is not None:
+        _require_benchmark_version(session, benchmark_version_id)
+    jv.benchmark_version_id = benchmark_version_id
+    session.add(jv)
+    session.flush()
+    return jv
+
+
+# ---------------------------------------------------------------------------
+# Benchmark execution seam (Adapter) + deterministic V1 placeholder
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BenchmarkOutcome:
+    """What a ``BenchmarkAdapter.run`` returns.
+
+    The adapter owns *execution* only; persistence (id, audit, reproducibility
+    hash) stays in ``run_benchmark``. ``trusted=False`` is the fail-closed signal:
+    ``run_benchmark`` records ``status="unknown"`` and never writes a fake score.
+    """
+
+    passed_cases: int | None
+    total_cases: int | None
+    quality_score: float | None
+    output_ref: str | None = None
+    environment: str = ""
+    trusted: bool = True
+
+
+class BenchmarkAdapter(Protocol):
+    """Execution seam for a benchmark run (design-spec §3.1).
+
+    Implementations plug in behind this interface. V1 ships only a deterministic
+    placeholder (no ai-arena / external LLM wiring -- constraint 8); a real adapter
+    is added later and must NOT reverse-depend on the Workforce core.
+    """
+
+    def run(
+        self, candidate: Candidate, benchmark_version: BenchmarkVersion
+    ) -> BenchmarkOutcome: ...
+
+
+@dataclass
+class _DefaultBenchmarkAdapter:
+    """V1 placeholder: no execution backend exists yet.
+
+    Returns an untrusted outcome so ``run_benchmark`` records ``status="unknown"``
+    (fail-closed) rather than fabricating a score. A real adapter replaces this.
+    """
+
+    def run(
+        self, candidate: Candidate, benchmark_version: BenchmarkVersion
+    ) -> BenchmarkOutcome:
+        return BenchmarkOutcome(
+            passed_cases=None,
+            total_cases=None,
+            quality_score=None,
+            trusted=False,
+        )
+
+
+def _case_set_hash(definition_json: dict[str, Any]) -> str:
+    blob = json.dumps(definition_json or {}, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _reproducibility_hash(
+    benchmark_version_id: str,
+    definition_json: dict[str, Any],
+    agent_id: str,
+    agent_snapshot: list[dict[str, Any]],
+    input_hash: str,
+) -> str:
+    """Hash of the five provenance pillars (constraint 6: traceable, not bit-exact).
+
+    Same five inputs -> same hash; changing any one (agent capability, input,
+    version, case set, or agent) -> different hash -> treated as a different run.
+    """
+    components = {
+        "benchmark_version_id": benchmark_version_id,
+        "case_set_hash": _case_set_hash(definition_json),
+        "agent_id": agent_id,
+        "agent_capability_snapshot": agent_snapshot,
+        "input_hash": input_hash,
+    }
+    blob = json.dumps(components, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def run_benchmark(
+    session: Session,
+    candidate_id: str,
+    benchmark_version_id: str,
+    run_id: str,
+    *,
+    adapter: BenchmarkAdapter | None = None,
+    environment: str = "",
+    input_hash: str = "",
+    evaluator: str = "workforce_benchmark",
+) -> BenchmarkResult:
+    """Run (or re-run idempotently) a benchmark for a candidate.
+
+    Idempotency: replaying the same ``(candidate_id, benchmark_version_id, run_id)``
+    returns the existing ``BenchmarkResult`` without re-executing. A concurrent
+    first-run race is absorbed by a SAVEPOINT (P2-1): the winning row is adopted,
+    otherwise 409 (fail-closed, never silent success).
+
+    fail-closed (F2): if the adapter raises or returns an untrusted / unverifiable
+    outcome, the row is still written with ``status="unknown"`` and
+    ``passed_cases/quality_score=None`` -- never a fake 0 or estimate.
+    """
+    cand = session.get(Candidate, candidate_id)
+    if cand is None:
+        raise ServiceError(404, f"candidate not found: {candidate_id}")
+    bv = _require_benchmark_version(session, benchmark_version_id)
+
+    existing = session.exec(
+        select(BenchmarkResult).where(
+            BenchmarkResult.candidate_id == candidate_id,
+            BenchmarkResult.benchmark_version_id == benchmark_version_id,
+            BenchmarkResult.run_id == run_id,
+        )
+    ).first()
+    if existing is not None:
+        return existing
+
+    caps = session.exec(
+        select(AgentCapability).where(AgentCapability.agent_id == cand.agent_id)
+    ).all()
+    snapshot = [
+        {
+            "capability_id": c.capability_id,
+            "priority": int(c.priority),
+            "enabled": bool(c.enabled),
+        }
+        for c in caps
+    ]
+    repro_hash = _reproducibility_hash(
+        bv.id, bv.definition_json, cand.agent_id, snapshot, input_hash
+    )
+
+    adapter_impl = adapter if adapter is not None else _DefaultBenchmarkAdapter()
+    outcome: BenchmarkOutcome | None = None
+    try:
+        outcome = adapter_impl.run(cand, bv)
+    except Exception:
+        outcome = None  # fail-closed: treat any adapter error as untrusted
+
+    if (
+        outcome is not None
+        and outcome.trusted
+        and outcome.passed_cases is not None
+        and outcome.total_cases
+        and outcome.total_cases > 0
+    ):
+        status = BenchmarkResultStatus.RECORDED
+        passed_cases = int(outcome.passed_cases)
+        total_cases = int(outcome.total_cases)
+        quality_score = (
+            float(outcome.quality_score)
+            if outcome.quality_score is not None
+            else None
+        )
+        output_ref = outcome.output_ref
+        env = outcome.environment or environment
+    else:
+        status = BenchmarkResultStatus.UNKNOWN
+        passed_cases = None
+        total_cases = None
+        quality_score = None
+        output_ref = None
+        env = environment
+
+    result = BenchmarkResult(
+        candidate_id=candidate_id,
+        benchmark_version_id=benchmark_version_id,
+        run_id=run_id,
+        passed_cases=passed_cases,
+        total_cases=total_cases,
+        quality_score=quality_score,
+        input_hash=input_hash,
+        output_ref=output_ref,
+        agent_snapshot_json=snapshot,
+        environment=env,
+        reproducibility_hash=repro_hash,
+        status=status,
+        evaluator=evaluator,
+    )
+    try:
+        with session.begin_nested():
+            session.add(result)
+            session.flush()
+            append_audit(
+                session,
+                actor=evaluator,
+                action="benchmark.run",
+                resource_type="benchmark_result",
+                resource_id=result.id,
+                project_id=None,
+                task_id=None,
+                before={},
+                after={
+                    "benchmark_result_id": result.id,
+                    "status": status.value,
+                    "reproducibility_hash": repro_hash,
+                },
+                idempotency_key=(
+                    f"benchmark:run:{candidate_id}:{benchmark_version_id}:{run_id}"
+                ),
+            )
+    except IntegrityError as exc:
+        with Session(session.get_bind()) as fresh:
+            auth = fresh.exec(
+                select(BenchmarkResult).where(
+                    BenchmarkResult.candidate_id == candidate_id,
+                    BenchmarkResult.benchmark_version_id == benchmark_version_id,
+                    BenchmarkResult.run_id == run_id,
+                )
+            ).first()
+        if auth is not None:
+            session.expire(result)
+            return auth
+        raise ServiceError(
+            409,
+            f"benchmark run already in progress: "
+            f"{candidate_id}:{benchmark_version_id}:{run_id}",
+        ) from exc
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Match / Ranking (read-only over W3-A's frozen evaluation_context)
+# ---------------------------------------------------------------------------
+
+
+def _attempt_from_evidence_refs(refs: list[str]) -> int | None:
+    if refs:
+        parts = refs[0].split(":")
+        # ["cand", candidate_id, "attempt", N]
+        if (
+            len(parts) == 4
+            and parts[0] == "cand"
+            and parts[2] == "attempt"
+        ):
+            try:
+                return int(parts[3])
+            except ValueError:
+                return None
+    return None
+
+
+def compute_match(
+    session: Session,
+    candidate_id: str,
+    job_version_id: str,
+    *,
+    evaluator: str = "workforce_match",
+) -> Match:
+    """Score an EVALUATED candidate against a JobVersion (W3-B side channel).
+
+    Reads W3-A's ``capability_evidence`` from ``Candidate.evaluation_context`` -- it
+    does NOT recompute capability_fit, and it NEVER writes ``Candidate.status`` or
+    ``evaluation_context`` (W3-A frozen, constraint 1).
+
+    Contracts (asserted by ``tests/test_workforce_benchmark_match_w3b.py``):
+
+    * F3: candidate must be ``EVALUATED`` and carry ``capability_evidence``;
+      otherwise ``ServiceError(422, "candidate not evaluable: ...")`` -- no silent
+      score.
+    * Unbound JobVersion (no ``benchmark_version_id``) -> ``benchmark_score`` is
+      waived and ``score == capability_fit`` (single-component normalization).
+    * F2: a bound-but-untrusted benchmark (no ``recorded`` result) -> waived, no
+      fake 0. A ``recorded`` result contributes ``0.4 * (passed/total)``.
+    * F1: ``capability_evidence.threshold_passed is False`` -> the Match is still
+      produced (scored to the floor) but marked ``status="blocked"`` with
+      ``match_blocked_reason="capability_gap"`` -- W3-C must refuse to recommend it.
+    * Idempotent: replay of the same evaluation ``attempt`` returns the existing
+      Match (no recompute, no duplicate audit). A re-evaluation (new ``attempt``)
+      recomputes and UPDATEs the row, recording ``match.recomputed`` before/after.
+    * Concurrency: first-run races are absorbed by a SAVEPOINT (P2-1).
+    """
+    cand = session.get(Candidate, candidate_id)
+    if cand is None:
+        raise ServiceError(404, f"candidate not found: {candidate_id}")
+    if cand.status != CandidateStatus.EVALUATED:
+        raise ServiceError(
+            422,
+            f"candidate not evaluable: status is {cand.status.value}, "
+            "expected evaluated",
+        )
+
+    ctx = cand.evaluation_context or {}
+    evidence = ctx.get("capability_evidence")
+    if not isinstance(evidence, dict) or "capability_fit" not in evidence:
+        raise ServiceError(
+            422,
+            "candidate not evaluable: evaluation_context has no capability_evidence "
+            "(run evaluate_candidate first)",
+        )
+
+    capability_fit = float(evidence["capability_fit"])
+    threshold_passed = bool(evidence.get("threshold_passed", False))
+    attempt = int(ctx.get("attempt", 0))
+
+    jv = session.get(JobVersion, job_version_id)
+    if jv is None:
+        raise ServiceError(404, f"job_version not found: {job_version_id}")
+    bound_bv_id = jv.benchmark_version_id
+
+    # Resolve a trusted benchmark_score, if any.
+    benchmark_score: float | None = None
+    trusted_result: BenchmarkResult | None = None
+    if bound_bv_id is not None:
+        trusted_result = session.exec(
+            select(BenchmarkResult)
+            .where(BenchmarkResult.candidate_id == candidate_id)
+            .where(BenchmarkResult.benchmark_version_id == bound_bv_id)
+            .where(BenchmarkResult.status == BenchmarkResultStatus.RECORDED)
+            .order_by(BenchmarkResult.created_at.desc())
+        ).first()
+        if (
+            trusted_result is not None
+            and trusted_result.total_cases
+            and trusted_result.total_cases > 0
+            and trusted_result.passed_cases is not None
+        ):
+            benchmark_score = trusted_result.passed_cases / trusted_result.total_cases
+
+    benchmark_counted = bound_bv_id is not None and benchmark_score is not None
+    if benchmark_counted:
+        score = (
+            MATCH_WEIGHTS_V1["capability_fit"] * capability_fit
+            + MATCH_WEIGHTS_V1["benchmark_score"] * benchmark_score
+        )
+    else:
+        # Single component: capability_fit is normalized to the full weight.
+        score = capability_fit
+    score = max(0.0, min(1.0, score))
+
+    if not threshold_passed:
+        status = MatchStatus.BLOCKED
+        blocked_reason = "capability_gap"
+    else:
+        status = MatchStatus.COMPUTED
+        blocked_reason = None
+
+    breakdown: dict[str, Any] = {
+        "weights_version": MATCH_WEIGHTS_VERSION,
+        "formula": (
+            "0.6*capability_fit + 0.4*benchmark_score "
+            "(benchmark_score waived if unbound or untrusted)"
+        ),
+        "capability_fit": {
+            "value": capability_fit,
+            "weight": MATCH_WEIGHTS_V1["capability_fit"],
+            "source": "evaluation_context.capability_evidence",
+            "threshold_passed": threshold_passed,
+        },
+        "benchmark_score": {
+            "value": benchmark_score,
+            "weight": MATCH_WEIGHTS_V1["benchmark_score"],
+            "status": "computed" if benchmark_counted else "waived",
+            "reason": (
+                None
+                if benchmark_counted
+                else (
+                    "JobVersion unbound"
+                    if bound_bv_id is None
+                    else "no recorded/trusted benchmark_result"
+                )
+            ),
+        },
+        "excluded": [
+            "reliability(future_capability)",
+            "historical(future_capability)",
+            "cost(unknown/advisory)",
+        ],
+    }
+    evidence_refs = [f"cand:{candidate_id}:attempt:{attempt}"]
+    if trusted_result is not None:
+        evidence_refs.append(f"br:{trusted_result.id}")
+    evaluated_fields = ["capability_fit"]
+    if benchmark_counted:
+        evaluated_fields.append("benchmark_score")
+
+    existing = session.exec(
+        select(Match).where(
+            Match.candidate_id == candidate_id,
+            Match.job_version_id == job_version_id,
+        )
+    ).first()
+
+    if existing is not None:
+        if _attempt_from_evidence_refs(existing.evidence_refs) == attempt:
+            # Idempotent replay of the same evaluation: no recompute, no audit.
+            return existing
+        # Re-evaluation (new attempt): UPDATE in place, keep the audit trail.
+        before_score = existing.score
+        existing.score = score
+        existing.weights_version = MATCH_WEIGHTS_VERSION
+        existing.breakdown = breakdown
+        existing.evaluated_fields = evaluated_fields
+        existing.evidence_refs = evidence_refs
+        existing.benchmark_version_id = bound_bv_id
+        existing.status = status
+        existing.match_blocked_reason = blocked_reason
+        existing.evaluator = evaluator
+        existing.created_at = now_utc()
+        session.add(existing)
+        session.flush()
+        append_audit(
+            session,
+            actor=evaluator,
+            action="match.recomputed",
+            resource_type="match",
+            resource_id=existing.id,
+            project_id=None,
+            task_id=None,
+            before={"score": before_score, "status": existing.status.value},
+            after={"score": score, "status": status.value},
+            idempotency_key=(
+                f"match:{candidate_id}:{job_version_id}:{attempt}"
+            ),
+        )
+        return existing
+
+    match = Match(
+        candidate_id=candidate_id,
+        job_version_id=job_version_id,
+        score=score,
+        weights_version=MATCH_WEIGHTS_VERSION,
+        breakdown=breakdown,
+        evaluated_fields=evaluated_fields,
+        evidence_refs=evidence_refs,
+        benchmark_version_id=bound_bv_id,
+        status=status,
+        match_blocked_reason=blocked_reason,
+        evaluator=evaluator,
+    )
+    try:
+        with session.begin_nested():
+            session.add(match)
+            session.flush()
+            append_audit(
+                session,
+                actor=evaluator,
+                action="match.computed",
+                resource_type="match",
+                resource_id=match.id,
+                project_id=None,
+                task_id=None,
+                before={},
+                after={
+                    "score": score,
+                    "breakdown": breakdown,
+                    "evaluated_fields": evaluated_fields,
+                    "status": status.value,
+                },
+                idempotency_key=f"match:{candidate_id}:{job_version_id}",
+            )
+    except IntegrityError as exc:
+        with Session(session.get_bind()) as fresh:
+            auth = fresh.exec(
+                select(Match).where(
+                    Match.candidate_id == candidate_id,
+                    Match.job_version_id == job_version_id,
+                )
+            ).first()
+        if auth is not None:
+            session.expire(match)
+            return auth
+        raise ServiceError(
+            409,
+            f"match already being computed: {candidate_id}:{job_version_id}",
+        ) from exc
+    return match
+
+
+def rank_candidates(
+    session: Session, job_version_id: str
+) -> list[Match]:
+    """Rank an EVALUATED candidate pool for a JobVersion (query only, no state).
+
+    Order: ``score`` desc, tie-break ``capability_fit`` -> ``benchmark_score`` ->
+    ``agent_id`` (Spec §2.7, deterministic). ``blocked`` Matches sort after all
+    ``computed`` ones (they must never be recommended). Pure read: no table writes,
+    no audit (V1 does not materialize a ranking snapshot; that is W3-C's job).
+    """
+    rows = session.exec(
+        select(Match, Candidate.agent_id)
+        .join(Candidate, Match.candidate_id == Candidate.id)
+        .where(Match.job_version_id == job_version_id)
+        .where(Candidate.status == CandidateStatus.EVALUATED)
+    ).all()
+    agent_of = {m.id: agent_id for m, agent_id in rows}
+
+    def _sort_key(m: Match):
+        cap = float(m.breakdown.get("capability_fit", {}).get("value", 0.0))
+        bench = m.breakdown.get("benchmark_score", {}).get("value") or 0.0
+        blocked_rank = 0 if m.status == MatchStatus.COMPUTED else 1
+        # Deterministic tie-break by agent_id (not candidate_id) per Spec §2.7.
+        return (blocked_rank, -m.score, -cap, -float(bench), agent_of.get(m.id, ""))
+
+    return sorted((m for m, _ in rows), key=_sort_key)

@@ -677,8 +677,9 @@ def test_w3a_is_zero_migration(tmp_path: Path) -> None:
     cfg = Config(root / "alembic.ini")
     cfg.set_main_option("script_location", str(root / "alembic"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
-    # Still the single W2 head -- W3-A added no revision.
-    assert heads == ["20260827_0002_workforce_candidate"]
+    # W3-A added no revision (head stayed at 20260827_0002_workforce_candidate);
+    # W3-B Match/Benchmark advances the single head to 20260901_0001_workforce_match_benchmark.
+    assert heads == ["20260901_0001_workforce_match_benchmark"]
 
     url = f"sqlite:///{(tmp_path / 'zeromig.db').as_posix()}"
     run_migrations(url)
@@ -686,12 +687,11 @@ def test_w3a_is_zero_migration(tmp_path: Path) -> None:
     tables = set(inspect(engine).get_table_names())
 
     assert "candidate" in tables
-    # None of the deferred W3-B/C/D tables leaked in.
+    # W3-A added no revision of its own; W3-B (now in the chain) legitimately adds
+    # benchmark / benchmark_version / benchmark_result / match -- those are asserted
+    # by the W3-B suite (test_w3b_migration_is_single_head_additive_reversible). The
+    # still-deferred W3-C/D/W4 tables must NOT have leaked in.
     for deferred in (
-        "benchmark",
-        "benchmark_version",
-        "benchmark_result",
-        "match",
         "recommendation",
         "trial",
         "candidate_evaluation",
