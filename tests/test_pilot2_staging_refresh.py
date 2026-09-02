@@ -548,6 +548,55 @@ def test_p23a_refresh_adds_missing_fk_and_rejects_orphan_write(tmp_path: Path):
     _audit("post-create")
     mca.evolve_existing_tables(engine)
     _audit("post-evolve")
+
+    # ==== PROBE3 (before verify; when probe path reached): connection-view
+    # comparison. v2 showed raw_connection sees FKs present while verify's pool
+    # connect() saw finalattributiondecision as missing -> suspect stale pool
+    # connection holding a pre-create_all schema generation. ====
+    from sqlalchemy import create_engine as _create_engine_probe
+
+    def _view(label: str, eng) -> None:
+        _raw3 = eng.raw_connection()
+        try:
+            _cur3 = _raw3.driver_connection.cursor()
+            _tabs = sorted(
+                r[0] for r in _cur3.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            )
+            _fad = _cur3.execute(
+                'PRAGMA foreign_key_list("finalattributiondecision")'
+            ).fetchall()
+        finally:
+            _raw3.close()
+        print(f"PROBE3[{label}] tables={_tabs}", flush=True)
+        print(f"PROBE3[{label}] fad_fk={_fad}", flush=True)
+
+    _view("raw", engine)
+    with engine.connect() as _c:
+        _tabs2 = sorted(
+            r[0] for r in _c.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).fetchall()
+        )
+        _fad2 = _c.execute(
+            text('PRAGMA foreign_key_list("finalattributiondecision")')
+        ).fetchall()
+        print(f"PROBE3[pool] tables={_tabs2}", flush=True)
+        print(f"PROBE3[pool] fad_fk={_fad2}", flush=True)
+        _c.rollback()
+    engine.dispose()
+    _view("disposed", engine)
+    _fresh = _create_engine_probe(
+        str(engine.url), connect_args={"check_same_thread": False, "timeout": 30}
+    )
+    _view("fresh-engine", _fresh)
+    _fresh.dispose()
+    # Re-create the disposed pool state for the verify below: after dispose the
+    # next connect() opens a brand-new connection (same as verify's behavior).
+    with engine.connect() as _c2:
+        _c2.rollback()
+
     mca.verify_pilot2_schema(engine)
     _audit("post-verify")
     mca.retire_superseded_tables(engine)
