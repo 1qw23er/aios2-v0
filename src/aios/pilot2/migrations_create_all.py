@@ -928,6 +928,19 @@ def run_create(
 
     pilot2_metadata.create_all(engine)        # create any entirely-missing tables
     evolve_existing_tables(engine)            # ALTER existing tables up to merged shape
+    # Stale-pool guard (2026-09-03, CI 33650217374 x2 + probes red; fix green):
+    # the DDL above (``_rebuild_table_for_missing_fk`` wholesale swaps, in-place
+    # ALTER/ADD) commits on individual pooled connections, but OTHER connections
+    # in the QueuePool that parsed ``sqlite_master`` earlier (pre-create_all or
+    # pre-rebuild) can keep serving a STALE schema view: ``PRAGMA
+    # foreign_key_list`` then reports the old table WITHOUT the FK it just
+    # gained, and ``verify_pilot2_schema`` below raises a false
+    # ``SchemaRebuildError``. It is a pool-reuse timing race -- CI fast runners
+    # hit it reliably, local / slow runs rarely. dispose() closes every pooled
+    # connection so verify opens a brand-new one guaranteed to observe the
+    # post-DDL schema. Verification MUST observe the schema as it is NOW, so a
+    # fresh connection is the correct (not just expedient) way to do it.
+    engine.dispose()
     verify_pilot2_schema(engine)             # tables + D2 triggers + COLUMN completeness
     if retire_superseded:
         retire_superseded_tables(
