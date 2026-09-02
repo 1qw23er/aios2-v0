@@ -520,46 +520,38 @@ def test_p23a_refresh_adds_missing_fk_and_rejects_orphan_write(tmp_path: Path):
         (r[3], r[2], r[4]) for r in before
     }
 
-    # ==== PROBE-20260903 diag: CI-only rebuild miss (push CI attempts 1+2 red
-    # on fast runner; local Py3.13 + PR-slow-runner always green). Prints the
-    # model-declared vs DB-actual FK state at the exact decision point. ====
-    _tbl = pilot2_metadata.tables.get("registrationobservation")
-    _cls_tbl = RegistrationObservation.__table__
-    print(
-        f"PROBE meta_has_table={_tbl is not None} same_as_cls={_tbl is _cls_tbl} "
-        f"table_id={id(_tbl) if _tbl is not None else None} "
-        f"cls_table_id={id(_cls_tbl)}",
-        flush=True,
+    # ==== PROBE-20260903 v2: stepwise run_create with per-step FK audit.
+    # CI-only rebuild miss: push attempts 1+2 = verify passed but after-FK set
+    # empty; PR#6 probe v1 = verify raised finalattributionhead missing FKs.
+    # Stepwise audit shows exactly which table loses FKs at which step. ====
+    from aios.pilot2.migrations_create_all import (
+        _declared_fk_tuples as _dft_probe,
+        _table_fk_tuples as _tft_probe,
     )
-    if _tbl is not None:
-        print(
-            "PROBE cols_with_fk="
-            + str(sorted(c.name for c in _tbl.columns if c.foreign_keys))
-            + " total_cols="
-            + str(len(list(_tbl.columns))),
-            flush=True,
-        )
-        print(
-            "PROBE declared="
-            + str(
-                sorted(
-                    (fk.parent.name, fk.column.table.name, fk.column.name)
-                    for c in _tbl.columns
-                    for fk in c.foreign_keys
-                )
-            ),
-            flush=True,
-        )
-        _raw = engine.raw_connection()
-        try:
-            _rows = _raw.driver_connection.cursor().execute(
-                "PRAGMA foreign_key_list(registrationobservation)"
-            ).fetchall()
-        finally:
-            _raw.close()
-        print(f"PROBE db_fk_rows={_rows}", flush=True)
 
-    mca.run_create(engine)
+    def _audit(label: str) -> None:
+        print(f"PROBE2[{label}] start", flush=True)
+        for _tn in sorted(pilot2_metadata.tables.keys()):
+            _raw = engine.raw_connection()
+            try:
+                _cur = _raw.driver_connection.cursor()
+                _decl = sorted(_dft_probe(pilot2_metadata.tables[_tn]))
+                _db = sorted(_tft_probe(_cur, _tn))
+            finally:
+                _raw.close()
+            if _decl != _db:
+                print(f"PROBE2[{label}] DIFF {_tn}: declared={_decl} db={_db}", flush=True)
+        print(f"PROBE2[{label}] done", flush=True)
+
+    _audit("pre")
+    pilot2_metadata.create_all(engine)
+    _audit("post-create")
+    mca.evolve_existing_tables(engine)
+    _audit("post-evolve")
+    mca.verify_pilot2_schema(engine)
+    _audit("post-verify")
+    mca.retire_superseded_tables(engine)
+    _audit("post-retire")
 
     # After refresh the FK exists and is enforceable.
     after = engine.connect().execute(
