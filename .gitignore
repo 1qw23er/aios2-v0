@@ -9,4 +9,7 @@ build/
 # Generated validation database + scratch work; never commit.
 data/
 
+# Local pytest scratch (basetemp override; must stay out of the working tree).
+.pytest_tmp/
+
 .env

@@ -26,7 +26,7 @@ from precheck_series_id_metadata import (  # noqa: E402
     run_precheck,
 )
 
-HEAD = "20260901_0001_workforce_match_benchmark"
+HEAD = "20260902_0001_workforce_recommendation"
 
 
 def _config(url: str) -> Config:
