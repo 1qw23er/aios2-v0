@@ -448,15 +448,28 @@ class CandidateLifecycle:
         EVALUATING -> POOLED          (evaluation failed; rolls back, never a half-state)
         EVALUATED -> REJECTED         (evaluation is an immutable snapshot)
 
-    Deliberately NOT present in W3-A:
+    W3-C opens the *controlled* Match gate on top of ``EVALUATED``:
 
-        EVALUATED -> RECOMMENDED      -- requires the W3-C/D Match gate
-        RECOMMENDED -> *              -- zero edges; the state is unreachable
+        EVALUATED -> RECOMMENDED       -- only via ``recommend_candidate``, and
+                                          only when the Match is COMPUTED and
+                                          every fail-closed gate (F-R1..F-R5)
+                                          passes.
+        RECOMMENDED -> EVALUATED       -- the ONLY outbound edge: a human
+                                          REJECT (``decide_recommendation``) or
+                                          a system withdraw (F-R8 drift
+                                          reconcile).
 
-    ``RECOMMENDED`` is a real ``CandidateStatus`` member (stable vocabulary) but
-    it is mapped to an empty edge set here, so every attempted transition into or
-    out of it is rejected with 409. Tests assert this explicitly so the state
-    cannot be wired up ahead of the Match gate.
+    Deliberately still absent after W3-C:
+
+        RECOMMENDED -> TRIALING        -- Trial is W3-D/W4; there is no
+                                         TRIALING member at all.
+        POOLED -> RECOMMENDED          -- the Match gate must be passed first.
+        RECOMMENDED -> POOLED          -- the only way out is back to EVALUATED.
+
+    ``RECOMMENDED`` is a real ``CandidateStatus`` member (stable vocabulary). It
+    was mapped to an empty edge set until W3-C wired the Match gate; the
+    illegal-edge tests still assert the shortcut edges above are rejected, so
+    the state cannot be reached outside the Match gate.
 
     Evaluation is treated as immutable history (like W1 JobVersion): re-evaluating
     requires ``EVALUATED -> REJECTED -> POOLED -> EVALUATING``, which keeps every
@@ -473,10 +486,16 @@ class CandidateLifecycle:
             CandidateStatus.EVALUATED,
             CandidateStatus.POOLED,
         },
-        CandidateStatus.EVALUATED: {CandidateStatus.REJECTED},
-        # EVALUATED -> RECOMMENDED lands with the W3-C/D Match gate. Until then
-        # RECOMMENDED has no inbound and no outbound edge (unreachable by design).
-        CandidateStatus.RECOMMENDED: set(),
+        CandidateStatus.EVALUATED: {
+            CandidateStatus.REJECTED,
+            # W3-C: the controlled Match gate. Traversed only by
+            # recommend_candidate, and only with a COMPUTED Match (F-R1..F-R5).
+            CandidateStatus.RECOMMENDED,
+        },
+        # W3-C: RECOMMENDED is now reachable, with exactly ONE outbound edge back
+        # to EVALUATED (human REJECT / system withdraw). RECOMMENDED -> TRIALING
+        # does not exist -- Trial is W3-D/W4.
+        CandidateStatus.RECOMMENDED: {CandidateStatus.EVALUATED},
     }
 
     @classmethod

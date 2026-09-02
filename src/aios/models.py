@@ -1551,11 +1551,16 @@ class CandidateStatus(StrEnum):
       half-state.
     * ``EVALUATED`` -- evaluation completed; evidence lives in
       ``Candidate.evaluation_context`` (no separate table in W3 V1).
-    * ``RECOMMENDED`` -- promoted in W3-A as a *real* enum member but
-      deliberately left UNREACHABLE: ``workforce.CandidateLifecycle`` grants it
-      zero inbound and zero outbound edges until the W3-C/D Match gate is
-      implemented. It is declared here so downstream code and migrations see a
-      stable vocabulary, while tests assert it cannot yet be entered.
+    * ``RECOMMENDED`` -- promoted in W3-A as a *real* enum member but kept
+      UNREACHABLE (zero inbound / zero outbound edges in
+      ``workforce.CandidateLifecycle``) until W3-C wired the controlled Match
+      gate:
+        * ``EVALUATED -> RECOMMENDED`` -- only via ``recommend_candidate``, and
+          only when the Match is COMPUTED and every fail-closed gate passes.
+        * ``RECOMMENDED -> EVALUATED`` -- the sole outbound edge, taken by a
+          human REJECT or a system withdraw (F-R8 drift reconcile).
+      No other edge exists: the POOLED / REJECTED shortcuts stay illegal and
+      Trial (W3-D/W4) is deliberately out of scope.
 
     NOTE (zero-migration): the ``candidate.status`` column is a plain
     ``sa.String()`` (migration ``20260827_0002_workforce_candidate``), NOT a DB
@@ -1802,3 +1807,120 @@ class Match(SQLModel, table=True):
     match_blocked_reason: str | None = None
     evaluator: str = "workforce_match"
     created_at: datetime = Field(default_factory=now_utc)
+
+
+# ---------------------------------------------------------------------------
+# W3-C: Recommendation + the L4 human gate
+# (see docs/Workforce_W3C_Recommendation_Approval_Spec_V4.md)
+#
+# APPEND-ONLY section -- no definition above this line is touched. The
+# service layer lives in ``workforce_recommendation.py`` (workforce.py itself is
+# frozen apart from the controlled CandidateLifecycle edges).
+# ---------------------------------------------------------------------------
+
+
+class RecommendationStatus(StrEnum):
+    """Lifecycle state of one Recommendation (W3-C, C2: the single state SoT).
+
+    ``Recommendation.status`` is the ONLY state source of truth -- there is
+    deliberately no ``approval_status`` column (C2 / INV-1).
+
+    * ``PROPOSED``  -- produced by the AI recommender, awaiting a human decision.
+    * ``APPROVED``  -- reachable only through ``decide_recommendation`` by an
+      owner actor (INV-3: ``decided_by`` is therefore always non-empty).
+    * ``REJECTED``  -- likewise human-only, and TERMINAL: fresh evidence never
+      resurrects a human refusal (fail-closed).
+    * ``WITHDRAWN`` -- reachable only by the system, when the evidence the
+      decision was based on has drifted (F-R8).
+
+    ``ApprovalStatus.EXPIRED`` is NOT part of this vocabulary: an expired
+    approval is a timeout, a withdrawn recommendation is invalidated evidence.
+    """
+
+    PROPOSED = "proposed"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    WITHDRAWN = "withdrawn"
+
+
+class Recommendation(SQLModel, table=True):
+    """A proposed hire for one Candidate against one JobVersion (W3-C).
+
+    Created only from a COMPUTED ``Match``: the score, breakdown and evidence are
+    **snapshots** (deep-copied), never recomputed, so the recommendation stays
+    explainable after the underlying Match is recomputed. A later recompute that
+    changes the attempt is caught by F-R8 and withdraws an APPROVED row rather
+    than silently keeping a decision that no longer rests on its evidence.
+
+    ``status`` is the single state SoT (C2); ``decided_by`` may only be written by
+    the human decision path (INV-3), which is why the service funnels every state
+    write through ``_transition_status`` against ``RECOMMENDATION_ALLOWED``.
+
+    ``match_id`` is RESTRICT (C4): deleting a Match that still backs a
+    recommendation would leave a dangling proposal, so it is refused; the unlock
+    path is withdraw/reject followed by ``purge_recommendation``.
+    """
+
+    __tablename__ = "recommendation"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "candidate_id",
+            "job_version_id",
+            name="uq_recommendation_candidate_job_version",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("rec"), primary_key=True)
+    # C4 / DR-1: both upstream FKs are RESTRICT. A candidate (and its Match) that
+    # still backs a recommendation must NOT be silently cascade-deleted with its
+    # Job -- the delete is refused so the evidence chain survives (the unlock path
+    # is withdraw/reject -> ``purge_recommendation``). CASCADE here would defeat
+    # ``match_id``'s RESTRICT by removing the parent candidate first.
+    candidate_id: str = Field(foreign_key="candidate.id", ondelete="RESTRICT")
+    job_version_id: str = Field(foreign_key="job_version.id", ondelete="RESTRICT")
+    match_id: str = Field(foreign_key="match.id", ondelete="RESTRICT")
+    # F-R8 drift token -- the attempt THIS row was built from, read back at
+    # reconcile start (C8). Deliberately NOT the Match's current attempt, which a
+    # concurrent recompute may already have advanced past. Never nullable: F-R3b
+    # rejects unresolvable evidence with 422 before a row is ever written.
+    match_attempt: int
+    status: RecommendationStatus = Field(
+        default=RecommendationStatus.PROPOSED, index=True
+    )
+    # V1 supports exactly one action; anything else is rejected with 422.
+    proposed_action: str = "hire"
+    # Snapshots of the Match -- never recomputed from the Match row.
+    score: float = Field(default=0.0)
+    weights_version: str = ""
+    breakdown: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON)
+    )
+    evaluated_fields: list[str] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    evidence_refs: list[str] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    excluded_fields: list[str] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    # Read-only snapshot of evaluation_context's three FUTURE dimensions
+    # (§4.3): status flags only -- never a fabricated numeric score.
+    unknown_dimensions: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON)
+    )
+    # Advisory ONLY: free text, never a numeric cost component (F-R5).
+    cost_advisory: str | None = None
+    # Deterministically templated, not free-form LLM prose.
+    rationale: str = ""
+    risk_level: RiskLevel = Field(default=RiskLevel.L4)
+    # Forward-only column: W4 backfills a real Approval row id. V1: always None.
+    approval_id: str | None = None
+    # INV-3: non-empty exactly for APPROVED / REJECTED, None otherwise.
+    decided_by: str | None = Field(default=None, index=True)
+    decided_at: datetime | None = None
+    decision_rationale: str | None = None
+    recommender: str = "workforce_recommendation"
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)

@@ -51,7 +51,7 @@ from aios.work_log import (
 )
 from alembic import command
 
-HEAD = "20260901_0001_workforce_match_benchmark"
+HEAD = "20260902_0001_workforce_recommendation"
 PREV = "20260727_0008"
 # Lowest revision these ORM-seeding tests upgrade to. The migrations above it
 # form a chain of one-way doors:

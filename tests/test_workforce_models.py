@@ -364,9 +364,10 @@ def test_alembic_single_head_is_capreq_hardening() -> None:
     cfg.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
-    # Single linear head; W3-B Match/Benchmark advances it past the W2 capreq
-    # hardening head (20260827_0002_workforce_candidate) to 20260901_0001.
-    assert heads == ["20260901_0001_workforce_match_benchmark"]
+    # Single linear head; W3-C Recommendation advances it past the W3-B
+    # Match/Benchmark head (20260901_0001_workforce_match_benchmark) to
+    # 20260902_0001.
+    assert heads == ["20260902_0001_workforce_recommendation"]
 
 
 def test_migration_creates_workforce_tables_additively(tmp_path: Path) -> None:
@@ -607,8 +608,9 @@ def test_candidate_illegal_transition_rejected_409(tmp_path: Path) -> None:
             # EVALUATED is an immutable snapshot -- no silent rollback to POOLED.
             # Re-evaluating means EVALUATED -> REJECTED -> POOLED -> EVALUATING.
             (CandidateStatus.EVALUATED, CandidateStatus.POOLED),
-            # RECOMMENDED remains unreachable until the W3-C/D Match gate lands.
-            (CandidateStatus.EVALUATED, CandidateStatus.RECOMMENDED),
+            # W3-C opens EVALUATED <-> RECOMMENDED, but the shortcut edges into
+            # and out of RECOMMENDED stay illegal: the Match gate must be passed
+            # (EVALUATED) and the only way back is RECOMMENDED -> EVALUATED.
             (CandidateStatus.POOLED, CandidateStatus.RECOMMENDED),
             (CandidateStatus.RECOMMENDED, CandidateStatus.POOLED),
         ]
