@@ -520,83 +520,34 @@ def test_p23a_refresh_adds_missing_fk_and_rejects_orphan_write(tmp_path: Path):
         (r[3], r[2], r[4]) for r in before
     }
 
-    # ==== PROBE-20260903 v2: stepwise run_create with per-step FK audit.
-    # CI-only rebuild miss: push attempts 1+2 = verify passed but after-FK set
-    # empty; PR#6 probe v1 = verify raised finalattributionhead missing FKs.
-    # Stepwise audit shows exactly which table loses FKs at which step. ====
-    from aios.pilot2.migrations_create_all import (
-        _declared_fk_tuples as _dft_probe,
-        _table_fk_tuples as _tft_probe,
-    )
+    # ==== PROBE-20260903 v4: dispose experiment (ruff-clean, no function
+    # imports). Push attempts 1+2 (unmodified) failed: verify passed but
+    # after-FK empty / verify raised missing FKs. v3 (dispose + extra
+    # connections before verify) PASSED on the same fast-runner population ->
+    # root cause points at a stale QueuePool connection holding a pre-create_all
+    # schema generation. v4 isolates the fix factor: stepwise run_create with
+    # engine.dispose() between evolve and verify. ====
 
     def _audit(label: str) -> None:
-        print(f"PROBE2[{label}] start", flush=True)
+        print(f"PROBE4[{label}] start", flush=True)
         for _tn in sorted(pilot2_metadata.tables.keys()):
             _raw = engine.raw_connection()
             try:
                 _cur = _raw.driver_connection.cursor()
-                _decl = sorted(_dft_probe(pilot2_metadata.tables[_tn]))
-                _db = sorted(_tft_probe(_cur, _tn))
+                _decl = sorted(mca._declared_fk_tuples(pilot2_metadata.tables[_tn]))
+                _db = sorted(mca._table_fk_tuples(_cur, _tn))
             finally:
                 _raw.close()
             if _decl != _db:
-                print(f"PROBE2[{label}] DIFF {_tn}: declared={_decl} db={_db}", flush=True)
-        print(f"PROBE2[{label}] done", flush=True)
+                print(f"PROBE4[{label}] DIFF {_tn}: declared={_decl} db={_db}", flush=True)
+        print(f"PROBE4[{label}] done", flush=True)
 
     _audit("pre")
     pilot2_metadata.create_all(engine)
     _audit("post-create")
     mca.evolve_existing_tables(engine)
     _audit("post-evolve")
-
-    # ==== PROBE3 (before verify; when probe path reached): connection-view
-    # comparison. v2 showed raw_connection sees FKs present while verify's pool
-    # connect() saw finalattributiondecision as missing -> suspect stale pool
-    # connection holding a pre-create_all schema generation. ====
-    from sqlalchemy import create_engine as _create_engine_probe
-
-    def _view(label: str, eng) -> None:
-        _raw3 = eng.raw_connection()
-        try:
-            _cur3 = _raw3.driver_connection.cursor()
-            _tabs = sorted(
-                r[0] for r in _cur3.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            )
-            _fad = _cur3.execute(
-                'PRAGMA foreign_key_list("finalattributiondecision")'
-            ).fetchall()
-        finally:
-            _raw3.close()
-        print(f"PROBE3[{label}] tables={_tabs}", flush=True)
-        print(f"PROBE3[{label}] fad_fk={_fad}", flush=True)
-
-    _view("raw", engine)
-    with engine.connect() as _c:
-        _tabs2 = sorted(
-            r[0] for r in _c.execute(
-                text("SELECT name FROM sqlite_master WHERE type='table'")
-            ).fetchall()
-        )
-        _fad2 = _c.execute(
-            text('PRAGMA foreign_key_list("finalattributiondecision")')
-        ).fetchall()
-        print(f"PROBE3[pool] tables={_tabs2}", flush=True)
-        print(f"PROBE3[pool] fad_fk={_fad2}", flush=True)
-        _c.rollback()
     engine.dispose()
-    _view("disposed", engine)
-    _fresh = _create_engine_probe(
-        str(engine.url), connect_args={"check_same_thread": False, "timeout": 30}
-    )
-    _view("fresh-engine", _fresh)
-    _fresh.dispose()
-    # Re-create the disposed pool state for the verify below: after dispose the
-    # next connect() opens a brand-new connection (same as verify's behavior).
-    with engine.connect() as _c2:
-        _c2.rollback()
-
     mca.verify_pilot2_schema(engine)
     _audit("post-verify")
     mca.retire_superseded_tables(engine)
