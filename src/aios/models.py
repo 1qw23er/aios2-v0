@@ -1573,6 +1573,12 @@ class CandidateStatus(StrEnum):
     EVALUATING = "evaluating"
     EVALUATED = "evaluated"
     RECOMMENDED = "recommended"
+    # W3-D: the only inbound edge is RECOMMENDED -> TRIALING (opened by
+    # ``create_trial_from_approval``). The outbound edge set is empty in V1:
+    # Trial activation / completion / cancellation is W4. The column is a plain
+    # ``sa.String()`` (migration ``20260827_0002_workforce_candidate``), so adding
+    # this member required no schema change.
+    TRIALING = "trialing"
 
 
 class Candidate(SQLModel, table=True):
@@ -1922,5 +1928,63 @@ class Recommendation(SQLModel, table=True):
     decided_at: datetime | None = None
     decision_rationale: str | None = None
     recommender: str = "workforce_recommendation"
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class TrialStatus(StrEnum):
+    """Lifecycle state of one Trial (W3-D).
+
+    W3-D writes exactly one member: ``PROPOSED``. There is deliberately no
+    reserved vocabulary for W4's states (ACTIVE / COMPLETED / CANCELLED /
+    FAILED): the column is a plain ``sa.String()`` (see ``CandidateStatus``), so
+    W4 can add members with zero migration, and dead enum members would only
+    obscure the fact that this stage has a single state.
+
+    Consequently V1 defines NO ``TRIAL_ALLOWED`` edge table and no
+    ``_transition_trial_status``: with zero transitions they would be dead code.
+    The invariant is structural instead -- ``trial.status`` has exactly one
+    writer, the constructor default in ``create_trial_from_approval``. W4 MUST
+    introduce ``TRIAL_ALLOWED`` + a single status writer together with its
+    first transition.
+    """
+
+    PROPOSED = "proposed"
+
+
+class Trial(SQLModel, table=True):
+    """The hand-off record from an APPROVED Recommendation into a trial (W3-D).
+
+    Deliberately thin: in W3-D a Trial is the *evidence that a human-approved
+    hire entered the trial stage*, not yet the substance of that trial. The
+    plan, dates and outcome belong to W4 (see ``Workforce_W3D_Trial_Spec_V1`` §2.2).
+
+    All THREE parent FKs are RESTRICT, mirroring W3-C's DR-1: a trial is live
+    hiring evidence and must survive a Job / Candidate / Recommendation delete.
+    RESTRICT is itself the fail-closed direction -- refusing the delete is
+    safe; an unlock is only a convenience. W3-D ships no unlock path (Spec
+    §3-Q2): in V1 it could not unblock anything anyway, because the upstream
+    APPROVED recommendation is already un-purgeable. W4 owns the unlock,
+    together with the Trial cancellation semantics it depends on.
+    """
+
+    __tablename__ = "trial"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "recommendation_id",
+            name="uq_trial_recommendation",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("trial"), primary_key=True)
+    candidate_id: str = Field(foreign_key="candidate.id", ondelete="RESTRICT")
+    job_version_id: str = Field(
+        foreign_key="job_version.id", ondelete="RESTRICT"
+    )
+    recommendation_id: str = Field(
+        foreign_key="recommendation.id", ondelete="RESTRICT"
+    )
+    status: TrialStatus = Field(default=TrialStatus.PROPOSED)
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)

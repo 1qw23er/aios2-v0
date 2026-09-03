@@ -459,10 +459,23 @@ class CandidateLifecycle:
                                           a system withdraw (F-R8 drift
                                           reconcile).
 
-    Deliberately still absent after W3-C:
+    W3-D (Trial) opens one controlled edge on top of the W3-C wiring:
 
-        RECOMMENDED -> TRIALING        -- Trial is W3-D/W4; there is no
-                                         TRIALING member at all.
+        RECOMMENDED -> TRIALING        -- only via ``create_trial_from_approval``
+                                         (owner actor, after the L4 approval in
+                                         W3-C). The ``TRIALING`` node is itself a
+                                         dead-end in V1: it has no outbound edge
+                                         (Trial activation / completion /
+                                         cancellation is W4). Note C-5: once a
+                                         candidate is TRIALING, the F-R8 drift
+                                         reconcile will NOT release it back
+                                         (``_sync_candidate_back`` only releases
+                                         RECOMMENDED), so a drifted approval leaves
+                                         a ``TRIALING`` candidate behind -- that is
+                                         a known W3-D boundary, owned by W4.
+
+    Deliberately still absent:
+
         POOLED -> RECOMMENDED          -- the Match gate must be passed first.
         RECOMMENDED -> POOLED          -- the only way out is back to EVALUATED.
 
@@ -493,9 +506,17 @@ class CandidateLifecycle:
             CandidateStatus.RECOMMENDED,
         },
         # W3-C: RECOMMENDED is now reachable, with exactly ONE outbound edge back
-        # to EVALUATED (human REJECT / system withdraw). RECOMMENDED -> TRIALING
-        # does not exist -- Trial is W3-D/W4.
-        CandidateStatus.RECOMMENDED: {CandidateStatus.EVALUATED},
+        # to EVALUATED (human REJECT / system withdraw). W3-D (Trial) opens a
+        # SECOND, controlled outbound edge into TRIALING -- traversed only by
+        # ``create_trial_from_approval`` (owner actor, after the L4 approval).
+        CandidateStatus.RECOMMENDED: {
+            CandidateStatus.EVALUATED,
+            CandidateStatus.TRIALING,
+        },
+        # W3-D: TRIALING is the terminal W3 stage. Its outbound edge set is EMPTY
+        # in V1 -- Trial activation / completion / cancellation is W4. A candidate
+        # that has entered TRIALING cannot leave it within W3-D.
+        CandidateStatus.TRIALING: set(),
     }
 
     @classmethod

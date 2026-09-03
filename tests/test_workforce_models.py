@@ -364,10 +364,9 @@ def test_alembic_single_head_is_capreq_hardening() -> None:
     cfg.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
-    # Single linear head; W3-C Recommendation advances it past the W3-B
-    # Match/Benchmark head (20260901_0001_workforce_match_benchmark) to
-    # 20260902_0001.
-    assert heads == ["20260902_0001_workforce_recommendation"]
+    # Single linear head; W3-D Trial advances it past W3-C Recommendation
+    # (20260902_0001_workforce_recommendation) to 20260903_0001_workforce_trial.
+    assert heads == ["20260903_0001_workforce_trial"]
 
 
 def test_migration_creates_workforce_tables_additively(tmp_path: Path) -> None:
