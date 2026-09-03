@@ -1,9 +1,71 @@
+# DSH 路径③ 自包含独立审计 Prompt — AIOS W3-D Trial (Spec V1)
+
+> **用途**：供 DeepSeek harness（oxalpha / DSH）在**无任何会话上下文、无仓库访问**的情况下，对 AIOS W3-D（Trial）设计规格执行**独立审计**。
+> **铁律**：DSH 审计 ≠ merge 授权，也 ≠ 实现授权。DSH 只审计 + 出 verdict；exact-head 授权必须由 owner(R7) 显式给出。
+> **当前阶段**：**V1 设计审计**（纯 spec 复核，尚无实现代码 / migration / 测试 / PR）。
+
+> **归档说明（复现凭证）**：§1.5 附件 A 嵌入的是**第一轮审计当时的规格原文（修订前版本）**，
+> 与产出的 `Workforce_W3D_DSH_Audit_Report_V1.md` 构成一对可复现记录。
+> 审计后规格已按 4 项条件修订（见规格 §14.1），修订不改变设计语义。
+
+---
+
+## 0. 审计目标（本次运行已填）
+
+- 阶段：☒ **V1 设计审计**（纯 spec 复核，无代码）  /  ☐ **实现 PR gate**（代码+测试核验）
+- 审计目标文档：`docs/workforce/Workforce_W3D_Trial_Spec_V1.md`
+  - **逐字嵌入于本 prompt §1.5 附件 A** —— DSH **不需要**访问仓库、不需要读任何其他文件。
+  - 代码基线：`aios2-v0` / `1qw23er` `main @ 9364a67`（W3-C 已冻结落地）
+- 实现 PR gate（**本次未启用**，待 R7 对 §12 C-1…C-8 确认 + 实现完成后再填）：
+  - PR 号 = `<PR#>`
+  - exact-head SHA = `<SHA>`
+  - CI 状态 = `<SUCCESS | FAIL>`
+  - 落地方式 = `<Squash Merge | Merge Commit>`（协议要求优先 Squash；R7 手动 merge 追认授权不违规但须留痕偏差）
+
+---
+
+## 1. 背景（自包含，DSH 无需外部信息）
+
+### 1.1 AIOS 与 W3 分层
+
+**AIOS** = AI 员工工作力编排系统。W3 分层：
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| W3-A | Evaluation（单环评估） | 已冻结，已合入 main |
+| W3-B | Match / Benchmark / Ranking | 已冻结，已合入 main |
+| W3-C | Recommendation + Approval（含 L4 人类闸） | 已冻结，已合入 main（`9364a67`，PR #5 / PR #7） |
+| **W3-D** | **Trial（试用期交接）** | **本轮审计对象** |
+| W4 | Employee / Training / Performance | 未实现 |
+
+### 1.2 协作铁律（不可违反）
+
+- GitHub = 事实源（Issue / PR / CI）；AI **绝不自动 merge**。
+- owner(R7) 须对 **exact-head SHA** 显式授权；授权严格绑定 SHA，head 不一致则 STOP。
+- DSH（DeepSeek harness）接管独立 PR gate 审计，产出 GO / NO-GO / GO WITH CONDITIONS；**DSH 审计 ≠ 授权**。
+
+### 1.3 W3-D 的由来与边界来源
+
+- W3-C Spec **V4 §11** 是 W3-D 的**权威边界表**：Trial 实体 + `create_trial` 归 W3-D；`assert_trial_eligible` 是唯一前置守卫；Employee / Budget / Scheduler / Execution 全部归 W4；W3-C 止于 `RECOMMENDED`。
+- 早期存在一份 `Workforce_W3C_Recommendation_Approval_Trial_Spec_V1.md`（W3-C + Trial 合并早期稿）。**该稿的 Trial 部分已被 W3-C V4 推翻**，本轮不继承。五处关键偏离已由 Spec §0.1 逐条登记（见 §4 台账）。
+
+### 1.4 本轮最关键的单点背景（读懂这条才能审 Q1）
+
+W3-C 的 **Q1=B 裁决**决定：**不物理复用 `Approval` 表** —— L4 人类决策落在 `Recommendation.decided_by` 上，`Approval` 表在 V1 **根本没有被写入过任何行**，因此 `Recommendation.approval_id` **恒为 `None`**。
+
+后果：早期 Trial 草稿设计用 `UNIQUE(approval_id)` 作为幂等锚，而 SQLite 的 UNIQUE 把多个 `NULL` 视为互不相同 —— **该约束在 V1 完全不生效，是一个假的幂等保证**。
+因此 W3-D 必须把幂等锚迁移到 `UNIQUE(recommendation_id)`。这是本轮**最重要的单点偏离**，也是审计重点。
+
+### 1.5 附件 A —— 审计目标文档（逐字嵌入）
+
+以下为 `docs/workforce/Workforce_W3D_Trial_Spec_V1.md` 的**完整原文**，逐字嵌入，未作任何删改：
+
+````markdown
 # Workforce W3-D — Trial Spec V1
 
-> 状态：**设计稿 —— DSH 路径③第一轮审计 = GO WITH CONDITIONS，4 项条件已于本稿修订闭环；待 R7 确认 §12 C-1…C-8 后进入实现**
+> 状态：**设计稿，待 R7 确认 §12 条件后进入实现**
 > 上游基线：`docs/workforce/Workforce_W3C_Recommendation_Approval_Spec_V4.md`（W3-C 已冻结落地，main `9364a67`）
 > 代码基线：`main @ 9364a67`（PR #7 落地后）
-> 审计凭证：`Workforce_W3D_DSH_Audit_Report_V1.md`；审计 prompt：`DSH_Path3_Audit_Prompt_W3D_V1.md`（均为逐字可复现归档）
 
 ---
 
@@ -422,27 +484,12 @@ def create_trial_from_approval(
     return trial
 ```
 
-> ⚠️ **实现硬约束（DSH W-2，阻塞实现期踩坑）**：上骨架中的 `select` **必须**来自
-> `from sqlmodel import select`，**不得**来自 `from sqlalchemy import select`。
-> 原因（本仓既有先例）：对 `table=True` 的 SQLModel 类，SQLAlchemy Core 的 `select`
-> 返回**不可变 `Row`**，`Row.first()` 不是 `Trial` 实例，访问 `.recommendation_id`
-> 抛 `AttributeError`，且该错误在"回读重放"路径上会伪装成别的失败。
-> 涉及两处：`existing` 预检（§7 重放）与 `except IntegrityError` 分支的 `winner` 回读。
-
 ### 6.2 幂等键与唯一性（F-14）
 
 `audit_log.idempotency_key` 是 **unique 且 NOT NULL**（`audit.py:71`）。
 
 `trial.created` 的键 `trial:{recommendation_id}` 与 `UNIQUE(recommendation_id)` 对齐：
-同一批准的第二条 `trial.created` 审计行会在 DB 层被拒，与"重放返回既有行（不写审计）"共同构成**一致性约束**。
-
-> ⚠️ **措辞更正（DSH W-7）**：初稿称二者为「双保险」，**表述过强，已更正**。
-> 实际生效次序是：**(1)** 顺序重放场景在 `append_audit` 之前就命中 `existing` 并 `return`，
-> 审计唯一约束**根本没有被走到**；**(2)** 并发首次创建场景先触发 `trial` 的 UNIQUE
-> （`IntegrityError` 被捕获 → 回读胜者返回），审计唯一约束**同样不独立生效**。
-> 因此准确表述是：二者**语义对齐**（同一业务事实有两个同构的 DB 级护栏，任一层被绕过时
-> 另一层在错误方向上仍是兜底），但**不构成两条独立生效的防线**。
-> 真正的第一防线是 **§7 的 `existing` 预检 + `IntegrityError` 回读**；审计唯一键是**一致性校验**。
+同一批准的第二条 `trial.created` 审计行会在 DB 层被拒，与"重放返回既有行（不写审计）"共同构成**双保险**。
 
 本轮**不产生** `trial.deleted` 审计（无删除路径，F-T7）。
 
@@ -456,7 +503,6 @@ def create_trial_from_approval(
 | 并发首次创建 | `IntegrityError` → `expire_all()` 后回读胜者返回（镜像 `recommend_candidate` §8） |
 | rec 被撤回后重建（`_rebuild_recommendation` 原地 UPDATE，id 不变）再批准 | 既有 Trial 行仍在 → 重放返回（**不产生第二个 Trial**） |
 | 删除后重建 | **V1 不存在该场景**：无删除路径（F-T7）；解锁归 W4，届时须同步定义重放语义 |
-| **Trial 已存在、但 rec 当前已非 APPROVED**（如漂移撤回为 `WITHDRAWN`） | **409，不重放** —— §6.1 的 `assert_trial_eligible` 闸门位于 `existing` 预检**之前**，fail-closed 优先于幂等（DSH W-1 显式补录） |
 
 > ⚠️ 注意 `_rebuild_recommendation` 是**原地 UPDATE**（F-11），`recommendation.id` 不变，
 > 因此"撤回 → 重建 → 再批准"之后 `UNIQUE(recommendation_id)` 依然命中**同一个** Trial 行。这是期望行为：
@@ -572,10 +618,7 @@ op.create_table(
 ### T-TRIAL-IDEM — 幂等与并发（4）
 
 12. 同一 APPROVED rec 连续调用两次 → 第二次返回**同一行**，Trial 表仍 1 行，审计仍 1 条
-13. **并发首次创建（确定性注入，DSH W-6 强制）**：测试**不得**依赖真实线程并发（SQLite 单连接下不可复现）。
-    采用 data-layer 直接插入抢占 `UNIQUE(recommendation_id)` 槽位，再调 `create_trial_from_approval`，
-    断言：返回**既有的那一行**（不是新建）、`trial` 表仍 1 行、**不产生 500**、**不产生第二条** `trial.created` 审计。
-    （与 W3-C「F-R8 演示改 data-layer 注入」同类裁决；本节亦覆盖 `IntegrityError` 分支的 `winner` 回读路径）
+13. 并发首次创建 → 不产生 2 行、不产生 500
 14. 撤回 → 重建（原地 UPDATE）→ 再批准 → 创建：仍只有 1 个 Trial
 15. `audit_log.idempotency_key` 唯一性未被破坏
 
@@ -634,34 +677,102 @@ W3-D（Trial）在 V1 交付的是**一张交接凭证**：把一条**经人类 
 
 **刻意偏离的一条**：三父 FK 用 RESTRICT 但**不**配 `purge_trial`（C-2）。这不是疏漏 —— §3-Q2 论证了在 V1 交付 purge 要么不可达、要么制造 orphan-`TRIALING`，两者都劣于一条记录在案的 W4 义务。RESTRICT 本身即 fail-closed 方向，解锁只是便利性。
 
-**待 R7 对 §12 的 C-1…C-8 逐条确认后，进入实现 + 第二轮 DSH 路径③实现期审计（PR gate）。**
+**待 R7 对 §12 的 C-1…C-8 逐条确认后，进入实现 + DSH 路径③独立审计。**
+````
+
+> **附件 A 结束。** 以下为审计契约与流程，DSH 只依据附件 A 与本节判据出 verdict。
 
 ---
 
-## 14. DSH 路径③第一轮审计留痕（设计审计，2026-09-02）
+## 2. 七项独立审计契约（A–G，可字面断言）
 
-| 项 | 内容 |
-|---|---|
-| 审计方 | DSH（DeepSeek harness，路径③自包含 prompt，零会话上下文、零仓库访问） |
-| 模型 / 耗时 | `deepseek-v4-pro`，299s，reasoning 14,042 tokens |
-| Verdict | **GO WITH CONDITIONS** |
-| 七契约 | **A–G 全部 PASS**（逐条带章节号 + 原文引述核验通过） |
-| 计数核验 | F-T=8 / INV-T=5 / Q=7 / C=8 / 测试=30（分组加总=30）：**YES** |
-| 闭环台账 | **L-1…L-7 全部确认闭环**（编号定义见 `DSH_Path3_Audit_Prompt_W3D_V1.md` §4；含 L-6「不交付 `purge_trial`」—— DSH 独立复核认为 §3-Q2 论证成立，但仍属 R7 拍板项，不等于授权） |
-| 新发现 | **无**（除已列条件外，未发现新的内部缺陷） |
+| 契约 | 内容 | 可字面断言的验收判据（**设计审计阶段** = 判据须在附件 A 中可逐字查到） |
+|---|---|---|
+| **A** | 单 head / additive / 可逆 | §10 表：`down_revision = 20260902_0001_workforce_recommendation`（保持**单 head**）；`upgrade()` 只 `op.create_table("trial", …)`，**0 个显式索引**，`downgrade()` = `op.drop_table("trial")` 完全对称；§10.1 表逐对象判定"是否需要 migration"，且 `recommendation` / `candidate` / `job_version` / `match` / `approval` **全部"否"**（零 ALTER 既有表）；§10 代码块中 `trial` 的列序/类型与 §4 模型段**逐字一致**（7 列 + PK + 3 FK + 1 UNIQUE） |
+| **B** | 状态机边界 | §5.1：W3-A/W3-B/W3-C 既有边**零删改**（`EVALUATED: {REJECTED, RECOMMENDED}` 不变）；`RECOMMENDED: {EVALUATED}` → `{EVALUATED, TRIALING}`（**只增**）；新增 `TRIALING: set()` 节点出边为空集；§5.1 明写 `CandidateStatus.TRIALING = "trialing"` 且因列是 `sa.String()` 而**零 migration**（F-12）；§5.2 明写 Trial 状态机 **V1 无转移**，§3-Q3 明写 **不建 `TRIAL_ALLOWED` 边表、不建 `_transition_trial_status`** |
+| **C** | downgrade 完整性 | §10 `downgrade()` = 单条 `drop_table("trial")`；§10.1 保证 downgrade 后 W3-A/B/C 表与数据**不受影响**；spec **全文不含**任何会修改 `candidate` / `recommendation` 表结构或既有数据的 migration 动作 |
+| **D** | SSoT 零重造 | §9 接口契约表：对 `workforce_recommendation.py` 的依赖**全部是 import 复用**（`assert_trial_eligible` / `CandidateLifecycle.require_transition` / `_assert_owner_actor` / `append_audit`）；§6 F-T2 明写"W3-D 不得自行判断资格、不得绕过"；§2.2 明列 **不重写** Budget（`check_budget`）/ Scheduler / Execution / Approval 判定；无第二套能力词汇 |
+| **E** | 契约测试 | §11 清单**数到 30 项**，八组分组为 GATE 7 / STATE 4 / IDEM 4 / FK 3 / AUDIT 3 / BOUNDARY 5 / MIG 3 / CPL 1，**加总须恰为 30**；每组每项都能映射到一条 F-T* 或 INV-T* 或 §3-Q*；§11 明写"仅清单，本轮不写测试代码"；T-TRIAL-CPL 覆盖"既有套件不回归" |
+| **F** | fail-closed 语义 | §6 的 **F-T1…F-T8 共 8 条**，逐条在 §11 测试清单中有**至少一项**对应测试；**不存在**绕过 `assert_trial_eligible` 达致 Trial 的路径（F-T1/F-T2）；§3-Q5 actor **keyword-only 无默认**（F-T4）；**不存在**任何 Trial 删除/purge 路径（F-T7 + §2.2 + T-TRIAL-BOUNDARY 26）；§3-Q2 三父 FK **全 RESTRICT** 且明写"不得引入任何 CASCADE" |
+| **G** | 交接凭证语义 + 审计留痕 | §8 表：V1 **只有一条**审计动作 `trial.created`，action / resource_type / before / after / idempotency_key 五项齐全；`before` **必须含 `decided_by`**（决策者身份进入证据链，对应测试 19）；INV-T5 + §6.1 骨架：状态写入 + 审计 + candidate 转换在**同一 `session.begin_nested()`**；§6.2 幂等键 `trial:{rec.id}` 与 `UNIQUE(recommendation_id)` 对齐构成双保险；明写**不产生** `trial.deleted` |
 
-### 14.1 四项条件与本稿修订对照
+---
 
-| # | DSH 判定 | 条件 | 本稿修订 | 落点 |
-|---|---|---|---|---|
-| W-1 | PASS（建议补录） | §7 幂等表未涵盖「Trial 已存在但 rec 已非 APPROVED」场景 | ✅ 补录一行：该场景 **409 不重放**，并写明"fail-closed 优先于幂等" | §7 |
-| W-2 | **FAIL（条件）** | 未钉死 `select` 的 import 来源，实现期踩 SQLModel `Row` 陷阱 | ✅ 新增「实现硬约束」块：必须 `from sqlmodel import select`，并点名两处调用点 | §6.1 |
-| W-6 | **FAIL（条件）** | 测试 13「并发首次创建」在 SQLite 单连接下不可确定性复现 | ✅ 改为 **data-layer 抢占 UNIQUE 槽的确定性注入**，并补足断言集 | §11 IDEM 13 |
-| W-7 | **FAIL（条件）** | §6.2「双保险」表述过强（两层并非各自独立生效） | ✅ 更正为「一致性约束」，并逐场景说明实际生效次序 | §6.2 |
+## 3. 核验方法（V1 设计审计，只读附件 A）
 
-### 14.2 DSH 判定为 PASS 的薄弱点（无需修订）
+DSH 逐项执行：
 
-- **W-3**（`append_audit` 签名 / `project_id=None`）：PASS —— F-15 已给出全关键字签名，骨架调用合规。
-- **W-4**（`require_transition` 的 StrEnum↔str 类型契约）：PASS —— `StrEnum` 与 `str` 哈希相等，dict 查找成立。
-- **W-5**（SAVEPOINT 内 `IntegrityError` 的恢复语义）：PASS —— `except` 位于 `begin_nested()` 之外，捕获后 `expire_all()` 再回读，模式自洽。
-- **W-8**（边界测试 22/23/26 的静态 grep）：PASS —— 廉价 fail-closed 边界断言，W3-C 有同类先例，可接受。
+1. **契约 A–G**：按上表"可字面断言的验收判据"在附件 A 中**逐字定位**，给出章节号 + 原文引述。定位不到 = FAIL。
+2. **计数核验**：§11 测试项数到 30 且分组加总为 30；§6 的 F-T 数到 8；§4.1 的 INV-T 数到 5；§12 的 C-* 数到 8；§3 的 Q* 数到 7。**任一计数不符 = FAIL（E）**。
+3. **内部一致性**：附件 A 内部是否存在自相矛盾（断言 X 与断言 Y 冲突）。历史上 W3-C V4 就在此项上被审出 P1-NEW-1（CAS 乐观锁 token 用错值）。**本项为重点**。
+4. **早期草稿偏离**：§0.1 五处偏离是否**自洽且与 Q1=B 事实相容**（尤其：`UNIQUE(approval_id)` → `UNIQUE(recommendation_id)` 的迁移论证是否成立）。
+5. **边界不越界**：§2.2「明确不做」表中的每一项，在 §4 / §6.1 / §10 中**确实没有被偷偷做**（例如：全文不得出现 `purge_trial` 的可交付定义、`ACTIVE`/`COMPLETED` 等 W4 死词汇、`check_budget` 调用、Employee 表）。
+6. **文档纯度**：附件 A 不含会落入生产代码库的最终实现（允许出现"参考实现骨架"，但须明确标注为骨架且待 R7 确认）。
+
+---
+
+## 4. 闭环台账（已由 spec 作者登记，DSH **只确认、不重新辩论**）
+
+| # | 项 | 声称的闭环方式 | DSH 核验 |
+|---|---|---|---|
+| L-1 | 早期草稿 `approval_id` FK | Q1=B 否决，§0.1 明列"不建该列、不建该 FK" | ☐ |
+| L-2 | 早期草稿 `UNIQUE(approval_id)` 锚失效 | §3-Q1 迁移到 `UNIQUE(recommendation_id)`，论证"恒 NULL = 假约束" | ☐ |
+| L-3 | 早期草稿给 `approval` 表加列 | V4 §12.2 判定不需要 migration，§0.1 明列"不碰 approval 表" | ☐ |
+| L-4 | 早期草稿 `trial_plan_ref` / `started_at` / `ended_at` | §3-Q4 判定为 W4 才填的死列，不建 | ☐ |
+| L-5 | 早期草稿把 `TRIALING` 放进 W3-C | V4 §11 明裁 W3-C 止于 `RECOMMENDED`，§0.1 挪到 W3-D | ☐ |
+| L-6 | `purge_trial` **不交付** | §3-Q2 三点论证（V1 不可达 / 制造 orphan-`TRIALING` / 正解依赖 W4 取消语义）+ 升格为 C-2 待 R7 拍板 | ☐ |
+| L-7 | 推论 B 的行为缺口（进入 `TRIALING` 后 F-R8 撤回不回退） | §12 C-5 登记为已知缺口，明确"不在 W3-D 修"，危险后果由 F-T3 阻断 | ☐ |
+
+> **注意**：L-6 是 spec 作者**主动偏离 W3-C 先例**（W3-C D-R1 曾确立「RESTRICT 必须配显式 purge」）。DSH 须判定该偏离的**论证是否成立**，而非默认其违规或默认其正确。
+
+---
+
+## 5. Spec 作者自陈的薄弱点（**不预设结论**，请 DSH 独立判定）
+
+以下 8 点是 spec 作者自认最可能被击穿的地方。**DSH 必须独立复核并给出 PASS / FAIL / 新 finding**，不得照抄作者的自我辩护：
+
+- **W-1 检查顺序（gate 先于 replay）**：§6.1 骨架先做 `assert_trial_eligible`（False → 409），**后**查 existing Trial 做重放。这意味若 Trial 已存在、但 rec 已被漂移撤回为 `WITHDRAWN`，重复调用会抛 **409** 而**不会**重放返回既有 Trial。即"幂等性"弱于"fail-closed"。请判定：这个顺序是否正确？§7 幂等规则表是否已充分覆盖该场景（表中第 1 行前提是"同一 **APPROVED** rec"，是否遗漏了"已非 APPROVED"的显式说明）？
+- **W-2 SQLModel select 陷阱**：§6.1 的 `session.exec(select(Trial).where(...)).first()` 与并发分支的 `winner` 回读，**未指定 `select` 的 import 来源**。本仓既有先例：对 `table=True` 类，`from sqlalchemy import select` 返回**不可变 Row**（`.first()` 不是 `Trial` 实例，访问属性抛 `AttributeError`），必须用 `from sqlmodel import select`。若 spec 未钉死 import，实现期极易踩坑且测试可能假通过。请判定是否应作为阻塞项要求 spec 显式钉死。
+- **W-3 `append_audit` 的 `project_id=None` / `task_id=None` 合法性**：§6.1 传 `project_id=None, task_id=None`，§8 称"与 W3-C 一致"。请判定 spec 是否应显式核对 `append_audit` 签名（该仓 `audit.py` 全关键字参数，且 `idempotency_key` 为 `unique=True` + NOT NULL）。
+- **W-4 `require_transition(cand.status, CandidateStatus.TRIALING)` 的类型契约**：`cand.status` 落库为 `sa.String()`，而 `CandidateLifecycle.ALLOWED` 的 key 是 `CandidateStatus`（StrEnum）。请判定 spec 是否应显式写明"StrEnum 与 str 的 hash 相等，故 dict 查找成立"，以免实现期因类型不匹配产生 409 假失败。
+- **W-5 SAVEPOINT 内的 `IntegrityError` 恢复语义**：§6.1 的 `except IntegrityError` 位于 `with session.begin_nested():` **之外**，捕获后 `session.expire_all()` 再回读胜者。请判定该模式与 W3-C `recommend_candidate` §8 的既有实现是否**逐字同构**（spec 声称"镜像"），以及 `session.add(trial)` 在 SAVEPOINT 回滚后对象状态是否需要额外 `expunge`。
+- **W-6 测试 13「并发首次创建」的可测性**：SQLite 单连接下难以产生真实并发 `IntegrityError`。请判定该测试在既有测试基建下是否可写、是否应改为"直接 data-layer 插入抢占 UNIQUE 槽"的确定性注入（W3-C 曾有同类裁决：F-R8 演示改 data-layer 注入）。
+- **W-7 `UNIQUE(recommendation_id)` 与 `audit_log.idempotency_key` 的"双保险"是否真双保险**：审计幂等键在 SAVEPOINT 内插入，若两个 SAVEPOINT 在同一外层事务/同一连接，唯一性冲突的**触发时机与传播路径**是否与 UNIQUE 约束一致。请判定"双保险"表述是否过强。
+- **W-8 边界测试 22/23/26 的静态 grep 脆弱性**：`test` 里 grep 源码断言"无 Employee / 无 check_budget / 无 purge_trial"属静态断言。请判定是否接受（W3-C 已有同类先例）或需降级为 P3。
+
+---
+
+## 6. Verdict 协议（DSH 必须**严格按此格式**输出）
+
+```
+VERDICT: GO | NO-GO | GO WITH CONDITIONS
+
+[A–G 逐项]
+A: PASS/FAIL — <证据：章节号 + 原文引述>
+B: PASS/FAIL — <证据>
+C: PASS/FAIL — <证据>
+D: PASS/FAIL — <证据>
+E: PASS/FAIL — <证据：实际数到的测试项数与分组加总>
+F: PASS/FAIL — <证据>
+G: PASS/FAIL — <证据>
+
+[计数核验] F-T=8 / INV-T=5 / Q=7 / C=8 / 测试=30（分组加总=30）：YES/NO
+[闭环台账 L-1…L-7] 全部确认闭环：YES/NO（否 -> 列出）
+[薄弱点 W-1…W-8] 逐条 PASS/FAIL/新 finding（**必须逐条给出独立判定**）
+[新发现] <附件 A 中发现的、上述未涵盖的任何缺陷；无则写"无">
+[结论] <一句话>
+```
+
+- **GO** → W3-D Spec V1 设计成熟，可路由 R7 逐条确认 §12 C-1…C-8 后进入 TDD。
+- **GO WITH CONDITIONS** → 列出必须修订的非阻塞项 + 条件；R7 可按"修订属文档级、不改变设计语义"直接采信并授权。
+- **NO-GO** → 列出具体未闭环项（契约 ? / W-? / 新发现 ?），**不授权**。
+- 若发现附件 A 本身的**新缺陷**（非台账已登记项），须作为新 finding 上报并给出**具体章节号 + 反例**，**不得自行修补**。
+
+---
+
+## 7. 硬约束（不可违反）
+
+1. **纯审计**：不改代码、不写 migration、不写测试、不 commit、不 push、不 PR、不授权实现、不授权合并。
+2. **exact-head 授权**必须由 R7 显式给出；DSH 审计 ≠ 授权。
+3. 所有输出必须可追溯到本 prompt 的 **§2 七契约**、**§4 台账**、**§5 薄弱点**三者之一，或作为**新发现**显式标记。
+4. **独立性要求**：不得因为"spec 作者已自我登记"就跳过对 L-* 与 W-* 的独立复核；作者的自我辩护不构成证据。
