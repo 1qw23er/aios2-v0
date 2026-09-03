@@ -678,9 +678,10 @@ def test_w3a_is_zero_migration(tmp_path: Path) -> None:
     cfg.set_main_option("script_location", str(root / "alembic"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
     # W3-A added no revision (head stayed at 20260827_0002_workforce_candidate);
-    # W3-B advanced it to 20260901_0001_workforce_match_benchmark, and W3-C
-    # Recommendation now advances the single head to 20260902_0001.
-    assert heads == ["20260902_0001_workforce_recommendation"]
+    # W3-B advanced it to 20260901_0001_workforce_match_benchmark, W3-C
+    # Recommendation to 20260902_0001_workforce_recommendation, and W3-D Trial
+    # now advances the single head to 20260903_0001_workforce_trial.
+    assert heads == ["20260903_0001_workforce_trial"]
 
     url = f"sqlite:///{(tmp_path / 'zeromig.db').as_posix()}"
     run_migrations(url)
@@ -691,10 +692,9 @@ def test_w3a_is_zero_migration(tmp_path: Path) -> None:
     # W3-A added no revision of its own; W3-B (now in the chain) legitimately adds
     # benchmark / benchmark_version / benchmark_result / match -- those are asserted
     # by the W3-B suite (test_w3b_migration_is_single_head_additive_reversible).
-    # W3-C adds ``recommendation`` (asserted by its own suite); the still-deferred
-    # W3-D/W4 tables must NOT have leaked in.
+    # W3-C adds ``recommendation`` and W3-D adds ``trial`` (asserted by their own
+    # suites); only the still-deferred W4+ tables must NOT have leaked in.
     for deferred in (
-        "trial",
         "candidate_evaluation",
     ):
         assert deferred not in tables, f"{deferred} must not exist yet"

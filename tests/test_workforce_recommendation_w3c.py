@@ -275,11 +275,21 @@ def test_recommend_refuses_non_evaluated_candidate(tmp_path: Path) -> None:
 
 
 def test_recommended_has_no_outbound_edge_but_evaluated(tmp_path: Path) -> None:
-    """T-REC-STATE-4: ALLOWED[RECOMMENDED] == {EVALUATED} -- no TRIALING edge."""
+    """T-REC-STATE-4: ALLOWED[RECOMMENDED] == {EVALUATED, TRIALING}.
+
+    W3-C opened the single Match-gate edge to EVALUATED; W3-D (Trial) added the
+    controlled second outbound edge to TRIALING. The Match-gate shortcuts stay
+    illegal even after both gates are open.
+    """
     assert CandidateLifecycle.ALLOWED[CandidateStatus.RECOMMENDED] == {
-        CandidateStatus.EVALUATED
+        CandidateStatus.EVALUATED,
+        CandidateStatus.TRIALING,
     }
-    # The shortcut edges stay illegal even after W3-C opens the Match gate.
+    # RECOMMENDED -> TRIALING is now legal (W3-D), but the Match-gate shortcuts
+    # stay illegal.
+    assert CandidateLifecycle.can_transition(
+        CandidateStatus.RECOMMENDED, CandidateStatus.TRIALING
+    )
     assert not CandidateLifecycle.can_transition(
         CandidateStatus.RECOMMENDED, CandidateStatus.POOLED
     )
@@ -540,20 +550,28 @@ def test_recommendation_never_writes_evaluation_context(tmp_path: Path) -> None:
 
 
 def test_no_deferred_tables_were_created(tmp_path: Path) -> None:
-    """T-REC-BOUNDARY-26: Trial / Employee / candidate_evaluation stay deferred."""
+    """T-REC-BOUNDARY-26 (residual): Employee / training / performance /
+    candidate_evaluation stay deferred.
+
+    NOTE: ``trial`` was deferred under W3-C's T-REC-BOUNDARY-26, but W3-D
+    implemented it (see ``workforce_trial.py`` + migration
+    ``20260903_0001_workforce_trial``), so it is intentionally no longer in
+    this list. The genuinely-still-deferred W4+ tables are asserted below.
+    """
     url = f"sqlite:///{(tmp_path / 'bound26.db').as_posix()}"
     with _db(url) as _session:
         tables = set(inspect(get_engine(url)).get_table_names())
         for deferred in (
-            "trial",
             "employee",
             "training",
             "performance",
             "candidate_evaluation",
         ):
             assert deferred not in tables, f"{deferred} must not exist yet"
-        # ...but W3-C's own table does exist (C3①: it is no longer deferred).
+        # W3-C's own table exists (C3①: it is no longer deferred) ...
         assert "recommendation" in tables
+        # ... and W3-D's ``trial`` table now exists too.
+        assert "trial" in tables
 
 
 def test_recommend_calls_no_w3a_w3b_budget_or_execution(
@@ -1617,11 +1635,11 @@ def test_w3c_migration_is_single_head_and_reversible(tmp_path: Path) -> None:
 
     from alembic import command
 
-    # 29: the recommendation migration is the single alembic head.
+    # 29: the single alembic head is now the W3-D Trial migration
     cfg = Config(ROOT / "alembic.ini")
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     assert ScriptDirectory.from_config(cfg).get_heads() == [
-        "20260902_0001_workforce_recommendation"
+        "20260903_0001_workforce_trial"
     ]
 
     db_path = tmp_path / "mig_w3c.db"
@@ -1648,7 +1666,7 @@ def test_w3c_migration_is_single_head_and_reversible(tmp_path: Path) -> None:
     version = conn.execute(
         "SELECT version_num FROM alembic_version"
     ).fetchone()[0]
-    assert version == "20260902_0001_workforce_recommendation"
+    assert version == "20260903_0001_workforce_trial"
     conn.close()
 
     # 30: reversible -- downgrade removes the W3-C table + indexes, nothing else.
