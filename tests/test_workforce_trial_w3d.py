@@ -688,7 +688,7 @@ def test_single_alembic_head() -> None:
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20260903_0002_workforce_employee"]
+    assert script.get_heads() == ["20260904_0001_workforce_cost_evidence"]
 
 
 def test_trial_table_shape_and_zero_explicit_indexes(tmp_path: Path) -> None:

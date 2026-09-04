@@ -170,9 +170,11 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     # prove the knowledge migrations; this final step only confirms we can
     # return to the current head (#109 customer-service workflow slice
     # 20260731_0001, then the SalesPlaybook V0 slice 20260812_0001, extend the
-    # chain past the #103 secret-store slice, to the current Workforce
-    # Management head (W3-D Trial): 20260903_0002_workforce_employee.
-    assert revision() == "20260903_0002_workforce_employee"
+    # chain past the #103 secret-store slice, to the Workforce Management
+    # chain (W1--W4: business_goal .. employee, head 20260903_0002) and then
+    # to the current W5 Cost Evidence head:
+    # 20260904_0001_workforce_cost_evidence.
+    assert revision() == "20260904_0001_workforce_cost_evidence"
 
 
 def test_scope_unique_migration_round_trip(tmp_path: Path) -> None:

@@ -1641,11 +1641,11 @@ def test_w3c_migration_is_single_head_and_reversible(tmp_path: Path) -> None:
 
     from alembic import command
 
-    # 29: the single alembic head is now the W3-D Trial migration
+    # 29: the single alembic head is now the W5 Cost Evidence migration
     cfg = Config(ROOT / "alembic.ini")
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     assert ScriptDirectory.from_config(cfg).get_heads() == [
-        "20260903_0002_workforce_employee"
+        "20260904_0001_workforce_cost_evidence"
     ]
 
     db_path = tmp_path / "mig_w3c.db"
@@ -1672,7 +1672,7 @@ def test_w3c_migration_is_single_head_and_reversible(tmp_path: Path) -> None:
     version = conn.execute(
         "SELECT version_num FROM alembic_version"
     ).fetchone()[0]
-    assert version == "20260903_0002_workforce_employee"
+    assert version == "20260904_0001_workforce_cost_evidence"
     conn.close()
 
     # 30: reversible -- downgrade removes the W3-C table + indexes, nothing else.

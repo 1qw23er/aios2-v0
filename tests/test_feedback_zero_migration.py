@@ -30,7 +30,7 @@ from aios.feedback import (
 )
 from aios.models import Artifact, ArtifactType, Event, Project, Task
 
-HEAD = "20260903_0002_workforce_employee"
+HEAD = "20260904_0001_workforce_cost_evidence"
 
 
 # Shared DB fixtures (mirror tests/test_feedback.py; pytest fixtures are

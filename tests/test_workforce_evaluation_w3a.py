@@ -679,9 +679,10 @@ def test_w3a_is_zero_migration(tmp_path: Path) -> None:
     heads = ScriptDirectory.from_config(cfg).get_heads()
     # W3-A added no revision (head stayed at 20260827_0002_workforce_candidate);
     # W3-B advanced it to 20260901_0001_workforce_match_benchmark, W3-C
-    # Recommendation to 20260902_0001_workforce_recommendation, and W3-D Trial
-    # now advances the single head to 20260903_0002_workforce_employee.
-    assert heads == ["20260903_0002_workforce_employee"]
+    # Recommendation to 20260902_0001_workforce_recommendation, W3-D Trial to
+    # 20260903_0002_workforce_employee, and W5 Cost Evidence to
+    # 20260904_0001_workforce_cost_evidence.
+    assert heads == ["20260904_0001_workforce_cost_evidence"]
 
     url = f"sqlite:///{(tmp_path / 'zeromig.db').as_posix()}"
     run_migrations(url)
