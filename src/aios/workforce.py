@@ -463,21 +463,40 @@ class CandidateLifecycle:
 
         RECOMMENDED -> TRIALING        -- only via ``create_trial_from_approval``
                                          (owner actor, after the L4 approval in
-                                         W3-C). The ``TRIALING`` node is itself a
-                                         dead-end in V1: it has no outbound edge
-                                         (Trial activation / completion /
-                                         cancellation is W4). Note C-5: once a
-                                         candidate is TRIALING, the F-R8 drift
-                                         reconcile will NOT release it back
-                                         (``_sync_candidate_back`` only releases
-                                         RECOMMENDED), so a drifted approval leaves
-                                         a ``TRIALING`` candidate behind -- that is
-                                         a known W3-D boundary, owned by W4.
+                                         W3-C). The ``TRIALING`` node had no
+                                         outbound edge in W3-D (Trial
+                                         activation / completion / cancellation
+                                         is W4) -- W4 opened them, see below.
+                                         Note C-5: once a candidate is TRIALING,
+                                         the F-R8 drift reconcile will NOT
+                                         release it back (``_sync_candidate_back``
+                                         only releases RECOMMENDED), so a drifted
+                                         approval leaves a ``TRIALING`` candidate
+                                         behind -- W4 mitigates this partially
+                                         with ``release_candidate`` (explicit
+                                         release path) without modifying W3-C.
+
+    W4 (Employee) opens the final two edges of the loop:
+
+        TRIALING -> EMPLOYED          -- only via ``promote_to_employee``, and
+                                        only when the Trial is COMPLETED
+                                        (INV-E1). Completing a trial does NOT
+                                        hire anyone (D-6 human gate).
+        TRIALING -> POOLED            -- only via ``release_candidate``, and only
+                                        when the Trial is FAILED or CANCELLED
+                                        (D-2). This is also the *partial*
+                                        mitigation of W3-D's known gap C-5: an
+                                        explicit release path now exists, but
+                                        the F-R8 withdraw path itself is left
+                                        untouched (W3-C is frozen).
+        EMPLOYED  -> (none)           -- terminal.
 
     Deliberately still absent:
 
         POOLED -> RECOMMENDED          -- the Match gate must be passed first.
         RECOMMENDED -> POOLED          -- the only way out is back to EVALUATED.
+        TRIALING -> EVALUATED/REJECTED -- a failed trial releases to POOLED and
+                                          re-evaluation starts from there.
 
     ``RECOMMENDED`` is a real ``CandidateStatus`` member (stable vocabulary). It
     was mapped to an empty edge set until W3-C wired the Match gate; the
@@ -513,10 +532,26 @@ class CandidateLifecycle:
             CandidateStatus.EVALUATED,
             CandidateStatus.TRIALING,
         },
-        # W3-D: TRIALING is the terminal W3 stage. Its outbound edge set is EMPTY
-        # in V1 -- Trial activation / completion / cancellation is W4. A candidate
-        # that has entered TRIALING cannot leave it within W3-D.
-        CandidateStatus.TRIALING: set(),
+        # W4: TRIALING is no longer a dead end -- it has exactly TWO outbound
+        # edges, and both are taken by an explicit owner action:
+        #   TRIALING -> EMPLOYED  -- only via ``promote_to_employee``, and only
+        #                            when the Trial is COMPLETED (INV-E1).
+        #   TRIALING -> POOLED    -- only via ``release_candidate``, and only
+        #                            when the Trial is FAILED or CANCELLED
+        #                            (D-2: release back into the talent pool so
+        #                            the candidate can be re-matched later; no
+        #                            new terminal state is introduced).
+        # There is deliberately NO TRIALING -> EVALUATED / REJECTED shortcut:
+        # a failed trial returns to POOLED, and re-evaluation starts from there.
+        CandidateStatus.TRIALING: {
+            CandidateStatus.EMPLOYED,
+            CandidateStatus.POOLED,
+        },
+        # W4: EMPLOYED is terminal -- zero outbound edges. Consistent with
+        # EmployeeStatus having a single member (ACTIVE) and with W4 shipping no
+        # delete semantics (D-4): there is no writer for "un-employ", so there
+        # is no edge for it.
+        CandidateStatus.EMPLOYED: set(),
     }
 
     @classmethod

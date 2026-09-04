@@ -171,8 +171,8 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     # return to the current head (#109 customer-service workflow slice
     # 20260731_0001, then the SalesPlaybook V0 slice 20260812_0001, extend the
     # chain past the #103 secret-store slice, to the current Workforce
-    # Management head (W3-D Trial): 20260903_0001_workforce_trial.
-    assert revision() == "20260903_0001_workforce_trial"
+    # Management head (W3-D Trial): 20260903_0002_workforce_employee.
+    assert revision() == "20260903_0002_workforce_employee"
 
 
 def test_scope_unique_migration_round_trip(tmp_path: Path) -> None:
