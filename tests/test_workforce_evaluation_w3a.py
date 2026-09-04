@@ -680,8 +680,8 @@ def test_w3a_is_zero_migration(tmp_path: Path) -> None:
     # W3-A added no revision (head stayed at 20260827_0002_workforce_candidate);
     # W3-B advanced it to 20260901_0001_workforce_match_benchmark, W3-C
     # Recommendation to 20260902_0001_workforce_recommendation, and W3-D Trial
-    # now advances the single head to 20260903_0001_workforce_trial.
-    assert heads == ["20260903_0001_workforce_trial"]
+    # now advances the single head to 20260903_0002_workforce_employee.
+    assert heads == ["20260903_0002_workforce_employee"]
 
     url = f"sqlite:///{(tmp_path / 'zeromig.db').as_posix()}"
     run_migrations(url)

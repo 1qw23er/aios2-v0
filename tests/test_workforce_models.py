@@ -365,8 +365,8 @@ def test_alembic_single_head_is_capreq_hardening() -> None:
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
     # Single linear head; W3-D Trial advances it past W3-C Recommendation
-    # (20260902_0001_workforce_recommendation) to 20260903_0001_workforce_trial.
-    assert heads == ["20260903_0001_workforce_trial"]
+    # (20260902_0001_workforce_recommendation) to 20260903_0002_workforce_employee.
+    assert heads == ["20260903_0002_workforce_employee"]
 
 
 def test_migration_creates_workforce_tables_additively(tmp_path: Path) -> None:

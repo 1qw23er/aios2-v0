@@ -1574,11 +1574,17 @@ class CandidateStatus(StrEnum):
     EVALUATED = "evaluated"
     RECOMMENDED = "recommended"
     # W3-D: the only inbound edge is RECOMMENDED -> TRIALING (opened by
-    # ``create_trial_from_approval``). The outbound edge set is empty in V1:
-    # Trial activation / completion / cancellation is W4. The column is a plain
-    # ``sa.String()`` (migration ``20260827_0002_workforce_candidate``), so adding
-    # this member required no schema change.
+    # ``create_trial_from_approval``). The outbound edge set stayed empty in W3-D
+    # because Trial activation / completion / cancellation is W4. The column is a
+    # plain ``sa.String()`` (migration ``20260827_0002_workforce_candidate``), so
+    # adding this member required no schema change.
     TRIALING = "trialing"
+    # W4: the terminal state of a successful hire. Reachable ONLY from TRIALING
+    # and ONLY through ``promote_to_employee`` (D-6 human gate) -- see
+    # ``docs/workforce/Workforce_W4_Employee_Spec_V1.md`` §5.5 / INV-E1. The edge
+    # is opened in ``workforce.CandidateLifecycle`` (W4's single touch point on
+    # that frozen module). Zero-migration for the same reason as TRIALING.
+    EMPLOYED = "employed"
 
 
 class Candidate(SQLModel, table=True):
@@ -1933,31 +1939,89 @@ class Recommendation(SQLModel, table=True):
 
 
 class TrialStatus(StrEnum):
-    """Lifecycle state of one Trial (W3-D).
+    """Lifecycle state of one Trial (W3-D states + the W4 state machine).
 
-    W3-D writes exactly one member: ``PROPOSED``. There is deliberately no
-    reserved vocabulary for W4's states (ACTIVE / COMPLETED / CANCELLED /
-    FAILED): the column is a plain ``sa.String()`` (see ``CandidateStatus``), so
-    W4 can add members with zero migration, and dead enum members would only
-    obscure the fact that this stage has a single state.
+    W3-D shipped exactly one member, ``PROPOSED``, and deliberately defined no
+    edge table and no status writer -- with zero transitions those would have
+    been dead code (see the W3-D note preserved below). W4 takes over the Trial
+    lifecycle (W3-D Spec §12 C-4) and therefore introduces the three missing
+    pieces *together*: the state vocabulary, the ``TRIAL_ALLOWED`` edge table,
+    and a single status writer (``workforce_employee._transition_trial_status``).
 
-    Consequently V1 defines NO ``TRIAL_ALLOWED`` edge table and no
-    ``_transition_trial_status``: with zero transitions they would be dead code.
-    The invariant is structural instead -- ``trial.status`` has exactly one
-    writer, the constructor default in ``create_trial_from_approval``. W4 MUST
-    introduce ``TRIAL_ALLOWED`` + a single status writer together with its
-    first transition.
+    * ``PROPOSED``  -- hand-off written by ``create_trial_from_approval`` (W3-D).
+      No trial substance yet.
+    * ``ACTIVE``    -- the trial is running (``activate_trial``: writes
+      ``trial_plan_ref`` + ``started_at``).
+    * ``COMPLETED`` -- terminal, outcome = ``pass`` (``complete_trial``).
+    * ``FAILED``    -- terminal, outcome = ``fail`` (``complete_trial``).
+    * ``CANCELLED`` -- terminal, outcome is ALWAYS ``None``: a cancellation is
+      not an assessment (``cancel_trial``).
+
+    COMPLETED / FAILED / CANCELLED are terminal -- their outbound edge set is
+    empty. Only ``promote_to_employee`` may act on a COMPLETED trial, and it
+    writes ``Employee``, not another Trial state.
+
+    NOTE (zero-migration): the ``trial.status`` column is a plain
+    ``sa.String()`` (migration ``20260903_0001_workforce_trial``), NOT a DB
+    ENUM -- adding these four members requires no schema change. The four new
+    *columns* on ``Trial`` (trial_plan_ref / started_at / ended_at / outcome)
+    DO require the W4 additive migration.
     """
 
     PROPOSED = "proposed"
+    # W4
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class TrialOutcome(StrEnum):
+    """The verdict of a trial that reached a verdict (W4).
+
+    Deliberately binary and deliberately nullable: ``pass`` / ``fail`` are the
+    only two outcomes a *completed* trial can have, and a CANCELLED trial has no
+    outcome at all (``outcome is None``). There is no ``unknown`` member --
+    fail-closed means an un-assessable trial is CANCELLED, never recorded as a
+    guessed verdict.
+
+    Zero-migration: ``trial.outcome`` is a plain ``sa.String()`` (the column
+    itself is created by the W4 migration; adding members later is free).
+    """
+
+    PASS = "pass"
+    FAIL = "fail"
+
+
+class EmployeeStatus(StrEnum):
+    """Lifecycle state of one Employee (W4, Q5).
+
+    V1 has exactly ONE member -- ``ACTIVE`` -- and therefore zero outbound
+    edges. This is a deliberate anti-speculation decision:
+
+    * there is no ``TERMINATED`` / ``ON_LEAVE`` / ``SUSPENDED`` member, because
+      V1 has no writer for any of them (D-4: W4 ships no ``purge_employee`` and
+      no delete semantics at all -- that is a W5 obligation);
+    * a dead member would only obscure the fact that hiring is currently a
+      one-way door.
+
+    Zero-migration: ``employee.status`` is a plain ``sa.String()``.
+    """
+
+    ACTIVE = "active"
 
 
 class Trial(SQLModel, table=True):
     """The hand-off record from an APPROVED Recommendation into a trial (W3-D).
 
     Deliberately thin: in W3-D a Trial is the *evidence that a human-approved
-    hire entered the trial stage*, not yet the substance of that trial. The
-    plan, dates and outcome belong to W4 (see ``Workforce_W3D_Trial_Spec_V1`` §2.2).
+    hire entered the trial stage*, not yet the substance of that trial.
+
+    W4 fills in that substance (additive migration, D-5) with four typed
+    columns -- ``trial_plan_ref`` / ``started_at`` / ``ended_at`` / ``outcome``
+    -- and takes over the lifecycle: W3-D left ``status`` at ``PROPOSED`` with
+    exactly one writer, and W4 is the stage that introduces the state machine
+    plus its single status writer (W3-D Spec §12 C-4).
 
     All THREE parent FKs are RESTRICT, mirroring W3-C's DR-1: a trial is live
     hiring evidence and must survive a Job / Candidate / Recommendation delete.
@@ -1986,5 +2050,91 @@ class Trial(SQLModel, table=True):
         foreign_key="recommendation.id", ondelete="RESTRICT"
     )
     status: TrialStatus = Field(default=TrialStatus.PROPOSED)
+    # --- W4: the substance of the trial (additive migration) -----------------
+    # Kept as FOUR separate typed columns instead of one JSON bag (D-5): the
+    # dates are queryable, ``outcome`` is constrained to the ``TrialOutcome``
+    # vocabulary by the service layer, and every field is individually
+    # nullable so "not yet known" is representable without a sentinel value.
+    # Opaque reference to the trial plan (a doc id / path -- never inlined).
+    trial_plan_ref: str | None = None
+    # Written when PROPOSED -> ACTIVE.
+    started_at: datetime | None = None
+    # Written when the trial reaches a terminal state (COMPLETED / FAILED /
+    # CANCELLED).
+    ended_at: datetime | None = None
+    # pass / fail for a verdict; ALWAYS None for CANCELLED (cancel != assess).
+    outcome: TrialOutcome | None = None
+    # --- end W4 -------------------------------------------------------------
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+# ---------------------------------------------------------------------------
+# W4: Employee -- the appointment record that closes the Workforce loop
+# (see docs/workforce/Workforce_W4_Employee_Spec_V1.md)
+#
+# APPEND-ONLY section: nothing below modifies a W1/W2/W3-A/B/C/D definition.
+# The service layer lives in ``workforce_employee.py``; the only edit W4 makes
+# to the frozen ``workforce.py`` is adding the two CandidateLifecycle edges
+# (TRIALING -> EMPLOYED | POOLED, EMPLOYED -> {}).
+# ---------------------------------------------------------------------------
+
+
+class Employee(SQLModel, table=True):
+    """An appointed employee: the terminal record of the Workforce loop (W4).
+
+    Created ONLY by ``promote_to_employee``, and ONLY from a COMPLETED Trial
+    (INV-E1) -- completing a trial never creates an Employee implicitly. That
+    two-step decoupling *is* the human gate (D-6): ``complete_trial`` records a
+    verdict, ``promote_to_employee`` records the owner's hiring decision.
+
+    Identity (Q1) is anchored on ``(candidate_id, trial_id)``, NOT on
+    ``agent_id`` alone:
+
+    * ``candidate_id`` is the *source* of the hire (who was trialled);
+    * ``trial_id`` is the *basis* of the hire (what justifies it) and, being
+      UNIQUE, is also the idempotency anchor (Q8 / F-E21) -- one trial can
+      never mint two employees.
+
+    ``agent_id`` / ``job_id`` / ``job_version_id`` are **snapshots copied from
+    the Candidate at promotion time** (F-E19), never re-resolved: re-reading the
+    registry or the Job head at promote time would make the record depend on
+    state that can move between the trial and the decision (TOCTOU).
+
+    FK policy (Q6): every FK is RESTRICT except ``agent_id``:
+
+    * ``candidate_id`` / ``trial_id`` / ``job_id`` / ``job_version_id`` are
+      RESTRICT (DR-1 lineage). An Employee is live hiring evidence; deleting an
+      upstream row must FAIL EXPLICITLY rather than silently cascade the
+      company's headcount away. W4 ships no unlock path (D-4) -- delete
+      semantics are a W5 obligation.
+    * ``agent_id`` is ``NO ACTION`` (same as ``Candidate.agent_id``): it is a
+      soft reference to the Alpha-1 Agent Registry, deliberately *not* a
+      hard-owned relation.
+
+    V1 does NOT write ``JobStatus.FILLED`` (D-3): the enum member exists but no
+    code sets it, and W4 adds no writer for it.
+    """
+
+    __tablename__ = "employee"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "trial_id",
+            name="uq_employee_trial",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("emp"), primary_key=True)
+    candidate_id: str = Field(foreign_key="candidate.id", ondelete="RESTRICT")
+    trial_id: str = Field(foreign_key="trial.id", ondelete="RESTRICT")
+    # Soft registry reference -- copied from the Candidate (never re-resolved).
+    agent_id: str = Field(foreign_key="agent.id", ondelete="NO ACTION")
+    job_id: str = Field(foreign_key="job.id", ondelete="RESTRICT")
+    job_version_id: str = Field(
+        foreign_key="job_version.id", ondelete="RESTRICT"
+    )
+    status: EmployeeStatus = Field(default=EmployeeStatus.ACTIVE)
+    hired_at: datetime = Field(default_factory=now_utc)
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)

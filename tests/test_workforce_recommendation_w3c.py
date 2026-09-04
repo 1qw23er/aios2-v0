@@ -550,19 +550,23 @@ def test_recommendation_never_writes_evaluation_context(tmp_path: Path) -> None:
 
 
 def test_no_deferred_tables_were_created(tmp_path: Path) -> None:
-    """T-REC-BOUNDARY-26 (residual): Employee / training / performance /
-    candidate_evaluation stay deferred.
+    """T-REC-BOUNDARY-26 (residual): training / performance /
+    candidate_evaluation stay deferred; W4 has now implemented ``employee`` and
+    ``trial`` (the latter under W3-D), so neither is deferred anymore.
 
     NOTE: ``trial`` was deferred under W3-C's T-REC-BOUNDARY-26, but W3-D
     implemented it (see ``workforce_trial.py`` + migration
-    ``20260903_0001_workforce_trial``), so it is intentionally no longer in
-    this list. The genuinely-still-deferred W4+ tables are asserted below.
+    ``20260903_0001_workforce_trial``), and ``employee`` was implemented by W4
+    (see ``workforce_employee.py`` + migration
+    ``20260903_0002_workforce_employee``). Both are intentionally no longer in
+    the deferred list. The genuinely-still-deferred W5+ tables are asserted
+    below.
     """
     url = f"sqlite:///{(tmp_path / 'bound26.db').as_posix()}"
     with _db(url) as _session:
         tables = set(inspect(get_engine(url)).get_table_names())
+        # W5+ obligations: still deferred.
         for deferred in (
-            "employee",
             "training",
             "performance",
             "candidate_evaluation",
@@ -570,8 +574,10 @@ def test_no_deferred_tables_were_created(tmp_path: Path) -> None:
             assert deferred not in tables, f"{deferred} must not exist yet"
         # W3-C's own table exists (C3①: it is no longer deferred) ...
         assert "recommendation" in tables
-        # ... and W3-D's ``trial`` table now exists too.
+        # ... W3-D's ``trial`` table now exists ...
         assert "trial" in tables
+        # ... and W4's ``employee`` table now exists too.
+        assert "employee" in tables
 
 
 def test_recommend_calls_no_w3a_w3b_budget_or_execution(
@@ -1639,7 +1645,7 @@ def test_w3c_migration_is_single_head_and_reversible(tmp_path: Path) -> None:
     cfg = Config(ROOT / "alembic.ini")
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     assert ScriptDirectory.from_config(cfg).get_heads() == [
-        "20260903_0001_workforce_trial"
+        "20260903_0002_workforce_employee"
     ]
 
     db_path = tmp_path / "mig_w3c.db"
@@ -1666,7 +1672,7 @@ def test_w3c_migration_is_single_head_and_reversible(tmp_path: Path) -> None:
     version = conn.execute(
         "SELECT version_num FROM alembic_version"
     ).fetchone()[0]
-    assert version == "20260903_0001_workforce_trial"
+    assert version == "20260903_0002_workforce_employee"
     conn.close()
 
     # 30: reversible -- downgrade removes the W3-C table + indexes, nothing else.

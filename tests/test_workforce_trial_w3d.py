@@ -374,13 +374,24 @@ def test_evaluated_to_trialing_illegal(tmp_path: Path) -> None:
 
 
 def test_trialing_has_no_outbound_edge(tmp_path: Path) -> None:
-    """T-TRIAL-STATE-11: TRIALING -> * is 409 (V1 outbound edge set is empty)."""
-    assert CandidateLifecycle.ALLOWED[CandidateStatus.TRIALING] == set()
-    with pytest.raises(ServiceError) as exc:
-        CandidateLifecycle.require_transition(
-            CandidateStatus.TRIALING, CandidateStatus.EVALUATED
-        )
-    assert exc.value.status_code == 409
+    """T-TRIAL-STATE-11 (W4-superseded): TRIALING keeps only its two W4 edges.
+
+    W3-D froze TRIALING with an empty outbound set; W4 (R7 D-2/D-3) opened
+    exactly TRIALING -> EMPLOYED (promote_to_employee) and TRIALING -> POOLED
+    (release_candidate). Every other target remains closed (409).
+    """
+    assert CandidateLifecycle.ALLOWED[CandidateStatus.TRIALING] == {
+        CandidateStatus.EMPLOYED,
+        CandidateStatus.POOLED,
+    }
+    for closed in (
+        CandidateStatus.EVALUATED,
+        CandidateStatus.REJECTED,
+        CandidateStatus.RECOMMENDED,
+    ):
+        with pytest.raises(ServiceError) as exc:
+            CandidateLifecycle.require_transition(CandidateStatus.TRIALING, closed)
+        assert exc.value.status_code == 409
 
 
 # ---------------------------------------------------------------------------
@@ -607,9 +618,16 @@ def test_replay_produces_no_second_audit(tmp_path: Path) -> None:
 
 
 def test_no_employee_table_or_column() -> None:
-    """T-TRIAL-BOUNDARY-22: W3-D introduces no Employee entity."""
-    src = (ROOT / "src" / "aios" / "models.py").read_text()
-    assert "class Employee" not in src
+    """T-TRIAL-BOUNDARY-22 (W4-superseded): Employee exists but W3-D owns none.
+
+    W3-D introduced no Employee entity; W4 (R7 D-3) added it and owns the only
+    creator. The W3-D boundary that survives: ``workforce_trial.py`` must not
+    reference or create an Employee.
+    """
+    assert "class Employee" in (ROOT / "src" / "aios" / "models.py").read_text()
+    trial_src = (ROOT / "src" / "aios" / "workforce_trial.py").read_text()
+    assert "Employee(" not in trial_src
+    assert "workforce_employee" not in trial_src
 
 
 def test_no_budget_scheduler_execution_calls() -> None:
@@ -635,13 +653,22 @@ def test_recommendation_module_definitions_unchanged() -> None:
 
 
 def test_lifecycle_edges_added_and_trialing_member() -> None:
-    """T-TRIAL-BOUNDARY-25: only the ALLOWED edges changed in workforce.py."""
+    """T-TRIAL-BOUNDARY-25 (W4-superseded): ALLOWED edges after the W4 handover.
+
+    W3-D added the TRIALING member with an empty edge set; W4 (R7 D-2/D-3)
+    opened exactly two outbound edges. RECOMMENDED and EVALUATING edges are
+    unchanged from W3-A/C.
+    """
     assert CandidateStatus.TRIALING in CandidateLifecycle.ALLOWED
     assert CandidateLifecycle.ALLOWED[CandidateStatus.RECOMMENDED] == {
         CandidateStatus.EVALUATED,
         CandidateStatus.TRIALING,
     }
-    assert CandidateLifecycle.ALLOWED[CandidateStatus.TRIALING] == set()
+    assert CandidateLifecycle.ALLOWED[CandidateStatus.TRIALING] == {
+        CandidateStatus.EMPLOYED,
+        CandidateStatus.POOLED,
+    }
+    assert CandidateLifecycle.ALLOWED[CandidateStatus.EMPLOYED] == set()
 
 
 def test_no_trial_deletion_path() -> None:
@@ -661,7 +688,7 @@ def test_single_alembic_head() -> None:
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20260903_0001_workforce_trial"]
+    assert script.get_heads() == ["20260903_0002_workforce_employee"]
 
 
 def test_trial_table_shape_and_zero_explicit_indexes(tmp_path: Path) -> None:
