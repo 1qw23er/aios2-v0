@@ -671,11 +671,12 @@ def test_w3b_does_not_mutate_candidate_state_or_context(tmp_path: Path) -> None:
 def test_w3b_migration_is_single_head_additive_reversible(
     tmp_path: Path, real_run_migrations
 ) -> None:
-    # Single (linear) head; now the W3-D Trial leaf. W3-B tables remain additive
+    # Single (linear) head; advanced past the W3-D Trial leaf by W5 Cost
+    # Evidence. W3-B tables remain additive
     cfg = Config(ROOT / "alembic.ini")
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_heads() == ["20260903_0002_workforce_employee"]
+    assert script.get_heads() == ["20260904_0001_workforce_cost_evidence"]
 
     db_path = tmp_path / "mig.db"
     url = f"sqlite:///{db_path.as_posix()}"
@@ -696,7 +697,7 @@ def test_w3b_migration_is_single_head_additive_reversible(
     jv_cols = [r[1] for r in conn.execute("PRAGMA table_info(job_version)")]
     assert "benchmark_version_id" in jv_cols
     version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-    assert version == "20260903_0002_workforce_employee"
+    assert version == "20260904_0001_workforce_cost_evidence"
     conn.close()
 
     # Reversible: downgrade to the prior W3-A head removes the 4 tables + column.

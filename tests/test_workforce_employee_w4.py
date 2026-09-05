@@ -782,8 +782,8 @@ def test_employee_table_and_trial_columns_exist_after_migration(
 
 
 def test_alembic_single_head_is_w4_employee() -> None:
-    """Single head advanced exactly to the W4 Employee migration."""
+    """Single head advanced past the W4 Employee migration (now W5 Cost Evidence)."""
     cfg = Config(ROOT / "alembic.ini")
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
-    assert heads == ["20260903_0002_workforce_employee"]
+    assert heads == ["20260904_0001_workforce_cost_evidence"]

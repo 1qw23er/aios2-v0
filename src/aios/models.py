@@ -2138,3 +2138,67 @@ class Employee(SQLModel, table=True):
     hired_at: datetime = Field(default_factory=now_utc)
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
+
+
+class CostEvidence(SQLModel, table=True):
+    """One measured cost fact bound to a REAL source event (W5).
+
+    Companion to ``docs/workforce/Workforce_W5_Design_V1.md``. W5 V1 is
+    bookkeeping-only (G2 / D-1.2): recording a fact, never enforcing a budget.
+    This model is a PURE ADDITION -- the 11 frozen W1--W4 Workforce tables are
+    untouched and no ``Project`` FK is introduced.
+
+    Honesty constraint (D-1.4 / I4): a row exists IFF a real, repo-defined cost
+    source event occurs that is attributable to a ``JobVersion`` (pre-hire) or,
+    after promotion, to an ``Employee``. The repo today has NO Workforce-native
+    cost source event (``DelegatedRun.cost`` belongs to the delegation domain,
+    bound ``Task -> Project``), so in V1 the table is schema-only with a
+    defined writer contract (``workforce_cost_evidence.record_cost_evidence``)
+    but NO caller, and is expected to hold 0 rows. ``delegated_run.id`` must
+    never be reused as if it were Workforce-attributable.
+
+    FK policy (I3): both FKs are RESTRICT (DR-1 lineage, fail-closed). Deleting
+    a parent with evidence rows fails explicitly -- no silent cascade.
+
+    Amount / currency (I6, G3 / D-1.3): ``amount`` is a nullable float, mirroring
+    every existing cost column in the repo (all float). A row is written only
+    when a real measured cost exists -- "no cost yet" is "no row", never
+    ``amount = 0``. There is NO ``currency`` column in V1 (the repo has no
+    currency fact to be compatible with; single-currency is a recorded open
+    assumption, not a repo fact).
+
+    Idempotency (I5): ``idempotency_key = f"{source_event_type}:"
+    f"{source_event_id}"`` -- derived deterministically from the real source
+    event's natural key, so a replay recomputes the same key and the UNIQUE
+    index rejects the duplicate (at-most-once). Mirrors
+    ``AuditLog.idempotency_key`` (unique + indexed).
+
+    ``cost_evidence`` sits OUTSIDE both lifecycle state machines (I9): it is an
+    external, append-only fact, not a state transition, and it never gates
+    ``Candidate`` / ``Trial`` / ``Employee`` transitions.
+    """
+
+    __tablename__ = "cost_evidence"
+
+    id: str = Field(default_factory=lambda: new_id("ce"), primary_key=True)
+    # Aggregation anchor (G1 / D-1.1): the JobVersion the cost is attributed to.
+    job_version_id: str = Field(
+        foreign_key="job_version.id", ondelete="RESTRICT", index=True
+    )
+    # Post-hire attribution only; nullable until an Employee bears the cost.
+    employee_id: str | None = Field(
+        default=None,
+        foreign_key="employee.id",
+        ondelete="RESTRICT",
+        index=True,
+    )
+    # Nullable: only real measured costs are recorded (I6).
+    amount: float | None = Field(default=None)
+    # Provenance of the REAL origin event (I4) -- no default, never fabricated.
+    source_event_type: str
+    source_event_id: str
+    # Replay-safe at-most-once anchor (I5), same pattern as AuditLog.
+    idempotency_key: str = Field(unique=True, index=True)
+    recorded_at: datetime = Field(default_factory=now_utc)
+    # Advisory free text only -- no structured currency/meta column in V1 (G3).
+    note: str | None = Field(default=None)
