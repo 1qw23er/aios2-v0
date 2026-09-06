@@ -27,6 +27,7 @@ from aios.actor import ActorContext, _assert_owner_actor
 from aios.audit import append_audit
 from aios.models import (
     Agent,
+    AgentTrustLevel,
     ApprovalStatus,
     Candidate,
     CandidateStatus,
@@ -137,6 +138,37 @@ def _build_cost_advisory(session: Session, cand: Candidate) -> str | None:
         return None
     keys = ", ".join(sorted(str(key) for key in policy))
     return f"cost policy present (advisory only; never scored): {keys}"
+
+
+# G-E hygiene slice: trust levels that clear the delegation boundary.
+# Deliberately RE-DECLARED here (not imported from ``aios.delegation``) so the
+# Workforce -> Delegation import boundary stays frozen (W7-I1). Drift between
+# this set and delegation's ``_TRUST_DELEGABLE`` is pinned by a test that
+# compares the two from the test side, where importing delegation is allowed.
+_DELEGATION_CLEARING: frozenset[AgentTrustLevel] = frozenset(
+    {AgentTrustLevel.INTERNAL, AgentTrustLevel.VERIFIED_EXTERNAL}
+)
+
+
+def _build_trust_advisory(session: Session, cand: Candidate) -> str | None:
+    """G-E hygiene slice: trust is advisory *text* only -- never a score or gate.
+
+    Reads the Agent registry LIVE (SSoT: no trust data is ever snapshotted onto
+    Candidate). Returns ``None`` when the agent's trust level clears the
+    delegation boundary (nothing to advise); otherwise names the level so a
+    human approver sees, before deciding, that this candidate is blocked at the
+    delegation boundary today. Mirrors ``_build_cost_advisory``: text only, no
+    numbers, no effect on status / score / ranking.
+    """
+    agent = session.get(Agent, cand.agent_id)
+    if agent is None:
+        return None  # no fabrication: a missing agent is not an advisory
+    if agent.trust_level in _DELEGATION_CLEARING:
+        return None
+    return (
+        f"agent trust_level={agent.trust_level.value} is not cleared for "
+        "external execution today (advisory only; never scored)"
+    )
 
 
 def _build_rationale(
@@ -282,6 +314,7 @@ def recommend_candidate(
         cand.evaluation_context or {}
     )  # F-R4
     cost_advisory = _build_cost_advisory(session, cand)  # F-R5
+    trust_advisory = _build_trust_advisory(session, cand)  # G-E hygiene
 
     rec = Recommendation(
         candidate_id=cand.id,
@@ -300,6 +333,7 @@ def recommend_candidate(
         excluded_fields=_excluded_fields(match),
         unknown_dimensions=unknown_dimensions,
         cost_advisory=cost_advisory,
+        trust_advisory=trust_advisory,
         recommender=recommender,
     )
     rec.rationale = _build_rationale(rec, match)
@@ -374,6 +408,7 @@ def _rebuild_recommendation(
         cand.evaluation_context or {}
     )  # F-R4
     cost_advisory = _build_cost_advisory(session, cand)  # F-R5
+    trust_advisory = _build_trust_advisory(session, cand)  # G-E hygiene
 
     _transition_status(rec, RecommendationStatus.PROPOSED)  # INV-4
     rec.proposed_action = "hire"
@@ -387,6 +422,7 @@ def _rebuild_recommendation(
     rec.excluded_fields = _excluded_fields(match)
     rec.unknown_dimensions = unknown_dimensions
     rec.cost_advisory = cost_advisory
+    rec.trust_advisory = trust_advisory
     rec.rationale = _build_rationale(rec, match)
     # INV-3: a rebuild wipes the prior human decision.
     rec.decided_by = None

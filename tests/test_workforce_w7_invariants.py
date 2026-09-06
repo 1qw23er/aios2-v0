@@ -415,24 +415,37 @@ def test_w7_i12_no_terminated_employee_status_introduced() -> None:
 
 
 # ---------------------------------------------------------------------------
-# W7-I13: no Workforce route, no @app.delete, no global IntegrityError->409
+# W7-I13 (amended by the debt & hygiene slice, DR-W7-6): no Workforce route,
+# no @app.delete, IntegrityError->409 handler REQUIRED
 # ---------------------------------------------------------------------------
 
 
-def test_w7_i13_no_workforce_route_no_global_integrity_handler() -> None:
-    """W7-I13: no Workforce HTTP route, no ``@app.delete``, and no global
-    IntegrityError -> 409 handler.
+def test_w7_i13_no_workforce_route_no_delete_integrity_handler_is_409() -> None:
+    """W7-I13, as amended by the debt & hygiene slice (DR-W7-6 resolution).
 
-    W6 asserted no Workforce *route prefix* is registered. W7 adds: the API layer
-    (``aios/api/app.py``) defines no global exception handler that would translate
-    an ``IntegrityError`` into a 409 -- so an uncaught FK/UNIQUE violation today
-    is a 500, not a 409. That fact is part of the frozen contract; if someone
-    adds such a handler, the W5/W6 "RESTRICT -> 500" reasoning changes and this
-    test must fail on purpose.
+    History: W7 froze "no global IntegrityError->409 handler" -- an uncaught
+    FK/UNIQUE violation was a 500, and that was the frozen fact. The W1-W7
+    architecture checkpoint (``docs/workforce/
+    Workforce_Architecture_Checkpoint_W1-W7.md``, merged as PR#17)
+    reclassified DR-W7-6 (global IntegrityError->409 translator) as an open
+    ARCHITECTURE decision, and the debt & hygiene slice implemented it. This
+    test now pins the NEW contract:
+
+    * the DR-W7-6 handler MUST be registered (a silent regression back to a
+      bare 500 fails here; behavior is pinned in
+      ``tests/test_debt_hygiene_slice.py``);
+    * the API still defines no DELETE route (unchanged from W7).
+
+    The unchanged part of the original invariant -- no Workforce HTTP route --
+    remains pinned by the W6 route-prefix check.
     """
     app_src = (SRC / "api" / "app.py").read_text(encoding="utf-8")
-    assert "exception_handler" not in app_src, "api defines an exception handler"
-    assert "add_exception_handler" not in app_src, "api adds an exception handler"
+    assert "add_exception_handler" in app_src, (
+        "DR-W7-6 IntegrityError handler was removed (regression to bare 500)"
+    )
+    assert "IntegrityError" in app_src, (
+        "DR-W7-6 IntegrityError handler was removed (regression to bare 500)"
+    )
     assert "@app.delete" not in app_src and "app.delete" not in app_src, (
         "api defines a DELETE route"
     )

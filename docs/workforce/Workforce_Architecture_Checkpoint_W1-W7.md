@@ -221,3 +221,18 @@ This checkpoint does **not** authorize: any bridge implementation; any migration
 | 14 boundary invariants | `tests/test_workforce_w7_invariants.py:137-446` (I1–I14) |
 | Alembic single head | `alembic/versions/20260904_0001_workforce_cost_evidence.py` (revision/down_revision) |
 | Baseline commit/tree | `git cat-file`/`rev-parse` at `94df645` / `aa7f042` |
+
+---
+
+## Appendix A — Debt & Hygiene Slice resolution notes (2026-09-06)
+
+Recorded post-merge; the analysis above is unchanged. Status of the register items this slice (candidate direction 1) addressed:
+
+| Item | Resolution |
+|---|---|
+| DR-W7-6 (IntegrityError→409, ARCH) | **Implemented** in `api/app.py` (`integrity_error_handler`, registered in `create_app`). W7-I13 amended deliberately: handler is now REQUIRED (was frozen-absent); no-DELETE-route part unchanged. |
+| G-E (trust_level not consulted, P2) | **Advisory capture**: `Recommendation.trust_advisory` (additive migration `20260906_0001`) populated live from the Agent SSoT only when the trust level does not clear the delegation boundary. Never a gate, never scored (mirrors F-R5). Workforce→Delegation import boundary untouched: the clearing set is re-declared locally (W7-I1) and pinned to `delegation._TRUST_DELEGABLE` from the test side. |
+| FILLED orphan enum (P3) | **Clarified, not changed**: already the W4 D-3 decision with a lock test; the misleading member comment in `models.py` was corrected to point at D-3. No writer introduced. |
+| `Task.actual_cost` dead column (P3) | **Documented** in the `Task` docstring: no writer; cost truth lives in `DelegatedRun.cost` / `Project.budget_used`. |
+| Alembic head | Advanced `20260904_0001_workforce_cost_evidence` → `20260906_0001_recommendation_trust_advisory` (single head preserved). |
+| Not addressed here | P1 items (attribution carrier, failed-run cost) remain blocked on DR-W7-5; origin/HEAD default-branch pollution remains an admin-UI task. |
