@@ -367,8 +367,8 @@ def test_alembic_single_head_is_capreq_hardening() -> None:
     # Single linear head; W3-D Trial advanced it past W3-C Recommendation
     # (20260902_0001_workforce_recommendation) to the W4 Employee migration
     # (20260903_0002_workforce_employee), and W5 Cost Evidence advances it to
-    # 20260904_0001_workforce_cost_evidence.
-    assert heads == ["20260904_0001_workforce_cost_evidence"]
+    # 20260906_0001_recommendation_trust_advisory.
+    assert heads == ["20260906_0001_recommendation_trust_advisory"]
 
 
 def test_migration_creates_workforce_tables_additively(tmp_path: Path) -> None:

@@ -48,7 +48,7 @@ from aios.models import (
 )
 from aios.services import ServiceError
 
-HEAD = "20260904_0001_workforce_cost_evidence"
+HEAD = "20260906_0001_recommendation_trust_advisory"
 
 OWNER = ActorContext(kind="owner", owner_id="owner")
 AGENT_PRODUCER = ActorContext(kind="agent", agent_id="producer-1")

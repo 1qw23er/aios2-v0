@@ -359,6 +359,16 @@ class AgentCapability(SQLModel, table=True):
 
 
 class Task(SQLModel, table=True):
+    """A unit of execution work in the Project domain.
+
+    Cost-field semantics (W1--W7 checkpoint debt register): ``estimated_cost``
+    feeds delegation's ``check_budget`` projection. ``actual_cost`` is a DEAD
+    COLUMN in V1 -- it has NO writer anywhere in the repo; measured cost truth
+    lives in ``DelegatedRun.cost`` and the sole ``Project.budget_used`` accrual
+    (``delegation._accrue_budget``). Do not start writing it without a decision:
+    a second cost writer would break the single-budget-authority boundary.
+    """
+
     __tablename__ = "task"
 
     id: str = Field(default_factory=lambda: new_id("tsk"), primary_key=True)
@@ -1388,7 +1398,10 @@ class RequiredWorkStatus(StrEnum):
 
 class JobStatus(StrEnum):
     OPEN = "open"
-    FILLED = "filled"  # a candidate has been appointed to this job (W2+)
+    # D-3: reserved member, NEVER written in V1. W4 decision --
+    # promote_to_employee does not flip Job.status; see workforce_employee.py
+    # D-3 and its lock test.
+    FILLED = "filled"
     CLOSED = "closed"
     ON_HOLD = "on_hold"
 
@@ -1924,6 +1937,11 @@ class Recommendation(SQLModel, table=True):
     )
     # Advisory ONLY: free text, never a numeric cost component (F-R5).
     cost_advisory: str | None = None
+    # Advisory ONLY (G-E hygiene slice): free text, never a score component.
+    # Populated live from the Agent registry (SSoT -- never snapshotted onto
+    # Candidate) ONLY when the agent's trust level does not clear the delegation
+    # boundary; None means "nothing to advise". See workforce_recommendation.
+    trust_advisory: str | None = None
     # Deterministically templated, not free-form LLM prose.
     rationale: str = ""
     risk_level: RiskLevel = Field(default=RiskLevel.L4)

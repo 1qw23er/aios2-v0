@@ -16,9 +16,10 @@ from fastapi import (
     Response,
     status,
 )
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from aios.actor import ActorContext
@@ -302,6 +303,20 @@ def _translate(error: ServiceError) -> HTTPException:
     return HTTPException(status_code=error.status_code, detail=error.detail)
 
 
+def integrity_error_handler(request: Request, exc: IntegrityError) -> JSONResponse:
+    """DR-W7-6 (W1-W7 checkpoint debt & hygiene slice): translate an uncaught
+    SQLAlchemy ``IntegrityError`` into **409 Conflict** instead of a 500.
+
+    RESTRICT / UNIQUE violations are conflicts with current resource state, not
+    server faults. The response deliberately carries a generic detail: DB
+    internals (constraint names, SQL) are never leaked to the client.
+    """
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "resource conflict: integrity constraint violated"},
+    )
+
+
 def _secret_unavailable() -> HTTPException:
     """Map a secret-store outage to HTTP 503 (issue #103 §6)."""
     return HTTPException(
@@ -571,6 +586,9 @@ def _to_feedback_detail(fb: Artifact) -> FeedbackDetail:
 
 def create_app() -> FastAPI:
     application = FastAPI(title="AIOS V0", version="0.1.0", lifespan=lifespan)
+
+    # DR-W7-6: uncaught DB integrity violations become 409, not 500.
+    application.add_exception_handler(IntegrityError, integrity_error_handler)
 
     @application.get("/health")
     def health() -> dict[str, str]:
