@@ -2934,6 +2934,15 @@ def create_app() -> FastAPI:
 
     register_employee_bridge_routes(application)
 
+    # W8-P1 (#112 follow-up): the Employee cost closure -- W8 attribution x W5
+    # evidence ledger. A composition surface (owner-facing), NOT a bridge seam
+    # module; route paths deliberately avoid the WORKFORCE_PREFIXES namespace
+    # (the W6 route guard's bridge-only set stays untouched). See
+    # src/aios/employee_cost.py and docs/workforce/Workforce_W8P1_Cost_Closure_V1.md.
+    from aios.api.employee_cost import register_employee_cost_routes
+
+    register_employee_cost_routes(application)
+
     return application
 
 

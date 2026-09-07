@@ -11,7 +11,8 @@ Scope (see ``docs/workforce/Workforce_W5_Design_V1.md`` §15, F-W5-*):
   the same source event is rejected by the UNIQUE index (at-most-once), while
   distinct real events each produce their own row (I1/I2);
 * the writer requires a REAL source event identity (P1) and structurally
-  cannot touch Budget machinery or have a caller in V1 (P2 / B1);
+  cannot touch Budget machinery (P2); the V1 "no caller" freeze (B1) was
+  revised by W8-P1 into a closed caller whitelist (``aios.employee_cost``);
 * every row is trailed by ``append_audit`` in the SAME savepoint, with
   ``project_id=None`` / ``task_id=None`` (A1);
 * the writer is owner-only, keyword-only, with no default actor (W4 Q7
@@ -429,26 +430,44 @@ def test_writer_structurally_excluded_from_budget_machinery() -> None:
 
 
 def test_writer_has_no_caller_in_v1() -> None:
-    """F-W5-B1 (structural half): no src module imports the W5 writer.
+    """F-W5-B1 (structural half), as revised by W8-P1: exactly ONE caller.
 
-    D-1.4: the repo has no Workforce-native cost source event, so the writer
-    must be a dormant contract. Any import from ``src/`` would be a fabricated
-    caller.
+    D-1.4: the repo had no Workforce-native cost source event, so the writer
+    was a dormant contract and ANY src import would have been a fabricated
+    caller. W8-P1 closes checkpoint gap G-5: a bridge Task's measured
+    execution cost IS a Workforce-native source event, and
+    ``aios.employee_cost`` is its sanctioned composition layer (W8 attribution
+    x W5 evidence). The guard therefore narrows from "no caller anywhere" to
+    a CLOSED CALLER WHITELIST: only ``employee_cost.py`` may import the
+    writer; every other src module remains banned -- no fabricated callers,
+    no delegation-domain reach-ins.
     """
+    sanctioned = {"employee_cost.py"}
     for path in SRC.rglob("*.py"):
         if path.name == "workforce_cost_evidence.py":
+            continue
+        if path.name in sanctioned:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 assert node.module != "aios.workforce_cost_evidence", (
-                    f"fabricated caller in V1: {path}"
+                    f"unsanctioned caller: {path}"
                 )
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     assert alias.name != "aios.workforce_cost_evidence", (
-                        f"fabricated caller in V1: {path}"
+                        f"unsanctioned caller: {path}"
                     )
+    # And the whitelist is not vacuous: the sanctioned caller really imports
+    # the writer (otherwise this guard would silently allow dormancy to break
+    # without anyone noticing).
+    caller = SRC / "employee_cost.py"
+    tree = ast.parse(caller.read_text(encoding="utf-8"))
+    assert any(
+        isinstance(node, ast.ImportFrom) and node.module == "aios.workforce_cost_evidence"
+        for node in ast.walk(tree)
+    ), "sanctioned caller employee_cost.py no longer imports the writer"
 
 
 # ---------------------------------------------------------------------------
