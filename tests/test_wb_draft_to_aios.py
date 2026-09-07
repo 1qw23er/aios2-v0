@@ -27,6 +27,7 @@ wb_draft_to_aios = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wb_draft_to_aios)
 
 from aios.db import get_engine  # noqa: E402
+from aios.known_agents import seed_known_agents  # noqa: E402
 from aios.models import (  # noqa: E402
     Artifact,
     ArtifactReviewStatus,
@@ -59,6 +60,9 @@ def db_url(tmp_path: Path, monkeypatch) -> str:
             )
         )
         s.commit()
+        # Gap #3: the adapter resolves a registry-backed identity, so the stable
+        # CLI agents must exist before create_draft (fail-closed: 404 if absent).
+        seed_known_agents(s)
     return url
 
 

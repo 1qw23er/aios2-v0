@@ -37,8 +37,11 @@ import sys
 from pathlib import Path
 
 from aios.actor import resolve_agent_actor
+from aios.agent_registry import get_agent
+from aios.attribution import build_aimi_signup_url
 from aios.content_draft import DEFAULT_SERIES_ID, ContentDraftService
 from aios.db import make_session
+from aios.known_agents import WORKBUDDY_AGENT_ID
 
 
 def _parse_ae_sections(text: str) -> dict[str, str]:
@@ -99,8 +102,15 @@ def create_draft(
     phase: str = "idea",
     task_id: str | None = None,
     idempotency_key: str | None = None,
+    attribution_key: str | None = None,
 ) -> dict[str, str]:
-    """Create a CONTENT_DRAFT artifact as the WorkBuddy agent. Returns a summary."""
+    """Create a CONTENT_DRAFT artifact as the WorkBuddy agent. Returns a summary.
+
+    The returned dict also includes the per-article ``attribution_key`` (minted at
+    draft creation when not supplied) and the trackable ``aimi_signup_url`` CTA
+    payload -- the single piece of data the published article must carry so the
+    "publish -> signup" loop (gap #2) becomes measurable.
+    """
     sections = _parse_ae_sections(body)
     outline = _build_outline(sections)
     anchors = _build_conversion_anchors(sections)
@@ -108,14 +118,15 @@ def create_draft(
     session = make_session()
     try:
         svc = ContentDraftService(session)
-        # Trust boundary (LOCAL CLI ONLY): we hardcode the agent identity here and
-        # do NOT route through the Agent Interop Gateway, so no registry
-        # re-validation of "workbuddy" occurs. This is acceptable ONLY because the
-        # trusted party is the operator running this script, never an external /
-        # gateway request. Do not reuse this path from any untrusted context --
-        # the gateway's resolve_agent_actor already guarantees a registry-validated
-        # agent_id.
-        actor = resolve_agent_actor("workbuddy", project_id)
+        # Registry-validated identity (fail-closed): confirm WORKBUDDY_AGENT_ID
+        # ("workbuddy") exists in the Agent registry before minting an agent
+        # actor. This upgrades the previously free-text identity into a
+        # registry-backed one; get_agent raises ServiceError(404) if the row is
+        # absent, so an unseeded or tampered registry refuses to produce a draft.
+        # The LOCAL CLI trust boundary still holds -- only the operator running
+        # this script reaches this path, never an external / gateway request.
+        get_agent(session, WORKBUDDY_AGENT_ID)
+        actor = resolve_agent_actor(WORKBUDDY_AGENT_ID, project_id)
         artifact = svc.create_content_draft(
             project_id=project_id,
             actor=actor,
@@ -127,7 +138,9 @@ def create_draft(
             series_id=series_id,
             task_id=task_id,
             idempotency_key=idempotency_key,
+            attribution_key=attribution_key,
         )
+        key = (artifact.metadata_json or {}).get("attribution_key", "")
         return {
             "artifact_id": artifact.id,
             "revision_count": str(artifact.revision_count),
@@ -135,6 +148,8 @@ def create_draft(
             "review_status": str(artifact.review_status),
             "type": str(artifact.type),
             "producer": (artifact.metadata_json or {}).get("producer", ""),
+            "attribution_key": key,
+            "aimi_signup_url": build_aimi_signup_url(key) if key else "",
         }
     finally:
         session.close()
@@ -162,6 +177,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Idempotency key; re-running with the same key is a safe no-op.",
     )
+    parser.add_argument(
+        "--attribution-key",
+        default=None,
+        help="Per-article attribution key for the Aimi lead-gen loop. Omit to "
+        "auto-mint one (recommended; the key is frozen into the draft metadata).",
+    )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     args = parser.parse_args(argv)
 
@@ -183,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         phase=args.phase,
         task_id=args.task_id,
         idempotency_key=args.idempotency_key,
+        attribution_key=args.attribution_key,
     )
 
     if args.json:
@@ -195,8 +217,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  review_status  = {result['review_status']}")
         print(f"  producer       = {result['producer']}")
         print(f"  type           = {result['type']}")
+        print(f"  attribution_key= {result['attribution_key']}")
+        print(f"  aimi_signup_url= {result['aimi_signup_url']}")
         print("\nNext: GPT editor calls update_content_draft (new revision)")
         print("       then submit_content_draft for independent review.")
+        print("Embed aimi_signup_url in the published article to close the loop.")
     return 0
 
 
