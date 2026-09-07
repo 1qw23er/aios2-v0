@@ -47,6 +47,7 @@ from aios.models import (
     Candidate,
     CandidateStatus,
     Employee,
+    EmployeeAgentBinding,
     EmployeeStatus,
     Trial,
     TrialOutcome,
@@ -338,10 +339,11 @@ def promote_to_employee(
     COMPLETED trial (INV-E1): an ACTIVE / FAILED / CANCELLED trial carries no
     mandate to hire.
 
-    The Employee + the ``TRIALING -> EMPLOYED`` candidate move are written in
-    ONE SAVEPOINT (INV-E6 / F-E18), so there is never an employed candidate
+    The Employee + the initial ``EmployeeAgentBinding`` + the
+    ``TRIALING -> EMPLOYED`` candidate move are written in ONE SAVEPOINT
+    (INV-E6 / F-E18 + W8-v2 INV-B1), so there is never an employed candidate
     without an employee row, nor an employee row whose candidate is still
-    trialling.
+    trialling, nor an Employee without exactly one current binding.
 
     Idempotent (F-E21 / Q8): a replay returns the existing row instead of
     writing a second one, and a concurrent first-promote is absorbed off the
@@ -396,6 +398,23 @@ def promote_to_employee(
         with session.begin_nested():  # INV-E6 / F-E18
             session.add(emp)
             session.flush()
+            # W8-v2 (INV-B1): the hire is born with its FIRST execution binding,
+            # inside the same savepoint -- there is never an Employee without
+            # exactly one current binding. ``agent_id`` is the SAME promote
+            # snapshot (F-E19), never re-resolved; ``effective_from`` is the
+            # promote transaction timestamp ``ts`` (identical to ``hired_at``),
+            # matching the migration backfill for pre-existing hires. This is a
+            # Workforce-domain table write: it introduces no cross-domain
+            # import (W7-I1/I2/I4/I5 untouched).
+            session.add(
+                EmployeeAgentBinding(
+                    employee_id=emp.id,
+                    agent_id=emp.agent_id,
+                    effective_from=ts,
+                    effective_to=None,
+                )
+            )
+            session.flush()
             CandidateLifecycle.require_transition(
                 cand.status, CandidateStatus.EMPLOYED
             )
@@ -418,14 +437,20 @@ def promote_to_employee(
             session.flush()
     except IntegrityError:
         # Concurrent first-promote: another writer won the UNIQUE slot. Absorb
-        # the race and return the authoritative row (mirrors W3-D §8).
+        # the race and return the authoritative row (mirrors W3-D §8). W8-v2
+        # (INV-B1) adds a second failure mode inside the same savepoint: the
+        # initial-binding insert can hit ``uq_eab_agent_current`` when the
+        # candidate's agent is CURRENTLY bound to another Employee. That is a
+        # real business conflict (one agent cannot serve two employees at
+        # once), not a race -- no winner exists for THIS trial, so it surfaces
+        # as an explicit 409 instead of a bare IntegrityError.
         session.expire_all()
         winner = session.exec(
             select(Employee).where(Employee.trial_id == trial_id)
         ).first()
         if winner is not None:
             return winner
-        raise
+        raise ServiceError(409, "agent_binding_conflict") from None
 
     return emp
 

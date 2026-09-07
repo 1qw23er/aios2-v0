@@ -786,4 +786,4 @@ def test_alembic_single_head_is_w4_employee() -> None:
     cfg = Config(ROOT / "alembic.ini")
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
-    assert heads == ["20260906_0001_recommendation_trust_advisory"]
+    assert heads == ["20260906_0002_workforce_agent_binding"]

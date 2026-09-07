@@ -46,7 +46,8 @@ SRC = ROOT / "src" / "aios"
 # The committed slice ``W7_SLICE_BASE..HEAD`` must be tests/-only (W7-I14).
 W7_SLICE_BASE = "bb6ec086afcef478f8c89da72b4489025a3d0f02"
 
-# The 14 Workforce tables as of W5/W6 (W1--W4 = 13 frozen + cost_evidence).
+# The 15 Workforce tables as of W8-v2 (W1--W4 = 13 frozen + cost_evidence
+# + employee_agent_binding, the W8-v2 execution-binding table).
 WORKFORCE_TABLES = {
     "benchmark",
     "benchmark_result",
@@ -56,6 +57,7 @@ WORKFORCE_TABLES = {
     "capability_requirement",
     "cost_evidence",
     "employee",
+    "employee_agent_binding",
     "job",
     "job_version",
     "match",
@@ -209,7 +211,8 @@ def test_w7_i4_no_workforce_delegation_bridge() -> None:
     """
     _, defs, ids = _workforce_facts()
     bridge_defs = [
-        n for n in defs
+        n
+        for n in defs
         if any(k in n.lower() for k in ("delegate", "via_delegation", "run_delegated"))
     ]
     assert not bridge_defs, f"Workforce defines a delegation bridge: {bridge_defs}"
@@ -366,9 +369,7 @@ def test_w7_i10_no_employee_soft_delete_infrastructure() -> None:
     """
     emp_cols = _cols("employee")
     banned = {"terminated_at", "purged_at", "deleted_at", "is_deleted", "purge_at"}
-    assert not (banned & emp_cols), (
-        f"employee has soft-delete columns: {sorted(banned & emp_cols)}"
-    )
+    assert not (banned & emp_cols), f"employee has soft-delete columns: {sorted(banned & emp_cols)}"
 
 
 # ---------------------------------------------------------------------------
@@ -467,10 +468,12 @@ def test_w7_i14_slice_touches_only_tests() -> None:
         be ``tests/``-only. The earlier W7 docs commits (Design V1, DR-W7-5
         Analysis) pre-date this slice and are intentionally excluded from base.
     """
+
     def git(*args: str) -> list[str]:
         return subprocess.run(
             ["git", "-C", str(ROOT), *args],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         ).stdout.splitlines()
 
     uncommitted = [line for line in git("diff", "--name-only", "HEAD") if line]
@@ -485,3 +488,85 @@ def test_w7_i14_slice_touches_only_tests() -> None:
             assert all(p.startswith("tests/") for p in slice_files), (
                 f"W7 slice touched non-test files: {slice_files}"
             )
+
+
+# ---------------------------------------------------------------------------
+# W8-v2 seam: the ONE sanctioned cross-domain edge (DR-W7-5 revision)
+# ---------------------------------------------------------------------------
+
+# The W8-v2 execution bridge modules: the only Workforce-side code allowed to
+# import the execution / scheduler domains (V1 §9). Paths relative to
+# ``src/aios`` -- the service module and the API module share a filename.
+BRIDGE_SEAM_MODULES = {"employee_bridge.py", "api/employee_bridge.py"}
+
+
+def _rel(p: Path) -> str:
+    return p.relative_to(SRC).as_posix()
+
+
+def test_w8_seam_only_bridge_reaches_execution() -> None:
+    """W8 seam (revises DR-W7-5 = (b) with the sanctioned bridge edge).
+
+    The recruitment domain (``workforce*.py``) still must NOT depend on the
+    execution / scheduler domains -- W7-I1/I4/I5 keep their original force on
+    the ``workforce*.py`` glob, which does not match the bridge modules. What
+    W8-v2 adds is the whitelist: across ALL Workforce-side modules (the
+    ``workforce*.py`` recruitment domain + the two bridge modules), ONLY
+    ``employee_bridge.py`` / ``api/employee_bridge.py`` may import
+    ``aios.execution`` / ``aios.scheduler``; and the recruitment domain must
+    not import the bridge either (the seam hangs OFF the domain, owner-facing,
+    never called from recruitment code).
+
+    The bridge modules themselves must NOT import any ``workforce*.py``
+    recruitment module -- the dependency direction is one-way:
+    bridge -> execution APIs, never bridge -> recruitment logic.
+    """
+    workforce_modules = [(_rel(p), p) for p in _workforce_modules()]
+    bridge_modules = [
+        (rel, SRC / rel) for rel in sorted(BRIDGE_SEAM_MODULES) if (SRC / rel).exists()
+    ]
+    assert set(BRIDGE_SEAM_MODULES) == {rel for rel, _ in bridge_modules}, (
+        f"bridge seam module missing on disk: {BRIDGE_SEAM_MODULES}"
+    )
+
+    for rel, path in workforce_modules + bridge_modules:
+        mods = _imported_modules(path)
+        is_bridge = rel in BRIDGE_SEAM_MODULES
+        violations: list[str] = []
+        for m in mods:
+            if is_bridge:
+                # Bridge -> execution/scheduler is the sanctioned edge; what is
+                # banned is reaching back into the recruitment domain (any
+                # aios.workforce* module) -- one-way dependency.
+                if m.startswith("aios.workforce"):
+                    violations.append(m)
+            else:
+                if m in ("aios.execution", "aios.scheduler", "aios.employee_bridge") or m.endswith(
+                    (".execution", ".scheduler", ".employee_bridge")
+                ):
+                    violations.append(m)
+        assert not violations, f"{rel} crosses the sanctioned seam boundary: {violations}"
+
+
+def test_w8_bridge_api_wires_the_409_mapping() -> None:
+    """W8 seam (§4.5 / DR-D4-2): the bridge API wires ServiceError -> 409.
+
+    The W6 forward-fail guard required the approved 409 mapping to ship in the
+    same change as the first Workforce route. This pins that fact permanently:
+    ``api/employee_bridge.py`` must (a) reference ``ServiceError`` and a
+    ``_translate`` helper, and (b) attach its routes through a
+    ``register_employee_bridge_routes`` function so ``create_app`` wires them
+    flat (never a nested ``include_router`` node that would hide the surface
+    from the owner-auth route inventory).
+    """
+    api_path = SRC / "api" / "employee_bridge.py"
+    ids, defs, _ = (
+        _code_identifiers(api_path),
+        _def_names(api_path),
+        _imported_modules(api_path),
+    )
+    assert "ServiceError" in ids, "bridge API must translate ServiceError"
+    assert "_translate" in ids, "bridge API must wire the approved 409 mapping"
+    assert "register_employee_bridge_routes" in defs, (
+        "bridge API must expose a flat registration entry point"
+    )

@@ -30,7 +30,7 @@ from aios.feedback import (
 )
 from aios.models import Artifact, ArtifactType, Event, Project, Task
 
-HEAD = "20260906_0001_recommendation_trust_advisory"
+HEAD = "20260906_0002_workforce_agent_binding"
 
 
 # Shared DB fixtures (mirror tests/test_feedback.py; pytest fixtures are

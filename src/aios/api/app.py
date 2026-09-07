@@ -2926,6 +2926,14 @@ def create_app() -> FastAPI:
     # legacy owner console (no project id in any URL, no mutable session).
     register_owner_inbox_routes(application)
 
+    # W8-v2 (#112): the Workforce execution bridge -- the ONE sanctioned
+    # cross-domain seam (recruitment domain -> execution APIs). Employee CRUD
+    # is deliberately absent; see src/aios/employee_bridge.py and the seam
+    # guards in tests/test_workforce_w6_invariants.py / w7_invariants.
+    from aios.api.employee_bridge import register_employee_bridge_routes
+
+    register_employee_bridge_routes(application)
+
     return application
 
 
