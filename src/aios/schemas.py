@@ -320,3 +320,32 @@ class ReviewPolicyCreate(BaseModel):
     enabled: bool = True
     project_id: str | None = None
 
+
+class AgentBindingCreate(BaseModel):
+    """Request body for binding / replacing an Employee's execution agent (W8-v2).
+
+    Deliberately minimal: the effective-dated timestamps are server-side by
+    contract (V1 §4.B) -- clients cannot pass ``effective_from`` or future-date
+    a binding, which is what keeps the ``[from, to)`` intervals gap-free.
+    """
+
+    agent_id: str = Field(min_length=1)
+
+
+class EmployeeWorkCreate(BaseModel):
+    """Work assignment for an Employee via the W8-v2 execution bridge.
+
+    Field-for-field the assignable subset of ``TaskCreate``: the bridge adds
+    ``assigned_agent_id`` (from the Employee's current binding) and
+    ``routing_mode=FIXED`` itself, so callers cannot override them -- the
+    Employee -> current Agent -> Task(FIXED) chain is not caller-configurable.
+    """
+
+    project_id: str
+    title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    required_capabilities: list[str] = Field(default_factory=list)
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    input_context_refs: list[str] = Field(default_factory=list)
+    estimated_cost: float = Field(default=0.0, ge=0)

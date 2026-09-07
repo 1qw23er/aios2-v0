@@ -2220,3 +2220,60 @@ class CostEvidence(SQLModel, table=True):
     recorded_at: datetime = Field(default_factory=now_utc)
     # Advisory free text only -- no structured currency/meta column in V1 (G3).
     note: str | None = Field(default=None)
+
+
+class EmployeeAgentBinding(SQLModel, table=True):
+    """Effective-dated Employee <-> Agent execution binding (W8-v2, #112).
+
+    Companion to the W8-v2 Implementation Design V1. This table carries the
+    *current execution agent* semantics for a Workforce Employee -- something
+    the frozen ``employee.agent_id`` snapshot deliberately does NOT provide
+    (F-E19: the snapshot is immutable hiring evidence, written once by
+    ``promote_to_employee`` and never re-resolved).
+
+    Semantics:
+
+    * **current binding** = the row with ``effective_to IS NULL``;
+    * **historical interval** = half-open ``[effective_from, effective_to)``;
+    * **current 1:1 both ways** is enforced by the DATABASE, not the service:
+      two partial unique indexes (``uq_eab_employee_current`` /
+      ``uq_eab_agent_current``) reject a second open row per employee and per
+      agent (see the migration);
+    * history is N:M: closed rows are never resurrected -- a rebind (agent
+      replacement, transfer, rehire) always opens a NEW row.
+
+    Attribution contract: historical Employee attribution is rebuilt from this
+    table anchored at ``Task.created_at`` -- never from ``employee.agent_id``.
+
+    FK policy mirrors ``Employee`` (Q6): ``employee_id`` is RESTRICT (DR-1
+    lineage -- an Employee is permanent, G4), ``agent_id`` is ``NO ACTION``
+    (soft Alpha-1 registry reference, same as ``Employee.agent_id``).
+
+    No ``created_by`` / ``reason`` / ``version`` columns: operator identity and
+    intent live in the existing audit SSoT (``append_audit``), and concurrency
+    authority is the partial unique indexes, not row versioning.
+    """
+
+    __tablename__ = "employee_agent_binding"
+
+    __table_args__ = (
+        # Interval validity: only non-open rows carry an end, and it must lie
+        # strictly after the start (half-open [from, to) can never be empty).
+        CheckConstraint(
+            "effective_to IS NULL OR effective_from < effective_to",
+            name="ck_eab_interval_valid",
+        ),
+        Index("ix_eab_employee_effective", "employee_id", "effective_from"),
+        Index("ix_eab_agent_effective", "agent_id", "effective_from"),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("eab"), primary_key=True)
+    employee_id: str = Field(
+        foreign_key="employee.id", ondelete="RESTRICT", index=True
+    )
+    # Soft registry reference -- same NO ACTION policy as Employee.agent_id.
+    agent_id: str = Field(foreign_key="agent.id", ondelete="NO ACTION", index=True)
+    effective_from: datetime = Field(default_factory=now_utc)
+    # NULL = the current binding.
+    effective_to: datetime | None = Field(default=None)
+    created_at: datetime = Field(default_factory=now_utc)

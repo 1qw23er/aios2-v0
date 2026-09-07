@@ -37,7 +37,7 @@ from aios.db import get_engine, run_migrations
 from alembic import command
 
 # Current single leaf of the whole tree (what #124 owns + advances).
-HEAD = "20260906_0001_recommendation_trust_advisory"
+HEAD = "20260906_0002_workforce_agent_binding"
 SERIES_REVISION = "20260820_0001_series_id"
 SERIES_FILE = "20260820_0001_series_id.py"
 # Previous leaf: the SalesPlaybook V0 follow-up slice. #124 chains directly after it.

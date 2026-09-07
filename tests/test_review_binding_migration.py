@@ -35,7 +35,7 @@ from aios.models import (
 )
 from alembic import command
 
-HEAD = "20260906_0001_recommendation_trust_advisory"
+HEAD = "20260906_0002_workforce_agent_binding"
 BASE = "20260720_0005"
 # Lowest revision these ORM-seeding tests upgrade to. The migrations above it
 # form a chain of one-way doors:

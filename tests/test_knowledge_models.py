@@ -174,7 +174,7 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     # chain (W1--W4: business_goal .. employee, head 20260903_0002) and then
     # to the current W5 Cost Evidence head:
     # 20260906_0001_recommendation_trust_advisory.
-    assert revision() == "20260906_0001_recommendation_trust_advisory"
+    assert revision() == "20260906_0002_workforce_agent_binding"
 
 
 def test_scope_unique_migration_round_trip(tmp_path: Path) -> None:

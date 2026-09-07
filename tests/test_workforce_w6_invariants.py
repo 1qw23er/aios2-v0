@@ -58,7 +58,10 @@ from aios.models import EmployeeStatus
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "aios"
 
-# The 14 Workforce tables as of W5 (W1--W4 = 13 frozen + cost_evidence).
+# The 15 Workforce tables as of W8-v2 (W1--W4 = 13 frozen + cost_evidence
+# + employee_agent_binding, the W8-v2 execution-binding table; its only outward
+# references are ``employee`` (domain) and ``agent`` (shared SSOT), so it
+# satisfies the dependency-direction checks below unchanged).
 WORKFORCE_TABLES = {
     "benchmark",
     "benchmark_result",
@@ -68,6 +71,7 @@ WORKFORCE_TABLES = {
     "capability_requirement",
     "cost_evidence",
     "employee",
+    "employee_agent_binding",
     "job",
     "job_version",
     "match",
@@ -207,9 +211,7 @@ def test_budget_used_has_exactly_one_writer() -> None:
             for target in targets:
                 if isinstance(target, ast.Attribute) and target.attr == "budget_used":
                     writers.append((path.name, node.lineno))
-    assert len(writers) == 1, (
-        f"expected exactly one Project.budget_used writer, found {writers}"
-    )
+    assert len(writers) == 1, f"expected exactly one Project.budget_used writer, found {writers}"
     assert writers[0][0] == "delegation.py", (
         f"the only budget_used writer must live in delegation.py, got {writers[0]}"
     )
@@ -236,9 +238,7 @@ def test_no_employee_terminate_writer_exists() -> None:
         for name in _function_names(path):
             lowered = name.lower()
             if "employee" in lowered and any(word in lowered for word in banned):
-                raise AssertionError(
-                    f"{path.name}::{name} -- termination is frozen by DR-D4-1 (A)"
-                )
+                raise AssertionError(f"{path.name}::{name} -- termination is frozen by DR-D4-1 (A)")
 
 
 def test_no_employee_delete_or_purge_writer_exists() -> None:
@@ -249,8 +249,7 @@ def test_no_employee_delete_or_purge_writer_exists() -> None:
             lowered = name.lower()
             if "employee" in lowered and any(word in lowered for word in banned):
                 raise AssertionError(
-                    f"{path.name}::{name} -- physical purge is permanently forbidden "
-                    "(DR-D4-3 (a))"
+                    f"{path.name}::{name} -- physical purge is permanently forbidden (DR-D4-3 (a))"
                 )
 
 
@@ -293,25 +292,66 @@ def test_employee_fk_lifecycle_is_frozen(template_db_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# DR-D4-2: no Workforce HTTP surface yet
+# DR-D4-2 (as revised by W8-v2): Workforce HTTP surface is bridge-only
 # ---------------------------------------------------------------------------
+
+# The ONLY module allowed to carry Workforce-prefixed route strings: the W8-v2
+# execution-bridge API surface (8 endpoints; Employee CRUD / hire routes are
+# banned everywhere, forever, by design -- an Employee exists only through the
+# W4 promote lifecycle). Path is relative to ``src/aios`` to disambiguate it
+# from the same-named service module.
+BRIDGE_API_MODULE = "api/employee_bridge.py"
+
+# The complete, closed set of sanctioned bridge route paths. Any Workforce-
+# prefixed string inside the bridge module that is NOT in this set fails.
+BRIDGE_ALLOWED_ROUTES = {
+    "/employees/{employee_id}/agent-binding",
+    "/employees/{employee_id}/agent-binding/replace",
+    "/employees/{employee_id}/agent-binding/history",
+    "/employees/{employee_id}/work",
+    "/tasks/{task_id}/employee-attribution",
+    "/artifacts/{artifact_id}/employee-attribution",
+}
 
 
 def test_no_workforce_http_route_is_registered() -> None:
-    """DR-D4-2: no Workforce route exists, so no 409 mapping is implemented.
+    """DR-D4-2 (seam-aware, W8-v2): Workforce routes live ONLY in the bridge.
+
+    Original freeze (DR-D4-2): no Workforce route exists, so no 409 mapping is
+    implemented. W8-v2 legalised exactly ONE sanctioned HTTP surface -- the
+    execution bridge (``src/aios/api/employee_bridge.py``) -- and the approved
+    §4.5 ``ServiceError`` -> 409 mapping shipped in that same change. The guard
+    therefore narrows from "no route anywhere" to:
+
+      1. Workforce-prefixed route strings may appear ONLY in
+         ``api/employee_bridge.py`` (module whitelist);
+      2. inside that module, every route string must be a member of the closed
+         ``BRIDGE_ALLOWED_ROUTES`` set (no CRUD/hire creep);
+      3. the §4.5 mapping is present and wired (see the companion W7 seam
+         invariant ``test_w8_seam_only_bridge_reaches_execution``, which also
+         pins the import edge).
 
     Knowledge-candidate routes (``/knowledge/candidates/...``) are a different
-    domain and are not matched here. The day a Workforce route is added, this
-    test fails on purpose: the approved §4.5 mapping must then be implemented
-    at the service layer in the same change.
+    domain and are not matched here.
     """
     for path in _iter_source_files():
+        rel = path.relative_to(SRC).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 value = node.value
-                if value.startswith(WORKFORCE_PREFIXES):
-                    raise AssertionError(
-                        f"{path.name}:{node.lineno} registers Workforce route "
-                        f"{value!r} -- implement the DR-D4-2 409 mapping first"
-                    )
+                if not value.startswith(WORKFORCE_PREFIXES):
+                    continue
+                if rel == BRIDGE_API_MODULE:
+                    if value not in BRIDGE_ALLOWED_ROUTES:
+                        raise AssertionError(
+                            f"{path.name}:{node.lineno} registers unsanctioned "
+                            f"Workforce route {value!r} -- Employee CRUD/hire "
+                            "stays banned; extend BRIDGE_ALLOWED_ROUTES only "
+                            "with an approved bridge endpoint"
+                        )
+                    continue
+                raise AssertionError(
+                    f"{path.name}:{node.lineno} registers Workforce route "
+                    f"{value!r} -- Workforce routes are bridge-only (W8-v2)"
+                )

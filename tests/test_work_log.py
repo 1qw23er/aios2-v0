@@ -51,7 +51,7 @@ from aios.work_log import (
 )
 from alembic import command
 
-HEAD = "20260906_0001_recommendation_trust_advisory"
+HEAD = "20260906_0002_workforce_agent_binding"
 PREV = "20260727_0008"
 # Lowest revision these ORM-seeding tests upgrade to. The migrations above it
 # form a chain of one-way doors:
