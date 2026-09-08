@@ -64,6 +64,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from aios.actor import ActorContext, _assert_owner_actor, resolve_agent_actor
+from aios.attribution import generate_attribution_key
 from aios.audit import AuditLog, append_audit
 from aios.models import (
     Approval,
@@ -322,11 +323,21 @@ class ContentDraftService:
         series_id: str = DEFAULT_SERIES_ID,
         task_id: str | None = None,
         idempotency_key: str | None = None,
+        attribution_key: str | None = None,
     ) -> Artifact:
-        """Create an UNVERIFIED content draft. Owner or any authenticated Agent."""
+        """Create an UNVERIFIED content draft. Owner or any authenticated Agent.
+
+        ``attribution_key`` is the per-article tracking id for the Aimi lead-gen
+        loop (gap #2). If omitted, one is minted via
+        ``generate_attribution_key(topic)`` and frozen into ``metadata_json`` at
+        creation time. Because the metadata is frozen into the checksum, adding
+        this field does NOT change an existing draft's checksum (ZERO-MIGRATION;
+        the invariant only protects rows created *after* this change).
+        """
         if actor.kind not in ("owner", "agent"):
             raise ServiceError(403, "create requires owner or agent identity")
         producer = actor.derive_submitted_by()
+        attribution_key = attribution_key or generate_attribution_key(topic)
         metadata: dict[str, Any] = {
             "topic": topic,
             "phase": phase,
@@ -334,6 +345,7 @@ class ContentDraftService:
             "conversion_anchors": conversion_anchors or [],
             "series_id": series_id,
             "producer": producer,
+            "attribution_key": attribution_key,
             "independent_review": None,
             "review_history": [],
         }
