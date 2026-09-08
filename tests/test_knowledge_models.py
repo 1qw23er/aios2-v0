@@ -173,8 +173,11 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     # chain past the #103 secret-store slice, to the Workforce Management
     # chain (W1--W4: business_goal .. employee, head 20260903_0002) and then
     # to the current W5 Cost Evidence head:
-    # 20260906_0001_recommendation_trust_advisory.
-    assert revision() == "20260906_0002_workforce_agent_binding"
+    # 20260906_0001_recommendation_trust_advisory, the W8-v2 Workforce
+    # Execution Bridge slice 20260906_0002, and finally the Skill System V1
+    # slice (skill_candidate / skill_review_decision / skill +
+    # task_context.applicable_skills): 20260907_0001_skill_system.
+    assert revision() == "20260907_0001_skill_system"
 
 
 def test_scope_unique_migration_round_trip(tmp_path: Path) -> None:
