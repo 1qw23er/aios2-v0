@@ -26,7 +26,7 @@ from aios.models import Project
 
 # Current single leaf of the whole tree. Later slices legitimately advance it;
 # what #109 owns is CS_REVISION, which must stay in the chain.
-HEAD = "20260906_0002_workforce_agent_binding"
+HEAD = "20260907_0001_skill_system"
 CS_REVISION = "20260731_0001"
 CS_FILE = "20260731_0001_customer_service.py"
 PREV = "20260730_0001_agent_secret.py"

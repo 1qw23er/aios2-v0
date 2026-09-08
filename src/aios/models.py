@@ -867,6 +867,12 @@ class TaskContext(SQLModel, table=True):
     approved_facts: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     relevant_decisions: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     applicable_policies: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    # Skill System V1: immutable snapshot of the approved skills injected into
+    # this context (see ``context_service._select_skills``). Each entry carries
+    # its own ``version`` / ``content_hash``, so a historical TaskContext row
+    # always records the exact skill content that was used -- replay never needs
+    # to re-resolve "latest".
+    applicable_skills: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     agent_profile: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     source_references: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     context_hash: str = Field(index=True)
@@ -2277,3 +2283,196 @@ class EmployeeAgentBinding(SQLModel, table=True):
     # NULL = the current binding.
     effective_to: datetime | None = Field(default=None)
     created_at: datetime = Field(default_factory=now_utc)
+
+
+# --- Skill System V1 -------------------------------------------------------
+#
+# KnowledgeFact answers "what do we know"; a Skill answers "how do we do it".
+# A Skill is therefore NOT a KnowledgeFact + prompt column: it carries three
+# structured execution fields (``steps`` / ``tool_bindings`` /
+# ``execution_strategy``) that must be reproducible at execution time.
+#
+# The domain is deliberately *isomorphic but separate* from the Knowledge
+# domain: it mirrors the Knowledge lifecycle (candidate -> review decision ->
+# versioned immutable asset) without reusing any Knowledge enum, table or
+# service. Reusing them would force "knowledge state" and "skill state" to
+# evolve in lockstep; the repo already established the same precedent by giving
+# Knowledge its own ``KnowledgeReviewDecision`` instead of reusing
+# ``Review`` / ``Approval``.
+#
+# Boundary (Implementation Contract §6): a Skill hangs off ``Capability``,
+# which is the shared SSoT. It meets Workforce's ``CapabilityRequirement``
+# *at* the Capability and nowhere else -- no per-agent or per-employee skill
+# table, no column pointing at job / candidate / employee / employee_agent_binding.
+
+
+class SkillCandidateStatus(StrEnum):
+    DRAFT = "draft"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class SkillReviewDecisionValue(StrEnum):
+    APPROVE = "approve"
+    REJECT = "reject"
+
+
+class SkillStatus(StrEnum):
+    APPROVED = "approved"
+    SUPERSEDED = "superseded"
+    INACTIVE = "inactive"
+
+
+class SkillExecutionStrategy(StrEnum):
+    SINGLE_PASS = "single_pass"
+    ITERATIVE = "iterative"
+    TOOL_FIRST = "tool_first"
+
+
+# Logical skill identity (the slug). Enforced in ``skill_service`` (422) rather
+# than as a DB CHECK: SQLite has no POSIX regex operator and PostgreSQL has no
+# GLOB, so a portable CHECK is not expressible. Service-level rejection keeps
+# the invariant engine-independent.
+SKILL_NAME_PATTERN = r"^[a-z][a-z0-9_]{2,63}$"
+
+
+class SkillCandidate(SQLModel, table=True):
+    """A proposed Skill awaiting exactly one human review decision.
+
+    Mirrors ``KnowledgeCandidate``. Two intentional deviations (Contract §2.2):
+
+    * ``source_artifact_id`` is NULLABLE -- a fact must cite an approved
+      artifact, but a Skill is procedural knowledge that an owner may author
+      directly; provenance falls back to ``submitted_by`` + the audit SSoT.
+    * no ``tags`` column -- matching is an exact ``capability_id`` intersection,
+      so no capability->tag vocabulary is needed.
+    """
+
+    __tablename__ = "skill_candidate"
+    __table_args__ = (
+        # Identity for idempotent re-submission. NULL project_id (company scope)
+        # is additionally guarded by the partial index
+        # ``uq_skillcand_identity_company`` -- SQLite treats every NULL as
+        # distinct, so the 3-column constraint alone cannot cover company scope
+        # (same class of bug as #53 / migration 20260727_0008).
+        UniqueConstraint(
+            "name", "content_hash", "project_id", name="uq_skill_candidate_identity"
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("skcand"), primary_key=True)
+    # Logical identity (slug). Constant across versions.
+    name: str = Field(index=True)
+    description: str
+    # The ONE capability seam: skills are only ever reachable through the
+    # capability a task requires and an agent declares. RESTRICT for lineage.
+    capability_id: str = Field(
+        foreign_key="capability.id", ondelete="RESTRICT", index=True
+    )
+    # Ordered procedure -- order is semantics, so this list is immutable once
+    # written. Empty is rejected (a skill with no steps is just a description).
+    steps: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    # Tool wiring, canonicalized (sort_keys) at write time so the content hash
+    # is stable regardless of key insertion order.
+    tool_bindings: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    execution_strategy: str
+    # Effective scope: NULL = company-wide, otherwise project-owned.
+    project_id: str | None = Field(default=None, foreign_key="project.id", index=True)
+    # Provenance: the project that produced this skill. NEVER NULL, so
+    # ownership can always be enforced even for company-scoped skills.
+    source_project_id: str = Field(foreign_key="project.id", index=True)
+    source_artifact_id: str | None = Field(
+        default=None, foreign_key="artifact.id", ondelete="RESTRICT", index=True
+    )
+    # Content fingerprint over the execution-relevant fields; used for
+    # idempotent submission and for rejecting same-content re-approval.
+    content_hash: str = Field(index=True)
+    # The ONLY mutable field: DRAFT -> APPROVED / REJECTED, exactly once.
+    status: SkillCandidateStatus = Field(
+        default=SkillCandidateStatus.DRAFT, index=True
+    )
+    # Typed, server-derived submitter identity (never accepted from input).
+    submitted_by_kind: str
+    submitted_by_owner_id: str | None = None
+    submitted_by_agent_id: str | None = None
+    # Derived display string (owner:<id> / agent:<id> / system); immutable.
+    submitted_by: str
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class SkillReviewDecision(SQLModel, table=True):
+    """The single owner decision on a candidate. One row per candidate, ever.
+
+    Deliberately NOT the ``Review`` protocol (``review.py``) nor ``Approval``:
+    those are separate concerns with their own lifecycle. ``candidate_id`` is
+    UNIQUE, which is what makes "reviewed at most once" a DB-level guarantee.
+    """
+
+    __tablename__ = "skill_review_decision"
+    __table_args__ = (UniqueConstraint("candidate_id", name="uq_skill_review_candidate"),)
+
+    id: str = Field(default_factory=lambda: new_id("skrev"), primary_key=True)
+    candidate_id: str = Field(foreign_key="skill_candidate.id", index=True)
+    decision: SkillReviewDecisionValue
+    # Typed, server-derived reviewer identity (never accepted from input).
+    reviewer_kind: str
+    reviewer_owner_id: str | None = None
+    reviewer_agent_id: str | None = None
+    # Derived display string; immutable (the table has no UPDATE path).
+    reviewer: str
+    rationale: str
+    reviewed_at: datetime = Field(default_factory=now_utc)
+
+
+class Skill(SQLModel, table=True):
+    """A published, immutable, versioned procedure.
+
+    Versioning model (Contract §4): the logical identity is ``name`` + scope;
+    every change mints a NEW row with ``version = head.version + 1``. There is
+    no code path that UPDATEs ``steps`` / ``tool_bindings`` /
+    ``execution_strategy`` / ``capability_id`` / ``version`` / ``content_hash``
+    -- ``status`` is the only mutable column (supersede / deactivate).
+    """
+
+    __tablename__ = "skill"
+    __table_args__ = (
+        # (name, version) uniqueness per project scope; company scope relies on
+        # the ``uq_skill_name_version_company`` partial index.
+        UniqueConstraint("name", "version", "project_id", name="uq_skill_name_version"),
+        # A candidate produces at most one skill, and vice versa.
+        UniqueConstraint("source_candidate_id", name="uq_skill_source_candidate"),
+        UniqueConstraint("review_decision_id", name="uq_skill_review_decision"),
+        UniqueConstraint("supersedes_skill_id", name="uq_skill_supersedes"),
+        # NOTE: single-active-head per (name, scope) is enforced by the partial
+        # indexes ``uq_skill_active_head_project`` / ``uq_skill_active_head_company``
+        # (migration 20260907_0001_skill_system) -- that partial form is also
+        # what makes concurrent approval of the same name fail with 409.
+    )
+
+    id: str = Field(default_factory=lambda: new_id("skill"), primary_key=True)
+    name: str = Field(index=True)
+    description: str
+    capability_id: str = Field(
+        foreign_key="capability.id", ondelete="RESTRICT", index=True
+    )
+    steps: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    tool_bindings: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    execution_strategy: str
+    project_id: str | None = Field(default=None, foreign_key="project.id", index=True)
+    source_project_id: str = Field(foreign_key="project.id", index=True)
+    source_artifact_id: str | None = Field(
+        default=None, foreign_key="artifact.id", ondelete="RESTRICT", index=True
+    )
+    content_hash: str = Field(index=True)
+    # Server-minted: 1 for a brand new (name, scope), else head.version + 1.
+    version: int = Field(ge=1)
+    # The only mutable field: APPROVED -> SUPERSEDED | INACTIVE.
+    status: SkillStatus = Field(default=SkillStatus.APPROVED, index=True)
+    source_candidate_id: str = Field(foreign_key="skill_candidate.id", index=True)
+    review_decision_id: str = Field(foreign_key="skill_review_decision.id", index=True)
+    supersedes_skill_id: str | None = Field(
+        default=None, foreign_key="skill.id", ondelete="RESTRICT", index=True
+    )
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
