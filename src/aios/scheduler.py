@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC
 from typing import Any
 
 from sqlmodel import Session, select
@@ -17,6 +18,13 @@ from aios.models import (
 )
 from aios.services import ServiceError, append_event
 
+# Runtime Thin Layer P1 (C4/C5): liveness pre-filter threshold (seconds).
+# Reuses the default per-delegation wall-clock ceiling (``Agent.timeout_s``
+# default = 300) as a sensible "no heartbeat within one delegation timeout =>
+# suspect" boundary. Liveness is a *pre-filter* only -- it never enters
+# ``_rank`` (C4/C5/R5). ``STALE`` is a computed state, never a persisted enum.
+RUNTIME_HEARTBEAT_STALE_SECONDS: float = 300.0
+
 
 def _candidate(
     session: Session,
@@ -30,6 +38,21 @@ def _candidate(
         reasons.append("disabled")
     if agent.status != AgentStatus.AVAILABLE:
         reasons.append(agent.status.value)
+    # Runtime P1 liveness pre-filter (C4/C5): only agents that HAVE heartbeated
+    # AND are older than the stale threshold are excluded. Agents with
+    # ``last_heartbeat_at IS NULL`` (pre-existing / never-heartbeated) stay
+    # eligible so the rollout does not mass-disable historical agents (fail-open).
+    if agent.last_heartbeat_at is not None:
+        # SQLite round-trips datetimes as naive; ``now_utc()`` is aware. Normalise
+        # both sides to naive UTC before subtracting (same convention as
+        # ``aios.employee_bridge._naive_utc``) so the comparison never raises on a
+        # tzinfo mismatch (C4/C5). Fail-open: NULL stays eligible elsewhere.
+        hb = agent.last_heartbeat_at
+        if hb.tzinfo is not None:
+            hb = hb.astimezone(UTC).replace(tzinfo=None)
+        age = (now_utc().replace(tzinfo=None) - hb).total_seconds()
+        if age > RUNTIME_HEARTBEAT_STALE_SECONDS:
+            reasons.append("runtime_stale")
     profiles = list(
         session.exec(
             select(AgentCapability).where(

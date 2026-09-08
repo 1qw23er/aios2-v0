@@ -30,6 +30,7 @@ from aios.agent_registry import (
     get_agent,
     list_agents,
     list_capabilities,
+    record_agent_heartbeat,
     register_agent,
     rotate_credential,
     set_agent_enabled,
@@ -2029,6 +2030,41 @@ def create_app() -> FastAPI:
     ) -> Agent:
         try:
             return set_agent_enabled(session, agent_id, request.enabled, actor=actor)
+        except ServiceError as error:
+            raise _translate(error) from error
+
+    @application.post(
+        "/agents/{agent_id}/heartbeat",
+        response_model=Agent,
+        status_code=status.HTTP_200_OK,
+    )
+    def agent_heartbeat(
+        agent_id: str,
+        session: Session = Depends(get_session),
+        actor: ActorContext = Depends(authenticate_agent),
+    ) -> Agent:
+        """Runtime Thin Layer P1 (C3): an agent reports its own liveness.
+
+        Self-only: the actor resolved from the bearer credential may heartbeat
+        ONLY its own ``agent_id``. A mismatch with the path param is a 401 with
+        zero side effects. The server writes ``last_heartbeat_at``; the client
+        never supplies a timestamp (C2). No new auth system -- it reuses
+        ``authenticate_agent`` and the same ownership scope as ``upsert_agent``.
+        """
+        if actor.kind != "agent" or not actor.agent_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="heartbeat requires an agent identity",
+                headers=_AGENT_UNAUTH_HEADERS,
+            )
+        if actor.agent_id != agent_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="heartbeat scope mismatch: an agent may only heartbeat itself",
+                headers=_AGENT_UNAUTH_HEADERS,
+            )
+        try:
+            return record_agent_heartbeat(session, agent_id)
         except ServiceError as error:
             raise _translate(error) from error
 

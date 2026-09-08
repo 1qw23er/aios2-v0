@@ -48,7 +48,7 @@ from aios.models import (
 )
 from aios.services import ServiceError
 
-HEAD = "20260907_0001_skill_system"
+HEAD = "20260908_0001_runtime_heartbeat"
 
 OWNER = ActorContext(kind="owner", owner_id="owner")
 AGENT_PRODUCER = ActorContext(kind="agent", agent_id="producer-1")

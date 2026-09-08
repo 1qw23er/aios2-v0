@@ -13,6 +13,7 @@ from threading import Barrier
 
 import pytest
 from alembic.config import Config
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -51,7 +52,7 @@ from aios.work_log import (
 )
 from alembic import command
 
-HEAD = "20260907_0001_skill_system"
+HEAD = "20260908_0001_runtime_heartbeat"
 PREV = "20260727_0008"
 # Lowest revision these ORM-seeding tests upgrade to. The migrations above it
 # form a chain of one-way doors:
@@ -1139,8 +1140,27 @@ def test_migration_0009_downgrade_fail_closed_populated(
 
     with Session(get_engine(url)) as session:
         if populated == "agent_platform":
-            session.add(
-                Agent(name="a", role="r", adapter_type="external", platform="hermes")
+            # Use raw SQL so the seeding survives future Agent columns that are
+            # NOT present at LAST_DOWNGRADABLE (e.g. Runtime P1 last_heartbeat_at).
+            session.execute(
+                text(
+                    "INSERT INTO agent "
+                    "(id, name, role, adapter_type, capabilities, "
+                    "permissions, cost_policy, enabled, platform) "
+                    "VALUES (:id, :name, :role, :adapter_type, :capabilities, "
+                    ":permissions, :cost_policy, :enabled, :platform)"
+                ),
+                {
+                    "id": "agt_0009_fc",
+                    "name": "a",
+                    "role": "r",
+                    "adapter_type": "external",
+                    "capabilities": "[]",
+                    "permissions": "[]",
+                    "cost_policy": "{}",
+                    "enabled": True,
+                    "platform": "hermes",
+                },
             )
         else:
             project = Project(name="P", objective="O")
@@ -1217,15 +1237,31 @@ def test_migration_0029_downgrade_fail_closed_when_tokens_consumed(
 
     # Seed an agent that has consumed a bootstrap token.
     with Session(get_engine(url)) as session:
-        session.add(
-            Agent(
-                name="a",
-                role="r",
-                adapter_type="external",
-                platform="p1",
-                external_ref="r1",
-                bootstrap_token_ref="jti-consumed",
-            )
+        # Use raw SQL so the seeding survives future Agent columns that are NOT
+        # present at the downgraded revision (e.g. Runtime P1 last_heartbeat_at).
+        session.execute(
+            text(
+                "INSERT INTO agent "
+                "(id, name, role, adapter_type, capabilities, permissions, "
+                "cost_policy, enabled, platform, external_ref, "
+                "bootstrap_token_ref) "
+                "VALUES (:id, :name, :role, :adapter_type, :capabilities, "
+                ":permissions, :cost_policy, :enabled, :platform, "
+                ":external_ref, :bootstrap_token_ref)"
+            ),
+            {
+                "id": "agt_0029_fc",
+                "name": "a",
+                "role": "r",
+                "adapter_type": "external",
+                "capabilities": "[]",
+                "permissions": "[]",
+                "cost_policy": "{}",
+                "enabled": True,
+                "platform": "p1",
+                "external_ref": "r1",
+                "bootstrap_token_ref": "jti-consumed",
+            },
         )
         session.commit()
 
