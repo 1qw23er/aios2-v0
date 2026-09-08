@@ -40,6 +40,11 @@ from aios.models import (
 from aios.orchestrator import Orchestrator, complete_task
 from aios.scheduler import route_task
 from aios.services import ServiceError, append_event
+from aios.task_run import (
+    claim_task_for_execution,
+    new_task_lease_owner,
+    release_task_lease,
+)
 
 
 class ExecutionResult(BaseModel):
@@ -260,11 +265,19 @@ def execute_task(
     if assignment is None:
         raise ServiceError(409, "任务无法认领（可能不是部门任务，或 agent 不可用）")
 
-    # RUNNING (persisted by the upcoming build_context commit).
-    before = task.status
-    task.status = TaskStatus.RUNNING
-    task.updated_at = now_utc()
-    session.add(task)
+    # (c2) Execution lease: one atomic READY -> RUNNING compare-and-set. Exactly
+    # one caller wins; a concurrent caller (or a second process) is rejected here
+    # instead of running the adapter twice (duplicate paid model calls, duplicate
+    # artifacts). The lease is what the fail-closed startup scan uses to decide
+    # whether a RUNNING task was abandoned (see aios.task_run).
+    lease_owner = new_task_lease_owner()
+    if not claim_task_for_execution(session, task_id=task.id, owner=lease_owner):
+        raise ServiceError(409, "任务已被其他执行占用（并发认领失败），请稍后重试")
+    # The CAS committed, so the ORM identity is refreshed on next access.
+    session.refresh(task)
+
+    # RUNNING (the transition itself was persisted by the claim above).
+    before = TaskStatus.READY
     append_event(
         session,
         project_id=task.project_id,
@@ -311,7 +324,9 @@ def execute_task(
                 "attempts": attempts,
                 "max_attempts": getattr(exc, "max_attempts", None),
             }
-        _mark_failed(session, task, idempotency_key, reason, actor, meta=meta)
+        _mark_failed(
+            session, task, idempotency_key, reason, actor, meta=meta, lease_owner=lease_owner
+        )
         raise
     except Exception as exc:  # noqa: BLE001 - surface as readable failure
         _mark_failed(
@@ -320,6 +335,7 @@ def execute_task(
             idempotency_key,
             f"adapter_exception:{type(exc).__name__}",
             actor,
+            lease_owner=lease_owner,
         )
         raise ExecutionError(502, _redact_secrets(f"部门执行失败：{exc}")) from exc
 
@@ -419,6 +435,11 @@ def execute_task(
         # Unlock downstream tasks (T1 DONE -> T2 READY, etc.).
         Orchestrator(session).process_pending()
         session.commit()
+        # Release the execution lease: a terminal task is never reclaimed by the
+        # fail-closed scan, but leaving dead owner/expiry metadata behind is
+        # sloppy and could confuse operators reading the row.
+        if lease_owner is not None:
+            release_task_lease(session, task_id=task.id, owner=lease_owner)
     except Exception:
         session.rollback()
         raise
@@ -434,6 +455,7 @@ def _mark_failed(
     actor: str,
     *,
     meta: dict[str, Any] | None = None,
+    lease_owner: str | None = None,
 ) -> None:
     from aios.audit import append_audit
 
@@ -481,6 +503,12 @@ def _mark_failed(
     except Exception:
         session.rollback()
         raise
+    # Release the execution lease so the task is immediately reclaimable: a
+    # FAILED task is retryable with a new idempotency key, and no abandoned
+    # lease may survive it. Owner-scoped -- a lease that was already reclaimed
+    # by recovery writes nothing.
+    if lease_owner is not None:
+        release_task_lease(session, task_id=task.id, owner=lease_owner)
 
 
 class AdapterErrorReason(NamedTuple):

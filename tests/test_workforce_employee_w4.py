@@ -786,4 +786,4 @@ def test_alembic_single_head_is_w4_employee() -> None:
     cfg = Config(ROOT / "alembic.ini")
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
-    assert heads == ["20260909_0001_execution_run_lease"]
+    assert heads == ["20260909_0002_task_run_lease"]
