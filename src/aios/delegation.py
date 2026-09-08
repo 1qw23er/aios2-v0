@@ -37,6 +37,14 @@ from typing import Any, Protocol
 from sqlmodel import Session
 
 from aios.audit import AuditEvent, append_audit, redact_secrets
+from aios.execution_run import (
+    acquire_run_lease,
+    complete_run,
+    new_run_lease_owner,
+    release_run_lease,
+    renew_run_lease,
+    update_run_if_owned,
+)
 from aios.models import (
     Agent,
     AgentTrustLevel,
@@ -207,6 +215,10 @@ class DelegatedExecutionAdapter:
             self.backoff_base = backoff_base
         # Per-delegation timeout ceiling (design review v1 §6). Default 300s.
         self.timeout_s = float(getattr(agent, "timeout_s", 0.0) or 0.0) or 300.0
+        # Execution Run Lifecycle P0: opaque, per-adapter-instance identity used
+        # to fence every mutation of a run this adapter drives. NOT an agent_id
+        # / employee_id / runtime identity -- see ``execution_run``.
+        self._lease_owner = new_run_lease_owner()
 
     # --- capability discovery (Contract point 1) ---
     def discover_capabilities(self) -> dict[str, Any]:
@@ -334,6 +346,10 @@ class DelegatedExecutionAdapter:
                     s.commit()
                 # Accrue budget from the actual run cost (0 if not reported).
                 self._accrue_budget(run)
+                # P0: the run reached a validated terminal outcome -- give up
+                # the lease so the record no longer looks in-flight.
+                with _session() as s:
+                    release_run_lease(s, run_id=run.id, owner=self._lease_owner)
                 return _to_execution_result(artifact_like, run)
             except DelegatedExecutionError as exc:
                 last_error = str(exc)
@@ -402,6 +418,13 @@ class DelegatedExecutionAdapter:
             s.add(run)
             s.commit()
             s.refresh(run)
+            # Execution Run Lifecycle P0: take the durable lease immediately. A
+            # freshly inserted row has a NULL lease, so this always succeeds --
+            # but it goes through the same conditional UPDATE as any other
+            # acquirer, so the run is protected from the recovery scan from the
+            # moment it exists.
+            acquire_run_lease(s, run_id=run.id, owner=self._lease_owner)
+            s.refresh(run)
             return run
 
     def _record_submitted(self, run: DelegatedRun, info: dict[str, Any]) -> None:
@@ -411,10 +434,20 @@ class DelegatedExecutionAdapter:
         run.status = DelegatedRunStatus.SUBMITTED
         with _session() as s:
             r = s.get(DelegatedRun, run.id)
-            r.status = DelegatedRunStatus.SUBMITTED
-            r.remote_run_id = info.get("remote_run_id")
-            r.remote_status = info.get("remote_status")
-            r.updated_helper() if hasattr(r, "updated_helper") else None
+            # Fenced (P0): only the current lease holder records the submit
+            # result. The write goes through a conditional UPDATE instead of
+            # ORM attribute assignment so a stale owner can never persist.
+            update_run_if_owned(
+                s,
+                run_id=run.id,
+                owner=self._lease_owner,
+                values={
+                    "status": DelegatedRunStatus.SUBMITTED,
+                    "remote_run_id": info.get("remote_run_id"),
+                    "remote_status": info.get("remote_status"),
+                },
+            )
+            s.refresh(r)
             # Observability: the task was delegated to the external agent.
             append_audit(
                 s,
@@ -428,49 +461,69 @@ class DelegatedExecutionAdapter:
                 after={"mode": self.mode.value, "remote_run_id": r.remote_run_id},
                 idempotency_key=f"audit:delegate:{r.id}:{new_id('k')}",
             )
-            s.add(r)
             s.commit()
 
     def _wait_for_completion(self, run: DelegatedRun) -> dict[str, Any]:
-        """Poll until finished (callback mode would instead be pushed)."""
+        """Poll until finished (callback mode would instead be pushed).
+
+        Execution Run Lifecycle P0: the durable lease is renewed before every
+        poll and every write is fenced on it. If the lease is lost (another
+        process reclaimed the run) we fail closed -- we must never mutate a run
+        we no longer own; the recovery scan then decides its fate.
+        """
         deadline = time.time() + self.timeout_s  # per-agent timeout (Contract 7)
         while time.time() < deadline:
+            with _session() as s:
+                if not renew_run_lease(s, run_id=run.id, owner=self._lease_owner):
+                    raise DelegatedExecutionError(
+                        f"delegated run {run.id} lost its execution lease"
+                    )
             info = self.status(delegated_run=run)
             with _session() as s:
-                r = s.get(DelegatedRun, run.id)
-                r.remote_status = info.get("remote_status")
+                values: dict[str, Any] = {"remote_status": info.get("remote_status")}
                 if info.get("cost") is not None:
-                    r.cost = float(info["cost"])
+                    values["cost"] = float(info["cost"])
                 if info.get("usage") is not None:
-                    r.usage = info["usage"]
-                s.add(r)
-                s.commit()
-            if info.get("finished"):
-                with _session() as s:
-                    r = s.get(DelegatedRun, run.id)
-                    # finished == the agent side completed; result is read at
-                    # ingest time. A non-None error overrides to FAILED/EXPIRED.
-                    r.status = (
-                        DelegatedRunStatus.FAILED
-                        if info.get("error")
-                        else DelegatedRunStatus.SUCCEEDED
+                    values["usage"] = info["usage"]
+                if not update_run_if_owned(
+                    s, run_id=run.id, owner=self._lease_owner, values=values
+                ):
+                    raise DelegatedExecutionError(
+                        f"delegated run {run.id} lost its execution lease"
                     )
-                    r.finished_at = now_utc()
-                    r.error = info.get("error")
-                    s.add(r)
-                    s.commit()
+            if info.get("finished"):
+                # finished == the agent side completed; result is read at
+                # ingest time. A non-None error overrides to FAILED/EXPIRED.
+                terminal = (
+                    DelegatedRunStatus.FAILED
+                    if info.get("error")
+                    else DelegatedRunStatus.SUCCEEDED
+                )
+                with _session() as s:
+                    if not complete_run(
+                        s,
+                        run_id=run.id,
+                        owner=self._lease_owner,
+                        status=terminal,
+                        error=info.get("error"),
+                    ):
+                        raise DelegatedExecutionError(
+                            f"delegated run {run.id} lost its execution lease"
+                        )
+                    r = s.get(DelegatedRun, run.id)
                     # Extract scalars before the session closes (r becomes detached).
                     final_status, final_error = r.status, r.error
                 return {"status": final_status, "error": final_error}
             time.sleep(2)
         # Timeout -> EXPIRED (Contract 7). Cost budget handling lives in orchestrator.
         with _session() as s:
-            r = s.get(DelegatedRun, run.id)
-            r.status = DelegatedRunStatus.EXPIRED
-            r.finished_at = now_utc()
-            r.error = "delegation timeout"
-            s.add(r)
-            s.commit()
+            complete_run(
+                s,
+                run_id=run.id,
+                owner=self._lease_owner,
+                status=DelegatedRunStatus.EXPIRED,
+                error="delegation timeout",
+            )
         return {"status": DelegatedRunStatus.EXPIRED, "error": "delegation timeout"}
 
     def _accrue_budget(self, run: DelegatedRun) -> None:
@@ -495,11 +548,22 @@ class DelegatedExecutionAdapter:
     def _record_failed(self, run: DelegatedRun, error: str) -> None:
         with _session() as s:
             r = s.get(DelegatedRun, run.id)
-            r.status = DelegatedRunStatus.FAILED
-            r.error = error
-            r.finished_at = now_utc()
-            s.add(r)
-            s.commit()
+            # Fenced (P0): only the current lease holder may terminalize. An
+            # EXPIRED run may still be relabelled FAILED by its own owner (a
+            # timed-out attempt), which preserves the existing behaviour.
+            if not complete_run(
+                s,
+                run_id=run.id,
+                owner=self._lease_owner,
+                status=DelegatedRunStatus.FAILED,
+                error=error,
+            ):
+                # We no longer own this run, or it already reached a settled
+                # outcome. Write nothing and leave no misleading audit record --
+                # the recovery scan owns its fate from here.
+                return
+            release_run_lease(s, run_id=run.id, owner=self._lease_owner)
+            s.refresh(r)
             append_audit(
                 s,
                 actor="gateway",

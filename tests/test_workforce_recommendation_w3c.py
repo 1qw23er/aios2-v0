@@ -1648,7 +1648,7 @@ def test_w3c_migration_is_single_head_and_reversible(tmp_path: Path) -> None:
     cfg = Config(ROOT / "alembic.ini")
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     assert ScriptDirectory.from_config(cfg).get_heads() == [
-        "20260908_0001_runtime_heartbeat"
+        "20260909_0001_execution_run_lease"
     ]
 
     db_path = tmp_path / "mig_w3c.db"
@@ -1675,7 +1675,7 @@ def test_w3c_migration_is_single_head_and_reversible(tmp_path: Path) -> None:
     version = conn.execute(
         "SELECT version_num FROM alembic_version"
     ).fetchone()[0]
-    assert version == "20260908_0001_runtime_heartbeat"
+    assert version == "20260909_0001_execution_run_lease"
     conn.close()
 
     # 30: reversible -- downgrade removes the W3-C table + indexes, nothing else.

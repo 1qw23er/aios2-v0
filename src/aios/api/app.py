@@ -297,6 +297,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # backend without a valid KEK (or an unknown backend) must crash at boot
     # with a readable message, not serve silent 503s. (issue #103 follow-up)
     validate_secret_store_config()
+    # Execution Run Lifecycle P0: reclaim stranded delegated runs left behind by
+    # a previous process (SUBMITTED/RUNNING with no valid lease). One shot at
+    # boot -- deliberately NOT a daemon, scheduler or background thread. It
+    # never resumes or retries a remote execution; unknown remote state is
+    # expired (see aios.execution_run).
+    from aios.execution_run import recover_stranded_runs_at_startup
+
+    recover_stranded_runs_at_startup()
     yield
 
 
@@ -2988,6 +2996,14 @@ def create_app() -> FastAPI:
     from aios.api.skill import register_skill_routes
 
     register_skill_routes(application)
+
+    # Execution Run Lifecycle & Recovery P0: run-lifecycle query surface over the
+    # EXISTING DelegatedRun (no new execution entity) plus an explicit recovery
+    # invocation point. Owner-only; paths avoid the WORKFORCE_PREFIXES namespace.
+    # See src/aios/api/execution_run.py and src/aios/execution_run.py.
+    from aios.api.execution_run import register_execution_run_routes
+
+    register_execution_run_routes(application)
 
     return application
 
