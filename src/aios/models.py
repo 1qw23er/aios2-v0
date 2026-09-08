@@ -507,6 +507,17 @@ class DelegatedRun(SQLModel, table=True):
     submitted_at: datetime = Field(default_factory=now_utc)
     finished_at: datetime | None = None
     created_at: datetime = Field(default_factory=now_utc)
+    # --- Execution Run Lifecycle & Recovery P0: durable lease -----------------
+    # Opaque identity of the execution worker/process that currently owns this
+    # run. It is deliberately NOT ``agent_id`` / ``employee_id`` / any runtime
+    # entity -- it is a per-process token (``new_id("lease")``) that exists only
+    # to fence mutations. Semantics:
+    #   * ``lease_owner IS NULL`` OR ``lease_expires_at <= now`` -> the run is
+    #     unowned: any worker may acquire it, and recovery may reclaim it.
+    #   * otherwise -> only ``lease_owner`` may renew / release / terminalize it.
+    # A stale owner can therefore never complete a run whose lease it lost.
+    lease_owner: str | None = Field(default=None)
+    lease_expires_at: datetime | None = Field(default=None)
 
 
 class Approval(SQLModel, table=True):

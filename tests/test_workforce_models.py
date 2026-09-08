@@ -368,7 +368,7 @@ def test_alembic_single_head_is_capreq_hardening() -> None:
     # (20260902_0001_workforce_recommendation) to the W4 Employee migration
     # (20260903_0002_workforce_employee), and W5 Cost Evidence advances it to
     # 20260906_0001_recommendation_trust_advisory.
-    assert heads == ["20260908_0001_runtime_heartbeat"]
+    assert heads == ["20260909_0001_execution_run_lease"]
 
 
 def test_migration_creates_workforce_tables_additively(tmp_path: Path) -> None:

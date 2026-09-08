@@ -25,6 +25,11 @@ class AuditEvent(StrEnum):
     ARTIFACT_VALIDATED = "artifact.validated"
     DELEGATION_FAILED = "delegation.failed"
     DELEGATION_CANCELLED = "delegation.cancelled"
+    # Execution Run Lifecycle & Recovery P0: a stranded run (SUBMITTED/RUNNING
+    # with no active lease and past the safety grace period) was reclaimed by
+    # the fail-closed recovery scan. Pure code addition -- StrEnum values are
+    # stored as plain VARCHAR, so no Alembic migration is required.
+    DELEGATION_RUN_RECOVERED = "delegation.run_recovered"
 
 # Dict keys whose *values* are credentials and must never be persisted.
 SECRET_KEYS = {"secret", "token", "password", "credential", "api_key", "api-key"}
