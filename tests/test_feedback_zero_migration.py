@@ -30,7 +30,7 @@ from aios.feedback import (
 )
 from aios.models import Artifact, ArtifactType, Event, Project, Task
 
-HEAD = "20260906_0002_workforce_agent_binding"
+HEAD = "20260907_0001_skill_system"
 
 
 # Shared DB fixtures (mirror tests/test_feedback.py; pytest fixtures are

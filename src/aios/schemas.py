@@ -14,6 +14,7 @@ from aios.models import (
     KnowledgeReviewDecisionValue,
     RiskLevel,
     RoutingMode,
+    SkillReviewDecisionValue,
 )
 
 
@@ -349,3 +350,47 @@ class EmployeeWorkCreate(BaseModel):
     acceptance_criteria: list[str] = Field(default_factory=list)
     input_context_refs: list[str] = Field(default_factory=list)
     estimated_cost: float = Field(default=0.0, ge=0)
+
+
+class SkillCandidateCreate(BaseModel):
+    """Owner submits a Skill candidate (Contract §12 #1).
+
+    Field-for-field mirrors ``SkillService.submit_candidate``. ``project_id``
+    is the single scope source of truth: ``None`` => company-wide (requires a
+    cited ``source_artifact_id`` so provenance always resolves -- fail-closed),
+    otherwise project-scoped. The submitter identity is NEVER taken from the
+    request -- it is always derived from the trusted owner actor.
+    """
+
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    capability_id: str = Field(min_length=1)
+    steps: list[dict[str, Any]] = Field(min_length=1)
+    tool_bindings: dict[str, Any] = Field(default_factory=dict)
+    execution_strategy: str = Field(min_length=1)
+    project_id: str | None = None
+    source_artifact_id: str | None = None
+
+
+class SkillReviewRequest(BaseModel):
+    """Owner review of a Skill candidate (Contract §12 #3, the single gate).
+
+    ``decision: approve`` mints the Skill server-side (version is server-minted,
+    no client version input exists); ``decision: reject`` records the verdict.
+    The reviewer identity is NEVER taken from the request.
+    """
+
+    candidate_id: str = Field(min_length=1)
+    decision: SkillReviewDecisionValue
+    rationale: str = Field(min_length=1)
+
+
+class SkillDeactivateRequest(BaseModel):
+    """Owner deactivation of a published Skill (Contract §12 #6).
+
+    Mints no new version: it flips the only mutable column (``status``), so the
+    skill disappears from subsequent context projections while historical
+    TaskContext snapshots keep replaying the version they captured.
+    """
+
+    rationale: str = Field(min_length=1)

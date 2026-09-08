@@ -2943,6 +2943,16 @@ def create_app() -> FastAPI:
 
     register_employee_cost_routes(application)
 
+    # Skill System V1: six owner-only endpoints under /skills (Contract §12).
+    # A composition surface like employee_cost, NOT a bridge seam: the single
+    # execution seam is the TaskContext projection in context_service. Route
+    # literals are fully qualified (/skills/...) so the W6 route guard's
+    # "/candidate" prefix never matches (F-3); see src/aios/api/skill.py and
+    # tests/test_skill_invariants.py.
+    from aios.api.skill import register_skill_routes
+
+    register_skill_routes(application)
+
     return application
 
 

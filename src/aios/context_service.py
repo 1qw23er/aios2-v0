@@ -33,11 +33,51 @@ from aios.models import (
     Project,
     ReviewedFact,
     ReviewedFactStatus,
+    Skill,
+    SkillCandidate,
+    SkillStatus,
     Task,
     TaskContext,
     TaskStatus,
 )
 from aios.services import ServiceError
+
+# Deterministic context-budget cap on Skill projection (Contract §8.1): after
+# the stable ``(name, version, id)`` ordering, at most this many skills are
+# injected into one TaskContext.
+SKILL_PROJECTION_LIMIT = 10
+
+
+def _skill_rank(skill: Skill) -> tuple[int, int, str]:
+    """Precedence key for same-name skills (Contract §5): project > company,
+    then newest version, then id (fully deterministic tie-break)."""
+    return (1 if skill.project_id is not None else 0, skill.version, skill.id)
+
+
+def _skill_heads(session: Session, project_id: str) -> list[Skill]:
+    """Latest APPROVED skill per logical identity (name) visible to a project.
+
+    Scope rule: company-wide (``project_id IS NULL``) and project-scoped rows
+    are both visible; when both scopes carry the same name the project-scoped
+    tailoring wins. Returns heads sorted by ``(name, version, id)``.
+    """
+    rows = list(
+        session.exec(
+            select(Skill).where(
+                Skill.status == SkillStatus.APPROVED,
+                or_(
+                    Skill.project_id.is_(None),
+                    Skill.project_id == project_id,
+                ),
+            )
+        )
+    )
+    head_by_name: dict[str, Skill] = {}
+    for skill in rows:
+        current = head_by_name.get(skill.name)
+        if current is None or _skill_rank(skill) > _skill_rank(current):
+            head_by_name[skill.name] = skill
+    return [head_by_name[name] for name in sorted(head_by_name)]
 
 SENSITIVE_KEYS = {
     "api-key",
@@ -167,6 +207,12 @@ class ContextService:
         # to the old scope-wide full injection.
         projected = self._select_knowledge_facts(project.id, references, agent, task)
         facts = reviewed_facts + [item[0] for item in projected]
+        # Skill projection: the single execution seam for the Skill domain
+        # (Contract §8.3). Same gate ordering and fail-closed philosophy as the
+        # KnowledgeFact projection above; results are immutable snapshots, so
+        # an old TaskContext row keeps replaying the versions it captured.
+        projected_skills = self._select_skills(project.id, references, agent, task)
+        skills = [item[0] for item in projected_skills]
         policies = self._policies(project.id, references)
         agent_profile = self._agent_profile(agent, references)
         references.sort(
@@ -189,6 +235,7 @@ class ContextService:
             "approved_facts": facts,
             "relevant_decisions": decisions,
             "applicable_policies": policies,
+            "applicable_skills": skills,
             "agent_profile": agent_profile,
             "source_references": references,
         }
@@ -252,6 +299,38 @@ class ContextService:
                     },
                     idempotency_key=(
                         f"audit:knowledge:projection:{context.id}:{meta['fact_id']}"
+                    ),
+                )
+            # Skill projection audit -- same structured, redacted, idempotent
+            # pattern as the fact loop above. Records which skill (id + frozen
+            # version) entered which TaskContext; no new execution chain is
+            # created here (Contract §15).
+            for _skill_dict, meta in projected_skills:
+                append_audit(
+                    self.session,
+                    actor="context_service",
+                    action="skill.projected",
+                    resource_type="skill",
+                    resource_id=meta["skill_id"],
+                    project_id=project.id,
+                    task_id=task.id,
+                    before={},
+                    after={
+                        "task_id": task.id,
+                        "task_project_id": task.project_id,
+                        "context_id": context.id,
+                        "agent_id": meta["agent_id"],
+                        "skill_id": meta["skill_id"],
+                        "name": meta["name"],
+                        "version": meta["version"],
+                        "content_hash": meta["content_hash"],
+                        "skill_scope": meta["skill_scope"],
+                        "skill_source_project_id": meta["skill_source_project_id"],
+                        "matched_capabilities": meta["matched_capabilities"],
+                        "projection_mode": "least_privilege",
+                    },
+                    idempotency_key=(
+                        f"audit:skill:projection:{context.id}:{meta['skill_id']}"
                     ),
                 )
             self.session.commit()
@@ -533,6 +612,132 @@ class ContextService:
                     ),
                 ]
             )
+        return result
+
+    def _select_skills(
+        self,
+        project_id: str,
+        references: list[dict[str, Any]],
+        agent: Agent | None,
+        task: Task,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """Gate + select approved Skills for projection (Contract §8.1).
+
+        Mirrors ``_select_knowledge_facts`` gate-for-gate, with two deliberate
+        differences: no feature flag (the skill table starts empty, so the
+        projection is naturally inert; a flag is a V1.1 grey-release need), and
+        capability matching is a pure ID set intersection (F-1: both
+        ``Task.required_capabilities`` and ``AgentCapability.capability_id``
+        hold capability IDs). Everything returned is an immutable snapshot;
+        ordering is fully deterministic.
+        """
+        if agent is None:
+            return []
+        if agent.trust_level != AgentTrustLevel.INTERNAL:
+            # External / experimental agents receive no Skill projection --
+            # skills carry executable procedure, so they are at least as
+            # sensitive as KnowledgeFacts. Fail-closed, same as above.
+            return []
+        # Fail-closed: the assigned agent must satisfy every required capability.
+        self._assert_required_capabilities(task, agent)
+        enabled_caps = self.session.exec(
+            select(AgentCapability).where(
+                AgentCapability.agent_id == agent.id,
+                AgentCapability.enabled.is_(True),
+            )
+        ).all()
+        agent_cap_ids = {ac.capability_id for ac in enabled_caps}
+        # Pure ID set intersection (F-1) -- no name resolution involved.
+        eff_cap_ids = set(task.required_capabilities or []) & agent_cap_ids
+        if not eff_cap_ids:
+            return []
+
+        # Head per logical identity (name) with scope precedence (§5), then the
+        # capability filter, then deterministic ordering and truncation.
+        heads = [
+            head
+            for head in _skill_heads(self.session, project_id)
+            if head.capability_id in eff_cap_ids
+        ]
+        if not heads:
+            return []
+        heads.sort(key=lambda s: (s.name, s.version, s.id))
+        heads = heads[:SKILL_PROJECTION_LIMIT]
+
+        result: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for skill in heads:
+            capability = self.session.get(Capability, skill.capability_id)
+            if capability is None:
+                raise ServiceError(409, "Skill capability reference is missing")
+            candidate = self.session.get(SkillCandidate, skill.source_candidate_id)
+            scope = "company" if skill.project_id is None else "project"
+            skill_dict = {
+                "skill_kind": "skill",
+                "skill_id": skill.id,
+                "name": skill.name,
+                "version": skill.version,
+                "capability_id": skill.capability_id,
+                "capability_name": capability.name,
+                "scope": scope,
+                "project_id": skill.project_id,
+                "source_project_id": skill.source_project_id,
+                "description": skill.description,
+                "steps": skill.steps,
+                "tool_bindings": skill.tool_bindings,
+                "execution_strategy": skill.execution_strategy.value
+                if hasattr(skill.execution_strategy, "value")
+                else skill.execution_strategy,
+                "content_hash": skill.content_hash,
+                "source_candidate_id": skill.source_candidate_id,
+                "review_decision_id": skill.review_decision_id,
+                "source_artifact_id": skill.source_artifact_id,
+            }
+            meta = {
+                "skill_id": skill.id,
+                "name": skill.name,
+                "version": skill.version,
+                "content_hash": skill.content_hash,
+                "skill_scope": scope,
+                "skill_source_project_id": skill.source_project_id,
+                "agent_id": agent.id,
+                "matched_capabilities": [skill.capability_id],
+            }
+            result.append((skill_dict, meta))
+            skill_reference: dict[str, Any] = _reference(
+                "skill",
+                skill.id,
+                f"{skill.name}:{skill.version}",
+                "approved_reusable_skill",
+            )
+            skill_reference.update({"scope": scope, "project_id": skill.project_id})
+            references.extend(
+                [
+                    skill_reference,
+                    _reference(
+                        "skill_candidate",
+                        skill.source_candidate_id,
+                        _timestamp(candidate.updated_at) if candidate else "",
+                        "skill_provenance",
+                    ),
+                    _reference(
+                        "skill_review_decision",
+                        skill.review_decision_id,
+                        _timestamp(skill.updated_at),
+                        "human_approval_provenance",
+                    ),
+                ]
+            )
+            if skill.source_artifact_id:
+                artifact = self.session.get(Artifact, skill.source_artifact_id)
+                if artifact is not None:
+                    references.append(
+                        _reference(
+                            "artifact",
+                            artifact.id,
+                            artifact.checksum,
+                            "skill_source_artifact",
+                        )
+                    )
         return result
 
     def _decisions(self, project_id: str, references: list[dict[str, str]]) -> list[dict[str, Any]]:
