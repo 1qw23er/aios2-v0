@@ -37,7 +37,7 @@ from aios.db import get_engine, run_migrations
 from alembic import command
 
 # Current single leaf of the whole tree (what #124 owns + advances).
-HEAD = "20260907_0001_skill_system"
+HEAD = "20260908_0001_runtime_heartbeat"
 SERIES_REVISION = "20260820_0001_series_id"
 SERIES_FILE = "20260820_0001_series_id.py"
 # Previous leaf: the SalesPlaybook V0 follow-up slice. #124 chains directly after it.

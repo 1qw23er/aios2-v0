@@ -51,7 +51,7 @@ from aios.work_log import (
 )
 from alembic import command
 
-HEAD = "20260907_0001_skill_system"
+HEAD = "20260908_0001_runtime_heartbeat"
 PREV = "20260727_0008"
 # Lowest revision these ORM-seeding tests upgrade to. The migrations above it
 # form a chain of one-way doors:

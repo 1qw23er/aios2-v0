@@ -31,6 +31,7 @@ from aios.models import (
     Capability,
     DelegationMode,
     new_id,
+    now_utc,
 )
 from aios.secrets_store import get_secret_store
 from aios.services import ServiceError
@@ -537,6 +538,30 @@ def upsert_agent(
         },
         idempotency_key=f"audit:agent:self_update:{agent.id}:{new_id('k')}",
     )
+    session.commit()
+    session.refresh(agent)
+    return agent
+
+
+def record_agent_heartbeat(session: Any, agent_id: str) -> Agent:
+    """Runtime Thin Layer P1 (C3): record an agent's liveness signal.
+
+    Server-generated timestamp only -- the client never supplies a value
+    (prevents timestamp forgery, C2). Raises ``ServiceError(404)`` for an unknown
+    agent so callers can map it to the same 404 the read/update routes use.
+
+    This is a thin metadata write: it does NOT touch ``enabled`` / ``status`` /
+    governance / capabilities (C2/C10). Last-writer-wins; no optimistic lock is
+    needed because a single timestamp column has no read-modify-write hazard.
+    """
+    agent = session.get(Agent, agent_id)
+    if agent is None:
+        raise ServiceError(404, f"agent 不存在: {agent_id}")
+    # Store naive UTC: ``now_utc()`` is tz-aware but SQLite columns round-trip
+    # naive (see ``aios.employee_bridge._naive_utc``); the liveness pre-filter in
+    # ``aios.scheduler._candidate`` compares in naive UTC (C4/C5).
+    agent.last_heartbeat_at = now_utc().replace(tzinfo=None)
+    session.add(agent)
     session.commit()
     session.refresh(agent)
     return agent

@@ -291,7 +291,7 @@ def test_alembic_single_head_is_w5_cost_evidence() -> None:
     cfg = Config(ROOT / "alembic.ini")
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
-    assert heads == ["20260907_0001_skill_system"]
+    assert heads == ["20260908_0001_runtime_heartbeat"]
 
 
 # ---------------------------------------------------------------------------

@@ -311,6 +311,13 @@ class Agent(SQLModel, table=True):
     # has NO dedicated index -- the ``(platform, external_ref)`` partial unique
     # index (migration 20260729_0001) provides tuple uniqueness instead.
     bootstrap_token_ref: str | None = Field(default=None)
+    # Runtime Thin Layer P1 (#RuntimeP1): liveness signal. Server-generated on
+    # heartbeat; never client-set. ``STALE`` is a COMPUTED state (see
+    # ``aios.scheduler._candidate`` liveness pre-filter), NOT a persisted enum --
+    # intentionally absent from ``AgentStatus``. Agents with
+    # ``last_heartbeat_at IS NULL`` are NOT treated as stale (fail-open) so the
+    # rollout does not mass-disable pre-existing agents.
+    last_heartbeat_at: datetime | None = Field(default=None)
 
 
 class AgentSecret(SQLModel, table=True):
