@@ -466,7 +466,27 @@ def test_migration_downgrade_fail_closed_with_row(tmp_path: Path) -> None:
     command.upgrade(cfg, LAST_DOWNGRADABLE)
     engine = create_engine(url)
     with Session(engine) as s:
-        s.add(Agent(id="agt_d", name="n", role="r", adapter_type="api"))
+        # Use raw SQL so the seeding survives future Agent columns that are NOT
+        # present at LAST_DOWNGRADABLE (e.g. Runtime P1 last_heartbeat_at).
+        s.execute(
+            text(
+                "INSERT INTO agent "
+                "(id, name, role, adapter_type, capabilities, permissions, "
+                "cost_policy, enabled) "
+                "VALUES (:id, :name, :role, :adapter_type, :capabilities, "
+                ":permissions, :cost_policy, :enabled)"
+            ),
+            {
+                "id": "agt_d",
+                "name": "n",
+                "role": "r",
+                "adapter_type": "api",
+                "capabilities": "[]",
+                "permissions": "[]",
+                "cost_policy": "{}",
+                "enabled": True,
+            },
+        )
         s.commit()
         s.add(
             AgentSecret(
