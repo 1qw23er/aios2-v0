@@ -1,4 +1,4 @@
-"""Contract tests for the W1 Workforce core entities (V1.1 minimum closed loop).
+﻿"""Contract tests for the W1 Workforce core entities (V1.1 minimum closed loop).
 
 These assert the structural + behavioural contracts that W1 must guarantee before
 any W2+ work (Candidate / Evaluation / Match / Employee) can be built on top:
@@ -368,7 +368,7 @@ def test_alembic_single_head_is_capreq_hardening() -> None:
     # (20260902_0001_workforce_recommendation) to the W4 Employee migration
     # (20260903_0002_workforce_employee), and W5 Cost Evidence advances it to
     # 20260906_0001_recommendation_trust_advisory.
-    assert heads == ["20260909_0002_task_run_lease"]
+    assert heads == ["20260909_0003_unified_attempt_usage_budget"]
 
 
 def test_migration_creates_workforce_tables_additively(tmp_path: Path) -> None:

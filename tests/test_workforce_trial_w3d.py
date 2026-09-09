@@ -1,4 +1,4 @@
-"""Contract tests for Workforce W3-D -- Trial (the W3-C -> W4 hand-off).
+﻿"""Contract tests for Workforce W3-D -- Trial (the W3-C -> W4 hand-off).
 
 Scope (see ``docs/workforce/Workforce_W3D_Trial_Spec_V1.md``):
 
@@ -688,7 +688,7 @@ def test_single_alembic_head() -> None:
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20260909_0002_task_run_lease"]
+    assert script.get_heads() == ["20260909_0003_unified_attempt_usage_budget"]
 
 
 def test_trial_table_shape_and_zero_explicit_indexes(tmp_path: Path) -> None:

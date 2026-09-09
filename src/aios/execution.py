@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import socket
@@ -29,9 +30,13 @@ from sqlmodel import Session, select
 
 from aios.context_render import render_task_context_markdown
 from aios.context_service import ContextService
+from aios.db import make_session
+from aios.execution_run import complete_local_run, create_local_run
 from aios.models import (
     Artifact,
     ArtifactType,
+    DelegatedRun,
+    DelegatedRunStatus,
     Task,
     TaskContext,
     TaskStatus,
@@ -45,6 +50,8 @@ from aios.task_run import (
     new_task_lease_owner,
     release_task_lease,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ExecutionResult(BaseModel):
@@ -610,22 +617,53 @@ class LLMExecutionAdapter:
                 "执行适配器未配置：请设置 AIOS_AGENT_API_KEY 环境变量",
                 category=AdapterErrorCategory.CONFIG_MISSING,
             )
+        project_id = getattr(task_context, "project_id", None)
         prompt = self._build_prompt(task_context, output_schema)
         # Retry loop: only TIMEOUT / NETWORK (see _RETRYABLE_CATEGORIES) are
         # retried. Non-retryable categories raise on the first attempt with a
-        # single outbound call. Attempt accounting is exposed on the result so
-        # execute_task can audit it. `last_sanitized` holds the redacted detail of
-        # the final failure (never the raw exception / secret).
+        # single outbound call. Each attempt records a DelegatedRun (LOCAL mode)
+        # so its usage / cost / budget accrue through the SAME unified path as a
+        # remote delegation (C: Unified Attempt + Usage + Budget Accrual).
         last_exc: ExecutionError | None = None
         attempts = 0
         max_attempts = 1 + self.max_retries
+        run: DelegatedRun | None = None
         for attempt in range(1, max_attempts + 1):
             attempts = attempt
+            # Record this local attempt as a DelegatedRun (LOCAL, no lease) before
+            # the call, so evidence/accounting is captured even when it fails.
+            # Best-effort: a recording failure must never fail the execution
+            # itself (the task result is still valid) -- we log and continue.
+            if project_id is not None:
+                try:
+                    with make_session() as s:
+                        run = create_local_run(
+                            s,
+                            task_id=task_id,
+                            project_id=project_id,
+                            attempt=attempt,
+                            idempotency_key=idempotency_key,
+                        )
+                except Exception:  # noqa: BLE001 - evidence is best-effort
+                    logger.warning(
+                        "failed to record local DelegatedRun for task %s attempt %d",
+                        task_id,
+                        attempt,
+                        exc_info=True,
+                    )
+                    run = None
             try:
                 recovery = None if attempt == 1 else self._RETRY_RECOVERY_HINT
-                raw = self._chat(prompt, attempt=attempt, recovery_hint=recovery)
+                content, usage = self._chat(
+                    prompt, attempt=attempt, recovery_hint=recovery
+                )
             except ExecutionError as exc:
                 last_exc = exc
+                # Terminalize the local run as FAILED with normalized, redacted
+                # evidence; a failed-but-paid attempt accrues via the unified path.
+                self._finish_local_run(
+                    run, DelegatedRunStatus.FAILED, error=_redact_secrets(exc.detail)
+                )
                 if exc.category in _RETRYABLE_CATEGORIES and attempt < max_attempts:
                     # Bounded sleep: exponential backoff capped at 30s. No secret
                     # or raw error text is carried into the recovery prompt.
@@ -635,13 +673,20 @@ class LLMExecutionAdapter:
                     continue
                 break  # non-retryable, or out of attempts
             else:
-                data = self._parse_json(raw)
+                data = self._parse_json(content)
                 if not isinstance(data, dict):
-                    raise ExecutionError(
+                    err = ExecutionError(
                         502,
                         "模型返回的不是 JSON 对象",
                         category=AdapterErrorCategory.PROVIDER_STRUCTURE,
                     )
+                    self._finish_local_run(
+                        run,
+                        DelegatedRunStatus.FAILED,
+                        error=_redact_secrets(err.detail),
+                    )
+                    last_exc = err
+                    break
                 artifacts = [
                     {
                         "type": "json",
@@ -656,6 +701,9 @@ class LLMExecutionAdapter:
                     artifacts=artifacts,
                     metadata={"attempts": attempts, "max_attempts": max_attempts},
                 )
+                # Terminalize as SUCCEEDED with real provider usage (None when the
+                # provider reports no token counts; never fabricated).
+                self._finish_local_run(run, DelegatedRunStatus.SUCCEEDED, usage=usage)
                 return result
         # All attempts exhausted (or a non-retryable category on the first try).
         assert last_exc is not None  # loop either raised or stored last_exc
@@ -670,6 +718,31 @@ class LLMExecutionAdapter:
         err.attempts = attempts_made
         err.max_attempts = max_attempts
         raise err from last_exc
+
+    def _finish_local_run(
+        self,
+        run: DelegatedRun | None,
+        status: DelegatedRunStatus,
+        *,
+        error: str | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> None:
+        """Terminalize a local ``DelegatedRun`` (no-op when recording is off).
+
+        Best-effort: a recording failure must never fail the execution (the task
+        result is already valid); we log and continue.
+        """
+        if run is None:
+            return
+        try:
+            with make_session() as s:
+                complete_local_run(
+                    s, run_id=run.id, status=status, error=error, usage=usage
+                )
+        except Exception:  # noqa: BLE001 - evidence is best-effort
+            logger.warning(
+                "failed to finalize local DelegatedRun %s", run.id, exc_info=True
+            )
 
     # Hint appended to the prompt on retry attempts. Deliberately contains NO
     # error text, exception string, or secret — just instructs the model to
@@ -766,13 +839,22 @@ class LLMExecutionAdapter:
                 502, f"模型调用失败：{exc}", category=AdapterErrorCategory.UNKNOWN
             ) from exc
         try:
-            return body["choices"][0]["message"]["content"]
+            content = body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise ExecutionError(
                 502,
                 f"模型返回结构异常：{exc}",
                 category=AdapterErrorCategory.PROVIDER_STRUCTURE,
             ) from exc
+        # Normalized usage evidence (C: Usage Normalization). Only the REAL
+        # provider usage object is surfaced; if the provider did not report
+        # token counts we return None (deliberately distinct from an empty dict)
+        # so "no measurement" is never silently treated as "zero usage". AIOS
+        # never fabricates token counts.
+        usage = body.get("usage") if isinstance(body, dict) else None
+        if not isinstance(usage, dict):
+            usage = None
+        return content, usage
 
     @staticmethod
     def _parse_json(text: str) -> Any:

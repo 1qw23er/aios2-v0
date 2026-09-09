@@ -637,14 +637,21 @@ class RetryingLLMExecutionAdapter(LLMExecutionAdapter):
         self._failures = list(failures)
         self.calls = 0
 
-    def _chat(self, prompt: str, *, attempt: int = 1, recovery_hint: str | None = None) -> str:
+    def _chat(
+        self,
+        prompt: str,
+        *,
+        attempt: int = 1,
+        recovery_hint: str | None = None,
+    ) -> tuple[str, dict | None]:
         self.calls += 1
         if self._failures:
             category, detail = self._failures.pop(0)
             status = 504 if category == AdapterErrorCategory.TIMEOUT else 502
             raise ExecutionError(status, detail, category=category)
-        # Success: returns a valid JSON object string expected by run()/_parse_json.
-        return '{"summary": "ok", "data": {}}'
+        # Success: returns a valid JSON object string expected by run()/_parse_json,
+        # plus normalized usage evidence (None => provider reported no token counts).
+        return '{"summary": "ok", "data": {}}', None
 
 
 def _ctx_and_schema():
@@ -709,7 +716,13 @@ def test_recovery_prompt_is_sanitized_no_raw_error() -> None:
     captured = {}
 
     class SpyAdapter(RetryingLLMExecutionAdapter):
-        def _chat(self, prompt: str, *, attempt: int = 1, recovery_hint: str | None = None) -> str:
+        def _chat(
+            self,
+            prompt: str,
+            *,
+            attempt: int = 1,
+            recovery_hint: str | None = None,
+        ) -> tuple[str, dict | None]:
             if attempt == 2:
                 captured["hint"] = recovery_hint
             return super()._chat(prompt, attempt=attempt, recovery_hint=recovery_hint)

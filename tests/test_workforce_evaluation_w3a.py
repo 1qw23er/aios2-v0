@@ -1,4 +1,4 @@
-"""Contract tests for Workforce W3-A -- Candidate Evaluation.
+﻿"""Contract tests for Workforce W3-A -- Candidate Evaluation.
 
 Scope: the *Evaluation* half of the W3 loop only (POOLED -> EVALUATING ->
 EVALUATED). Match / Benchmark / Recommendation / Trial stay in later stages.
@@ -682,7 +682,7 @@ def test_w3a_is_zero_migration(tmp_path: Path) -> None:
     # Recommendation to 20260902_0001_workforce_recommendation, W3-D Trial to
     # 20260903_0002_workforce_employee, and W5 Cost Evidence to
     # 20260906_0001_recommendation_trust_advisory.
-    assert heads == ["20260909_0002_task_run_lease"]
+    assert heads == ["20260909_0003_unified_attempt_usage_budget"]
 
     url = f"sqlite:///{(tmp_path / 'zeromig.db').as_posix()}"
     run_migrations(url)

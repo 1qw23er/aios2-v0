@@ -1,4 +1,4 @@
-"""Work-log & knowledge-capture system tests (#88).
+﻿"""Work-log & knowledge-capture system tests (#88).
 
 Covers plan §11 (docs/issue-88-implementation-plan.md): model/enum additions,
 the 20260728_0009 migration (empty-data round trip, fail-closed populated
@@ -52,7 +52,7 @@ from aios.work_log import (
 )
 from alembic import command
 
-HEAD = "20260909_0002_task_run_lease"
+HEAD = "20260909_0003_unified_attempt_usage_budget"
 PREV = "20260727_0008"
 # Lowest revision these ORM-seeding tests upgrade to. The migrations above it
 # form a chain of one-way doors:

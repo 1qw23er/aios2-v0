@@ -1,4 +1,4 @@
-"""Migration proof for PR #124 -- persist owner-inbox cross-thread series_id.
+﻿"""Migration proof for PR #124 -- persist owner-inbox cross-thread series_id.
 
 Asserts from several angles:
 * the Alembic tree still has a single head (now ``20260906_0001_recommendation_trust_advisory``);
@@ -37,7 +37,7 @@ from aios.db import get_engine, run_migrations
 from alembic import command
 
 # Current single leaf of the whole tree (what #124 owns + advances).
-HEAD = "20260909_0002_task_run_lease"
+HEAD = "20260909_0003_unified_attempt_usage_budget"
 SERIES_REVISION = "20260820_0001_series_id"
 SERIES_FILE = "20260820_0001_series_id.py"
 # Previous leaf: the SalesPlaybook V0 follow-up slice. #124 chains directly after it.

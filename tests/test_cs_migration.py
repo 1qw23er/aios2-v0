@@ -1,4 +1,4 @@
-"""Migration proof for the #109 customer-service implementation (plan §2.4 / §7 T1, T20).
+﻿"""Migration proof for the #109 customer-service implementation (plan §2.4 / §7 T1, T20).
 
 Asserts from several angles:
 * the Alembic tree still has a single head (now ``20260906_0001_recommendation_trust_advisory``, the
@@ -26,7 +26,7 @@ from aios.models import Project
 
 # Current single leaf of the whole tree. Later slices legitimately advance it;
 # what #109 owns is CS_REVISION, which must stay in the chain.
-HEAD = "20260909_0002_task_run_lease"
+HEAD = "20260909_0003_unified_attempt_usage_budget"
 CS_REVISION = "20260731_0001"
 CS_FILE = "20260731_0001_customer_service.py"
 PREV = "20260730_0001_agent_secret.py"

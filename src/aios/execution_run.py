@@ -44,7 +44,13 @@ from sqlalchemy import or_, update
 from sqlmodel import Session, select
 
 from aios.audit import AuditEvent, append_audit
-from aios.models import DelegatedRun, DelegatedRunStatus, new_id, now_utc
+from aios.models import (
+    DelegatedRun,
+    DelegatedRunStatus,
+    DelegationMode,
+    new_id,
+    now_utc,
+)
 
 # --- Lease -----------------------------------------------------------------
 
@@ -293,8 +299,110 @@ def complete_run(
         .values(**values)
     )
     result = session.execute(stmt)
+    if result.rowcount != 1:
+        session.commit()
+        return False
+    # Unified budget accrual participates in the same transaction as the
+    # terminal transition. ``accrue_run_budget`` is the SOLE writer of
+    # ``Project.budget_used`` (governance invariant); imported lazily to avoid a
+    # load-time cycle (delegation imports execution_run). A terminal, chargeable
+    # run is charged exactly once -- SUCCEEDED, FAILED (paid), or EXPIRED.
+    from aios.delegation import accrue_run_budget
+
+    accrue_run_budget(session, run_id=run_id, now=now_naive)
     session.commit()
-    return result.rowcount == 1
+    return True
+
+
+# --- Local (synchronous LLM) attempts ---------------------------------------
+
+# The department ``LLMExecutionAdapter`` runs the model synchronously in-process.
+# For unified accounting (C: Unified Attempt + Usage + Budget Accrual) every
+# local attempt records the SAME ``DelegatedRun`` entity a remote delegation
+# does -- there is no separate ``LocalRun`` / ``RemoteRun`` split. The only
+# differences are ``delegation_mode = LOCAL`` and ``agent_id = None`` (no
+# department agent is resolved for an in-process call). Local runs carry no
+# execution lease: the calling process is the sole writer while it is alive, and
+# if it dies mid-call the run is left SUBMITTED with no lease, so recovery
+# reclaims it to EXPIRED (fail-closed) -- exactly like a stranded remote run.
+
+
+def create_local_run(
+    session: Session,
+    *,
+    task_id: str,
+    project_id: str,
+    attempt: int,
+    idempotency_key: str,
+) -> DelegatedRun:
+    """Persist one local LLM attempt as a ``DelegatedRun`` (``delegation_mode=LOCAL``).
+
+    No lease is taken: a local run is single-process and terminalizes before the
+    call returns. Returns the persisted row.
+    """
+    run = DelegatedRun(
+        project_id=project_id,
+        task_id=task_id,
+        agent_id=None,
+        delegation_mode=DelegationMode.LOCAL,
+        attempt=attempt,
+        idempotency_key=idempotency_key,
+        status=DelegatedRunStatus.SUBMITTED,
+        lease_owner=None,
+        lease_expires_at=None,
+    )
+    session.add(run)
+    session.commit()
+    return run
+
+
+def complete_local_run(
+    session: Session,
+    *,
+    run_id: str,
+    status: DelegatedRunStatus,
+    error: str | None = None,
+    usage: dict[str, Any] | None = None,
+    cost: float = 0.0,
+    now: datetime | None = None,
+) -> bool:
+    """Terminalize a local ``DelegatedRun`` and accrue budget exactly once.
+
+    A plain id-only fence (the local process is the sole owner) moves the run to
+    its terminal state and records normalized usage / real cost. Budget accrual
+    then flows through the SAME ``accrue_run_budget`` path as every other
+    terminal run (SUCCEEDED / FAILED / EXPIRED), so a *failed-but-paid* local
+    attempt is charged exactly like a remote one. ``cost`` is the real provider
+    cost when known; a missing/zero cost is never fabricated into a charge.
+
+    Returns True if the run was terminalized by this call.
+    """
+    now_naive = _naive_utc(now or now_utc())
+    values: dict[str, Any] = {
+        "status": status,
+        "finished_at": now_naive,
+    }
+    if error is not None:
+        values["error"] = error
+    if usage is not None:
+        values["usage"] = usage
+    if cost:
+        values["cost"] = cost
+    stmt = (
+        update(DelegatedRun)
+        .where(DelegatedRun.id == run_id)
+        .where(DelegatedRun.status.notin_(SETTLED_RUN_STATUSES))
+        .values(**values)
+    )
+    result = session.execute(stmt)
+    if result.rowcount != 1:
+        session.commit()
+        return False
+    from aios.delegation import accrue_run_budget
+
+    accrue_run_budget(session, run_id=run_id, now=now_naive)
+    session.commit()
+    return True
 
 
 # --- Recovery --------------------------------------------------------------
@@ -433,6 +541,12 @@ def recover_stranded_runs(
         remote_run_id = run.remote_run_id
         if not _claim_and_expire(session, run_id=run.id, owner=recovery_owner, now=now):
             continue  # another recovery worker won this run
+        # A reclaimed EXPIRED run participates in the same unified accrual path
+        # as every other terminal run: if it carried a (paid) cost before
+        # stranding, it is charged exactly once here (idle for cost == 0).
+        from aios.delegation import accrue_run_budget
+
+        accrue_run_budget(session, run_id=run.id, now=now)
         # Governance-sensitive: the audit carries the transition, the reason and
         # both owner identities. Only opaque, non-secret fields are included --
         # never secret_ref, context_ref, endpoint or credential material.

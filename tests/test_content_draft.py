@@ -1,4 +1,4 @@
-"""Personal-IP content & monetization workflow tests (#108-A).
+﻿"""Personal-IP content & monetization workflow tests (#108-A).
 
 Implements the TDD plan from ``docs/issue-108-a-plan.md`` (v3). Covers the
 service-layer contracts (creation, locked update, independent review, owner
@@ -48,7 +48,7 @@ from aios.models import (
 )
 from aios.services import ServiceError
 
-HEAD = "20260909_0002_task_run_lease"
+HEAD = "20260909_0003_unified_attempt_usage_budget"
 
 OWNER = ActorContext(kind="owner", owner_id="owner")
 AGENT_PRODUCER = ActorContext(kind="agent", agent_id="producer-1")
