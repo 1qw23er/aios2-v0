@@ -11,6 +11,8 @@ data/
 
 # Local pytest scratch (basetemp override; must stay out of the working tree).
 .pytest_tmp/
+# Per-run pytest basetemp scratch (e.g. .pytest-c1/, .pytest-w1/); never commit.
+.pytest-*/
 
 # Historical UAT scratch database (pre-dates tracking; never commit).
 uat_v1_2.db
