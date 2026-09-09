@@ -501,3 +501,36 @@ def test_lease_owner_is_an_opaque_token_not_a_domain_identity() -> None:
     owner = new_task_lease_owner()
     assert owner.startswith("lease_")
     assert "agt" not in owner and "emp" not in owner
+
+
+# --- Lifespan integration wiring (GAP-1 hotfix) ----------------------------
+
+
+def test_lifespan_startup_invokes_task_recovery(owner_app, monkeypatch) -> None:
+    """The FastAPI lifespan must invoke the task-level startup recovery.
+
+    Integration-wiring regression (GAP-1): ``recover_stranded_tasks_at_startup``
+    existed but had zero call sites -- the lifespan only ran the run-level
+    pass -- so a restart left RUNNING tasks stranded (permanent 409) until the
+    owner manually called ``POST /tasks/recover``.
+
+    The recorders patch the two module-level startup entry points; the lifespan
+    imports them at call time, so the patch is observed exactly when startup
+    executes. Run-level recovery must keep firing too, in the documented
+    order (runs first, then tasks).
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "aios.execution_run.recover_stranded_runs_at_startup",
+        lambda: calls.append("run"),
+    )
+    monkeypatch.setattr(
+        "aios.task_run.recover_stranded_tasks_at_startup",
+        lambda: calls.append("task"),
+    )
+    # Entering the TestClient context runs the lifespan exactly once; no HTTP
+    # interaction is needed because the subject under test is the startup hook.
+    with TestClient(owner_app, follow_redirects=False):
+        assert calls == ["run", "task"]
+    # Exiting the context (shutdown) must not re-run recovery: one shot at boot.
+    assert calls == ["run", "task"]
