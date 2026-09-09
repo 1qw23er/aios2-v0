@@ -114,7 +114,15 @@ class FakeAdapter(DelegatedExecutionAdapter):
     fail_submit = False
     never_finish = False
 
-    def submit(self, *, delegated_run, projected_context, output_schema, remote_callback_url):
+    def submit(
+        self,
+        *,
+        delegated_run,
+        projected_context,
+        output_schema,
+        remote_callback_url,
+        remote_callback_token=None,
+    ):
         if self.fail_submit:
             raise DelegatedExecutionError("submit boom")
         return {"remote_run_id": f"fake:{delegated_run.id}", "remote_status": "running"}
