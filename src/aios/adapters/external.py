@@ -125,7 +125,15 @@ class WorkstationAdapter(_DelegatedExecutionAdapter):
         super().__init__(agent=agent)
         self._ws = ExternalWorkstationAdapter(outbox=outbox, inbox=inbox)
 
-    def submit(self, *, delegated_run, projected_context, output_schema, remote_callback_url):
+    def submit(
+        self,
+        *,
+        delegated_run,
+        projected_context,
+        output_schema,
+        remote_callback_url,
+        remote_callback_token: str | None = None,
+    ):
         packet = {
             "task_id": delegated_run.task_id,
             "project": {"id": delegated_run.project_id},

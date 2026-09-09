@@ -676,7 +676,7 @@ def test_w3b_migration_is_single_head_additive_reversible(
     cfg = Config(ROOT / "alembic.ini")
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_heads() == ["20260909_0003_unified_attempt_usage_budget"]
+    assert script.get_heads() == ["20260909_0004_callback_ingest"]
 
     db_path = tmp_path / "mig.db"
     url = f"sqlite:///{db_path.as_posix()}"
@@ -697,7 +697,7 @@ def test_w3b_migration_is_single_head_additive_reversible(
     jv_cols = [r[1] for r in conn.execute("PRAGMA table_info(job_version)")]
     assert "benchmark_version_id" in jv_cols
     version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-    assert version == "20260909_0003_unified_attempt_usage_budget"
+    assert version == "20260909_0004_callback_ingest"
     conn.close()
 
     # Reversible: downgrade to the prior W3-A head removes the 4 tables + column.
@@ -721,3 +721,4 @@ def test_w3b_migration_is_single_head_additive_reversible(
     ).fetchone()[0]
     assert version_after == "20260827_0002_workforce_candidate"
     conn.close()
+

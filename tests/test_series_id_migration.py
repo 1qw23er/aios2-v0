@@ -37,7 +37,7 @@ from aios.db import get_engine, run_migrations
 from alembic import command
 
 # Current single leaf of the whole tree (what #124 owns + advances).
-HEAD = "20260909_0003_unified_attempt_usage_budget"
+HEAD = "20260909_0004_callback_ingest"
 SERIES_REVISION = "20260820_0001_series_id"
 SERIES_FILE = "20260820_0001_series_id.py"
 # Previous leaf: the SalesPlaybook V0 follow-up slice. #124 chains directly after it.
@@ -716,3 +716,4 @@ def test_json_guard_is_current_head() -> None:
     _, _, sd = _script_dir()
     assert sd.get_heads() == [HEAD]
     assert sd.get_revision("20260824_0001_series_id_json_guard").down_revision == SERIES_REVISION
+

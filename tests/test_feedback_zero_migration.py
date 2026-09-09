@@ -30,7 +30,7 @@ from aios.feedback import (
 )
 from aios.models import Artifact, ArtifactType, Event, Project, Task
 
-HEAD = "20260909_0003_unified_attempt_usage_budget"
+HEAD = "20260909_0004_callback_ingest"
 
 
 # Shared DB fixtures (mirror tests/test_feedback.py; pytest fixtures are
@@ -232,3 +232,4 @@ def _transition(session, fb, transition):
         actor=_owner(),
         transition=transition,
     )
+

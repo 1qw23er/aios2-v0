@@ -35,6 +35,19 @@ class AuditEvent(StrEnum):
     # fail-closed recovery scan and made retryable again. Pure code addition --
     # StrEnum values are stored as plain VARCHAR, so no migration is required.
     TASK_RUN_RECOVERED = "task.run_recovered"
+    # Callback / Webhook Ingest P1: an authenticated inbound provider callback
+    # was acknowledged. These record *why* a callback had no effect (duplicate /
+    # late / conflicting / unknown run), which is the only place that
+    # distinction is allowed to exist -- the HTTP response is identical for all
+    # of them so an external caller can never infer run existence. Pure code
+    # addition -- StrEnum values are stored as plain VARCHAR, so no Alembic
+    # migration is required.
+    DELEGATION_CALLBACK_RECEIVED = "delegation.callback_received"
+    DELEGATION_CALLBACK_DUPLICATE = "delegation.callback_duplicate"
+    DELEGATION_CALLBACK_CONFLICT = "delegation.callback_conflict"
+    DELEGATION_CALLBACK_LATE = "delegation.callback_late"
+    DELEGATION_CALLBACK_INVALID = "delegation.callback_invalid"
+    DELEGATION_CALLBACK_EXPIRED = "delegation.callback_expired"
 
 # Dict keys whose *values* are credentials and must never be persisted.
 SECRET_KEYS = {"secret", "token", "password", "credential", "api_key", "api-key"}

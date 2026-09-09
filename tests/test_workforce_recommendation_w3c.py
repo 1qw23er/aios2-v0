@@ -1648,7 +1648,7 @@ def test_w3c_migration_is_single_head_and_reversible(tmp_path: Path) -> None:
     cfg = Config(ROOT / "alembic.ini")
     cfg.set_main_option("script_location", str(ROOT / "alembic"))
     assert ScriptDirectory.from_config(cfg).get_heads() == [
-        "20260909_0003_unified_attempt_usage_budget"
+        "20260909_0004_callback_ingest"
     ]
 
     db_path = tmp_path / "mig_w3c.db"
@@ -1675,7 +1675,7 @@ def test_w3c_migration_is_single_head_and_reversible(tmp_path: Path) -> None:
     version = conn.execute(
         "SELECT version_num FROM alembic_version"
     ).fetchone()[0]
-    assert version == "20260909_0003_unified_attempt_usage_budget"
+    assert version == "20260909_0004_callback_ingest"
     conn.close()
 
     # 30: reversible -- downgrade removes the W3-C table + indexes, nothing else.
@@ -1784,3 +1784,4 @@ def test_withdrawn_rebuild_refuses_unresolvable_evidence_422(
         assert cand.status == CandidateStatus.EVALUATED
         # Only the original proposal exists -- the failed rebuild wrote nothing.
         assert len(_audits(session, "recommendation.proposed")) == 1
+

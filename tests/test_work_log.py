@@ -52,7 +52,7 @@ from aios.work_log import (
 )
 from alembic import command
 
-HEAD = "20260909_0003_unified_attempt_usage_budget"
+HEAD = "20260909_0004_callback_ingest"
 PREV = "20260727_0008"
 # Lowest revision these ORM-seeding tests upgrade to. The migrations above it
 # form a chain of one-way doors:
@@ -1318,3 +1318,4 @@ def test_artifact_trigger_survives_0009(tmp_path: Path) -> None:
         )
         with pytest.raises(IntegrityError):
             session.commit()
+

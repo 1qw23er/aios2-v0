@@ -38,6 +38,12 @@ from typing import Any, Protocol
 from sqlmodel import Session
 
 from aios.audit import AuditEvent, append_audit, redact_secrets
+from aios.callback_ingest import (
+    CALLBACK_TTL_GRACE_SECONDS,
+    build_callback_url,
+    callback_signal,
+    mint_callback_token,
+)
 from aios.execution_run import (
     acquire_run_lease,
     complete_run,
@@ -118,6 +124,10 @@ class DelegatedAdapter(Protocol):
         projected_context: dict[str, Any],
         output_schema: dict[str, Any],
         remote_callback_url: str | None,
+        # Callback / Webhook Ingest P1: minimal, backwards-compatible extension.
+        # The run-scoped HMAC token travels as a SEPARATE field (never inside the
+        # URL) so it cannot be captured by access logs / proxies / APM.
+        remote_callback_token: str | None = None,
     ) -> dict[str, Any]:
         """Return {"remote_run_id": ..., "remote_status": ...}."""
 
@@ -364,12 +374,32 @@ class DelegatedExecutionAdapter:
                     est = float(getattr(ctx_task, "estimated_cost", 0.0) or 0.0)
                     check_budget(s, project, est)
             run = self._create_run(task_id, idempotency_key, attempt)
+            # Callback / Webhook Ingest P1: mint a run-scoped token + the
+            # AIOS-hosted callback URL for THIS run/attempt. Best-effort by
+            # design -- if the owner signing key is not configured we simply
+            # fall back to today's polling-only behaviour, because a callback is
+            # an accelerator and never a correctness dependency. The token is
+            # never persisted and never placed in the URL.
+            callback_url = None
+            callback_token = None
+            try:
+                callback_url = build_callback_url(run.id)
+                callback_token = mint_callback_token(
+                    run_id=run.id,
+                    attempt=attempt,
+                    agent_id=self.agent.id,
+                    ttl_seconds=self.timeout_s + CALLBACK_TTL_GRACE_SECONDS,
+                )
+            except Exception:  # noqa: BLE001 - callback is optional, never fatal
+                callback_url = None
+                callback_token = None
             try:
                 submit_info = self.submit(
                     delegated_run=run,
                     projected_context=projected,
                     output_schema=output_schema,
-                    remote_callback_url=self.agent.callback_url,
+                    remote_callback_url=callback_url,
+                    remote_callback_token=callback_token,
                 )
                 self._record_submitted(run, submit_info)
                 final = self._wait_for_completion(run)
@@ -455,7 +485,15 @@ class DelegatedExecutionAdapter:
         # Defense in depth: the projection must never carry a credential value.
         return redact_secrets(projected)
 
-    def submit(self, *, delegated_run, projected_context, output_schema, remote_callback_url):
+    def submit(
+        self,
+        *,
+        delegated_run,
+        projected_context,
+        output_schema,
+        remote_callback_url,
+        remote_callback_token: str | None = None,
+    ):
         raise NotImplementedError
 
     def status(self, *, delegated_run):
@@ -530,6 +568,35 @@ class DelegatedExecutionAdapter:
             )
             s.commit()
 
+    def _completion_signal(self, run: DelegatedRun) -> dict[str, Any] | None:
+        """Return the staged callback evidence for ``run``, or ``None``.
+
+        Callback / Webhook Ingest P1. This is a READ: it does not terminalize,
+        does not accrue, and does not touch the lease. It only lets the polling
+        loop skip one remote ``status()`` round-trip when the provider already
+        told us the outcome. Terminalization stays in ``complete_run`` below.
+        """
+        with _session() as s:
+            persisted = s.get(DelegatedRun, run.id)
+            signal = callback_signal(persisted) if persisted is not None else None
+        if not signal or not signal.get("finished"):
+            return None
+        status = str(signal.get("status") or "")
+        terminal = {
+            "succeeded": DelegatedRunStatus.SUCCEEDED,
+            "failed": DelegatedRunStatus.FAILED,
+            "cancelled": DelegatedRunStatus.CANCELLED,
+        }.get(status, DelegatedRunStatus.FAILED)
+        return {
+            "remote_status": status,
+            "finished": True,
+            "error": signal.get("error"),
+            "cost": signal.get("cost"),
+            "usage": signal.get("usage"),
+            "terminal_status": terminal,
+            "source": "callback",
+        }
+
     def _wait_for_completion(self, run: DelegatedRun) -> dict[str, Any]:
         """Poll until finished (callback mode would instead be pushed).
 
@@ -545,7 +612,13 @@ class DelegatedExecutionAdapter:
                     raise DelegatedExecutionError(
                         f"delegated run {run.id} lost its execution lease"
                     )
-            info = self.status(delegated_run=run)
+            # Callback / Webhook Ingest P1: prefer already-staged callback
+            # EVIDENCE over another remote round-trip. This only substitutes
+            # where ``info`` comes from -- terminalization below is still
+            # ``complete_run``, still fenced on OUR lease.
+            info = self._completion_signal(run)
+            if info is None:
+                info = self.status(delegated_run=run)
             with _session() as s:
                 values: dict[str, Any] = {"remote_status": info.get("remote_status")}
                 if info.get("cost") is not None:
@@ -561,7 +634,7 @@ class DelegatedExecutionAdapter:
             if info.get("finished"):
                 # finished == the agent side completed; result is read at
                 # ingest time. A non-None error overrides to FAILED/EXPIRED.
-                terminal = (
+                terminal = info.get("terminal_status") or (
                     DelegatedRunStatus.FAILED
                     if info.get("error")
                     else DelegatedRunStatus.SUCCEEDED

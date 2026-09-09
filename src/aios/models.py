@@ -553,6 +553,20 @@ class DelegatedRun(SQLModel, table=True):
     # concurrent terminalizations, and recovery re-runs. ``None`` means not yet
     # accrued (or nothing to accrue: cost <= 0 is never fabricated into a charge).
     budget_accrued_at: datetime | None = Field(default=None)
+    # --- Callback / Webhook Ingest P1 (evidence only) -------------------------
+    # A provider may push its outcome to AIOS. The push is EVIDENCE, never
+    # authority: these two columns record *what the provider said, when*, under a
+    # run-scoped token. Nothing here is a status, a cost or a budget entry -- the
+    # lease-owning execution path stays the single terminal-status writer and
+    # ``delegation.accrue_run_budget`` stays the single budget writer.
+    # ``callback_payload`` is redacted provider input (untrusted, never
+    # authoritative) and always carries the token ``jti`` so a repeated delivery
+    # is detectable. No new entity -- no Callback / Webhook / Ingest table.
+    callback_received_at: datetime | None = Field(default=None)
+    # The annotation stays non-Optional (with ``default=None``) because SQLModel
+    # cannot resolve ``dict | None`` against ``sa_column=Column(JSON)``;
+    # nullability is enforced by the migration, exactly like ``usage`` above.
+    callback_payload: dict[str, Any] = Field(default=None, sa_column=Column(JSON))
 
 
 class Approval(SQLModel, table=True):
