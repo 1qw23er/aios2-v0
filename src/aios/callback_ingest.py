@@ -28,6 +28,12 @@ A callback is therefore an **accelerator, never a correctness dependency**: if
 it is lost, malformed, late, or never delivered, polling and recovery behave
 exactly as they did before this module existed.
 
+GAP-4 (late evidence): a callback that arrives after its run already settled
+is no longer silently dropped. The FIRST late delivery stages its evidence
+through the same ``callback_received_at`` CAS gate (first-wins, exactly like
+the received path) while the terminal status, cost, usage, lease and budget
+stay untouched; repeat deliveries classify as duplicate/conflict by ``jti``.
+
 No new entity is introduced (no ``Callback`` / ``WebhookEvent`` / ``Ingest``
 table): the evidence lives in two nullable columns on ``DelegatedRun``.
 """
@@ -369,14 +375,18 @@ def ingest_callback(
     Ordering is deliberate:
 
     1. unknown run            -> ``unknown_run`` (2xx, audited, no leak)
-    2. already terminal       -> ``late``        (2xx, audited, never reopened)
-    3. same jti seen before   -> ``duplicate``   (2xx, audited, no rewrite)
-    4. different evidence set -> ``conflict``    (2xx, audited, first wins)
-    5. otherwise              -> ``received``    (evidence staged, nothing else)
+    2. same jti seen before   -> ``duplicate``   (2xx, audited, no rewrite)
+    3. different evidence set -> ``conflict``    (2xx, audited, first wins)
+    4. otherwise              -> evidence staged via the CAS gate:
+         - run still active   -> ``received``    (nothing else changes)
+         - run already terminal -> ``late``      (evidence kept, state frozen)
 
     The staging write is a single conditional UPDATE gated on
-    ``callback_received_at IS NULL``, so concurrent duplicate deliveries race
-    safely: exactly one wins, the rest are classified as duplicate/conflict.
+    ``callback_received_at IS NULL``, so concurrent deliveries race safely:
+    exactly one wins, the rest are classified as duplicate/conflict. A
+    ``late`` delivery therefore PERSISTS its evidence (first-wins) on the
+    terminal run while changing no status, cost, usage, lease or budget:
+    callback remains evidence, never authority, and the run is never reopened.
     """
     stamp = _naive_utc(now) if now is not None else _naive_utc(_now())
     jti = claims.jti
@@ -414,20 +424,6 @@ def ingest_callback(
         )
         session.commit()
         return CallbackIngestResult(outcome="unknown_run", run_id=run_id, jti=jti)
-
-    if run.status in TERMINAL_RUN_STATUSES:
-        _audit(
-            session,
-            action=AuditEvent.DELEGATION_CALLBACK_LATE,
-            run_id=run_id,
-            jti=jti,
-            outcome="late",
-            project_id=run.project_id,
-            task_id=run.task_id,
-            nonce=uuid.uuid4().hex[:8],
-        )
-        session.commit()
-        return CallbackIngestResult(outcome="late", run_id=run_id, jti=jti)
 
     existing = run.callback_payload
     if isinstance(existing, dict) and existing:
@@ -490,6 +486,26 @@ def ingest_callback(
         )
         session.commit()
         return CallbackIngestResult(outcome=outcome, run_id=run_id, jti=jti)
+
+    if run.status in TERMINAL_RUN_STATUSES:
+        # GAP-4: this delivery lost the timing race against the run's own
+        # completion. The evidence above is still staged (first-wins via the
+        # same CAS gate), the outcome is audited as ``late``, and NOTHING else
+        # moves: no status rewrite, no cost/usage apply, no accrual, no lease
+        # touch. Evidence, not authority -- the run stays exactly as the
+        # lease-owning completion path left it.
+        _audit(
+            session,
+            action=AuditEvent.DELEGATION_CALLBACK_LATE,
+            run_id=run_id,
+            jti=jti,
+            outcome="late",
+            project_id=run.project_id,
+            task_id=run.task_id,
+            nonce=uuid.uuid4().hex[:8],
+        )
+        session.commit()
+        return CallbackIngestResult(outcome="late", run_id=run_id, jti=jti)
 
     _audit(
         session,
