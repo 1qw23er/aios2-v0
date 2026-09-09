@@ -454,6 +454,206 @@ def test_callback_for_expired_run_is_late(db) -> None:
     assert project.budget_used == 0.0  # callback is never a budget writer
 
 
+# --- Late evidence (GAP-4) --------------------------------------------------
+
+
+def test_late_callback_to_terminal_run_persists_evidence(db) -> None:
+    """GAP-4: the first late delivery to an already-terminal run is no longer
+    silently dropped -- it stages evidence through the same CAS gate while the
+    terminal state, money columns and lease stay untouched."""
+    project, agent, task = _seed(db, budget_limit=100.0)
+    run = _run(db, project_id=project.id, task_id=task.id, agent_id=agent.id)
+    acquire_run_lease(db, run_id=run.id, owner="w1")
+    complete_run(db, run_id=run.id, owner="w1", status=DelegatedRunStatus.FAILED)
+    db.refresh(run)
+    before = (
+        run.status,
+        run.finished_at,
+        run.cost,
+        run.lease_owner,
+        run.lease_expires_at,
+    )
+    result = ingest_callback(
+        db,
+        run_id=run.id,
+        claims=_claims(run_id=run.id, agent_id=agent.id, jti="late-ev"),
+        payload=_payload(status="succeeded", cost=5.0, usage={"t": 2}),
+        now=_naive_now(),
+    )
+    assert result.outcome == "late"
+    db.refresh(run)
+    assert run.callback_received_at is not None
+    assert run.callback_payload["jti"] == "late-ev"
+    assert run.callback_payload["status"] == "succeeded"
+    assert run.callback_payload["cost"] == 5.0
+    assert run.callback_payload["usage"] == {"t": 2}
+    # Evidence, not authority: nothing about the terminal run moved.
+    assert (
+        run.status,
+        run.finished_at,
+        run.cost,
+        run.lease_owner,
+        run.lease_expires_at,
+    ) == before
+    assert run.usage is None
+    db.refresh(project)
+    assert project.budget_used == pytest.approx(0.0)
+    late_audits = [
+        entry
+        for entry in db.exec(
+            select(AuditLog).where(AuditLog.resource_id == run.id)
+        ).all()
+        if entry.after_snapshot.get("outcome") == "late"
+    ]
+    assert late_audits, "late delivery must be audited as outcome=late"
+
+
+def test_second_late_callback_same_jti_is_duplicate_first_wins(db) -> None:
+    """GAP-4: once the first late delivery has staged evidence on a terminal
+    run, a replay of the SAME delivery is a duplicate -- first evidence wins
+    and the CAS gate is never reopened."""
+    project, agent, task = _seed(db)
+    run = _run(
+        db,
+        project_id=project.id,
+        task_id=task.id,
+        agent_id=agent.id,
+        status=DelegatedRunStatus.EXPIRED,
+    )
+    claims = _claims(run_id=run.id, agent_id=agent.id, jti="late-dup")
+    first = ingest_callback(
+        db, run_id=run.id, claims=claims, payload=_payload(cost=2.0), now=_naive_now()
+    )
+    db.refresh(run)
+    first_ts = run.callback_received_at
+    second = ingest_callback(
+        db, run_id=run.id, claims=claims, payload=_payload(cost=2.0), now=_naive_now()
+    )
+    assert first.outcome == "late"
+    assert second.outcome == "duplicate"
+    db.refresh(run)
+    assert run.callback_received_at == first_ts
+    assert run.callback_payload["jti"] == "late-dup"
+    assert run.status == DelegatedRunStatus.EXPIRED
+
+
+def test_second_late_callback_different_jti_is_conflict(db) -> None:
+    """GAP-4: a different-jti late delivery on a terminal run conflicts and
+    never overwrites the first evidence."""
+    project, agent, task = _seed(db)
+    run = _run(
+        db,
+        project_id=project.id,
+        task_id=task.id,
+        agent_id=agent.id,
+        status=DelegatedRunStatus.EXPIRED,
+    )
+    first = ingest_callback(
+        db,
+        run_id=run.id,
+        claims=_claims(run_id=run.id, agent_id=agent.id, jti="late-1"),
+        payload=_payload(status="succeeded"),
+        now=_naive_now(),
+    )
+    db.refresh(run)
+    first_ts = run.callback_received_at
+    second = ingest_callback(
+        db,
+        run_id=run.id,
+        claims=_claims(run_id=run.id, agent_id=agent.id, jti="late-2"),
+        payload=_payload(status="failed", error="contradiction"),
+        now=_naive_now(),
+    )
+    assert first.outcome == "late"
+    assert second.outcome == "conflict"
+    db.refresh(run)
+    assert run.callback_payload["jti"] == "late-1"
+    assert run.callback_payload["status"] == "succeeded"
+    assert run.callback_received_at == first_ts
+    assert run.status == DelegatedRunStatus.EXPIRED
+
+
+def test_late_callback_never_accrues_budget_or_terminalizes(db) -> None:
+    """GAP-4: even a cost-bearing terminal SUCCEEDED run stays exactly as it
+    is -- the callback stores its payload as evidence only and never accrues."""
+    project, agent, task = _seed(db, budget_limit=100.0)
+    run = _run(
+        db,
+        project_id=project.id,
+        task_id=task.id,
+        agent_id=agent.id,
+        status=DelegatedRunStatus.SUCCEEDED,
+        cost=7.0,
+    )
+    result = ingest_callback(
+        db,
+        run_id=run.id,
+        claims=_claims(run_id=run.id, agent_id=agent.id, jti="late-money"),
+        payload=_payload(status="succeeded", cost=42.0, usage={"tokens": 11}),
+        now=_naive_now(),
+    )
+    assert result.outcome == "late"
+    db.refresh(run)
+    assert run.status == DelegatedRunStatus.SUCCEEDED
+    assert run.cost == 7.0  # NOT the pushed 42.0
+    assert run.usage is None
+    assert run.callback_payload["cost"] == 42.0  # stored as evidence only
+    db.refresh(project)
+    assert project.budget_used == 0.0  # never a budget writer, even late
+
+
+def test_replay_of_preterminal_evidence_after_completion_is_duplicate(db) -> None:
+    """GAP-4 semantic change, pinned: evidence staged BEFORE terminalization,
+    then the run completes, then the same delivery replays -- it is now
+    classified duplicate (existing-evidence semantics) instead of late."""
+    project, agent, task = _seed(db)
+    run = _run(db, project_id=project.id, task_id=task.id, agent_id=agent.id)
+    claims = _claims(run_id=run.id, agent_id=agent.id, jti="pre-1")
+    assert (
+        ingest_callback(
+            db,
+            run_id=run.id,
+            claims=claims,
+            payload=_payload(cost=1.0),
+            now=_naive_now(),
+        ).outcome
+        == "received"
+    )
+    acquire_run_lease(db, run_id=run.id, owner="w1")
+    complete_run(db, run_id=run.id, owner="w1", status=DelegatedRunStatus.SUCCEEDED)
+    replay = ingest_callback(
+        db, run_id=run.id, claims=claims, payload=_payload(cost=1.0), now=_naive_now()
+    )
+    assert replay.outcome == "duplicate"
+    db.refresh(run)
+    assert run.status == DelegatedRunStatus.SUCCEEDED
+    assert run.callback_payload["jti"] == "pre-1"
+
+
+def test_http_late_callback_persists_evidence(client, db) -> None:
+    """GAP-4 over HTTP: a late delivery is acknowledged with the uniform body
+    AND its evidence is persisted; the run is not reopened."""
+    project, agent, task = _seed(db)
+    run = _run(db, project_id=project.id, task_id=task.id, agent_id=agent.id)
+    acquire_run_lease(db, run_id=run.id, owner="w1")
+    complete_run(db, run_id=run.id, owner="w1", status=DelegatedRunStatus.SUCCEEDED)
+    resp = client.post(
+        f"/runs/{run.id}/callback",
+        json={"status": "succeeded", "cost": 3.0},
+        headers={
+            CALLBACK_TOKEN_HEADER: _token(
+                run_id=run.id, agent_id=agent.id, jti="http-late"
+            )
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"received": True}
+    db.refresh(run)
+    assert run.status == DelegatedRunStatus.SUCCEEDED
+    assert run.callback_received_at is not None
+    assert run.callback_payload["jti"] == "http-late"
+
+
 def test_callback_after_lease_expiry_is_staged_but_not_terminal(db) -> None:
     project, agent, task = _seed(db)
     run = _run(db, project_id=project.id, task_id=task.id, agent_id=agent.id)
