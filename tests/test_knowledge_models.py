@@ -176,8 +176,8 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     # 20260906_0001_recommendation_trust_advisory, the W8-v2 Workforce
     # Execution Bridge slice 20260906_0002, and finally the Skill System V1
     # slice (skill_candidate / skill_review_decision / skill +
-    # task_context.applicable_skills): 20260909_0003_unified_attempt_usage_budget.
-    assert revision() == "20260909_0003_unified_attempt_usage_budget"
+    # task_context.applicable_skills): 20260909_0004_callback_ingest.
+    assert revision() == "20260909_0004_callback_ingest"
 
 
 def test_scope_unique_migration_round_trip(tmp_path: Path) -> None:
@@ -591,3 +591,4 @@ def test_scope_unique_downgrade_lossless_without_cross_scope(tmp_path: Path) -> 
     command.upgrade(config, "20260727_0008")
     assert revision() == "20260727_0008"
     assert set(constraint_columns()) == {"series_id", "version", "project_id"}
+

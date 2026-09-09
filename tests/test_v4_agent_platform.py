@@ -1190,7 +1190,7 @@ def test_alembic_single_new_head() -> None:
     cfg = Config(root / "alembic.ini")
     cfg.set_main_option("script_location", str(root / "alembic"))
     head = ScriptDirectory.from_config(cfg).get_current_head()
-    assert head == "20260909_0003_unified_attempt_usage_budget"
+    assert head == "20260909_0004_callback_ingest"
 
 
 def test_migration_adds_bootstrap_token_ref_no_second_index(v4_session) -> None:
@@ -1335,3 +1335,4 @@ def _make_project_via_client(client) -> str:
     )
     assert resp.status_code == 201
     return resp.json()["id"]
+

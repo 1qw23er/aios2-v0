@@ -682,7 +682,7 @@ def test_w3a_is_zero_migration(tmp_path: Path) -> None:
     # Recommendation to 20260902_0001_workforce_recommendation, W3-D Trial to
     # 20260903_0002_workforce_employee, and W5 Cost Evidence to
     # 20260906_0001_recommendation_trust_advisory.
-    assert heads == ["20260909_0003_unified_attempt_usage_budget"]
+    assert heads == ["20260909_0004_callback_ingest"]
 
     url = f"sqlite:///{(tmp_path / 'zeromig.db').as_posix()}"
     run_migrations(url)
@@ -751,3 +751,4 @@ def test_w2_discovery_and_lifecycle_semantics_unchanged(tmp_path: Path) -> None:
             CandidateStatus.REJECTED,
             CandidateStatus.RECOMMENDED,
         }
+

@@ -45,7 +45,15 @@ class RemoteApiAdapter(DelegatedExecutionAdapter):
         self._store: dict[str, dict[str, Any]] = {}  # in-process run registry for self-test
 
     # --- DelegatedAdapter surface ---
-    def submit(self, *, delegated_run, projected_context, output_schema, remote_callback_url):
+    def submit(
+        self,
+        *,
+        delegated_run,
+        projected_context,
+        output_schema,
+        remote_callback_url,
+        remote_callback_token: str | None = None,
+    ):
         # Resolve the secret handle -> actual key at call time (never stored).
         secret = self.resolve_secret(self.agent.secret_ref) if self.resolve_secret else None
         api_key = secret or ""
@@ -57,6 +65,10 @@ class RemoteApiAdapter(DelegatedExecutionAdapter):
             "output_schema": output_schema,
             "callback_url": remote_callback_url,
         }
+        # Callback / Webhook Ingest P1: the run-scoped token is a separate field,
+        # never part of the URL (a token in a URL leaks into access logs).
+        if remote_callback_token:
+            payload["callback_token"] = remote_callback_token
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"

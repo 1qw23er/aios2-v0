@@ -3013,6 +3013,15 @@ def create_app() -> FastAPI:
 
     register_task_run_routes(application)
 
+    # Callback / Webhook Ingest P1: the authenticated inbound signal surface for
+    # a delegated provider to push its run outcome. It is NOT owner-only -- it is
+    # authenticated by a run-scoped HMAC token -- and it stages EVIDENCE only:
+    # no status write, no budget write, no lease bypass.
+    # See src/aios/api/callback.py and src/aios/callback_ingest.py.
+    from aios.api.callback import register_callback_routes
+
+    register_callback_routes(application)
+
     return application
 
 

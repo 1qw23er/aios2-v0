@@ -51,8 +51,12 @@ class WorkerDelegatedAdapter:
         projected_context: dict[str, Any],
         output_schema: dict[str, Any],
         remote_callback_url: str | None,
+        remote_callback_token: str | None = None,
     ) -> dict[str, Any]:
         del remote_callback_url
+        # A worker-side execution is driven by AIOS polling the worker; the
+        # run-scoped callback token is accepted for contract symmetry only.
+        del remote_callback_token
         if delegated_run.id in self._envelopes:
             raise DelegatedExecutionError("worker execution already submitted for this attempt")
         if self._context_hash is None:

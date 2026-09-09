@@ -26,7 +26,7 @@ from aios.models import Project
 
 # Current single leaf of the whole tree. Later slices legitimately advance it;
 # what #109 owns is CS_REVISION, which must stay in the chain.
-HEAD = "20260909_0003_unified_attempt_usage_budget"
+HEAD = "20260909_0004_callback_ingest"
 CS_REVISION = "20260731_0001"
 CS_FILE = "20260731_0001_customer_service.py"
 PREV = "20260730_0001_agent_secret.py"
@@ -140,3 +140,4 @@ def test_alembic_version_is_new_head(migrated_engine):
     with migrated_engine.connect() as conn:
         v = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
     assert v == HEAD
+
