@@ -3022,6 +3022,15 @@ def create_app() -> FastAPI:
 
     register_callback_routes(application)
 
+    # Usage Metering P1: READ-ONLY cost/run projections over the existing
+    # DelegatedRun SSoT plus a report-only budget reconciliation endpoint.
+    # Owner-only; no new entity, no migration, and no write path of any kind
+    # (the W6 single budget writer in delegation.py is untouched).
+    # See src/aios/api/usage.py and src/aios/usage_metering.py.
+    from aios.api.usage import register_usage_routes
+
+    register_usage_routes(application)
+
     return application
 
 
