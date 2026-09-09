@@ -397,6 +397,15 @@ class Task(SQLModel, table=True):
     retry_count: int = 0
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
+    # Execution lease (Execution Run Lifecycle P0-B, see ``aios.task_run``):
+    # which process owns this task's RUNNING state, and until when. Both are
+    # nullable and never used for routing, attribution or ranking -- a crashed
+    # process must leave the task reclaimable. ``lease_owner`` is an opaque
+    # per-process token (``new_id("lease")``), never an ``agent_id`` /
+    # ``employee_id`` / runtime identity. ``lease_expires_at`` is stored naive
+    # UTC (SQLite round-trips naive, same convention as DelegatedRun's lease).
+    lease_owner: str | None = Field(default=None)
+    lease_expires_at: datetime | None = Field(default=None)
     # Structured idempotency key (server-determined identity). Used for the
     # Independent Review Protocol's owner-requested revision dedup (req 1):
     # ``review-revision:{source_artifact_id}:{next_review_round}``. Never derived

@@ -35,7 +35,7 @@ from aios.models import (
 )
 from alembic import command
 
-HEAD = "20260909_0001_execution_run_lease"
+HEAD = "20260909_0002_task_run_lease"
 BASE = "20260720_0005"
 # Lowest revision these ORM-seeding tests upgrade to. The migrations above it
 # form a chain of one-way doors:

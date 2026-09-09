@@ -3005,6 +3005,14 @@ def create_app() -> FastAPI:
 
     register_execution_run_routes(application)
 
+    # Execution Run Lifecycle P0-B: task-execution lifecycle surface over the
+    # EXISTING Task (no new execution entity) plus an explicit recovery
+    # invocation point. Owner-only; paths avoid the WORKFORCE_PREFIXES namespace.
+    # See src/aios/api/task_run.py and src/aios/task_run.py.
+    from aios.api.task_run import register_task_run_routes
+
+    register_task_run_routes(application)
+
     return application
 
 

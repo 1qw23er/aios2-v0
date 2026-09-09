@@ -30,6 +30,11 @@ class AuditEvent(StrEnum):
     # the fail-closed recovery scan. Pure code addition -- StrEnum values are
     # stored as plain VARCHAR, so no Alembic migration is required.
     DELEGATION_RUN_RECOVERED = "delegation.run_recovered"
+    # Execution Run Lifecycle P0-B: a task left in RUNNING by a crashed process
+    # (no valid lease, past the safety grace period) was reclaimed by the
+    # fail-closed recovery scan and made retryable again. Pure code addition --
+    # StrEnum values are stored as plain VARCHAR, so no migration is required.
+    TASK_RUN_RECOVERED = "task.run_recovered"
 
 # Dict keys whose *values* are credentials and must never be persisted.
 SECRET_KEYS = {"secret", "token", "password", "credential", "api_key", "api-key"}
