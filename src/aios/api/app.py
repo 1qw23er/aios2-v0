@@ -305,6 +305,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     from aios.execution_run import recover_stranded_runs_at_startup
 
     recover_stranded_runs_at_startup()
+    # Execution Run Lifecycle P0-B: reclaim stranded RUNNING tasks the same
+    # way -- no valid lease past the grace period -> FAILED (the retryable
+    # terminal). Same fail-closed one-shot contract as the run-level pass
+    # above: never resumes or retries an unknown execution (see aios.task_run).
+    from aios.task_run import recover_stranded_tasks_at_startup
+
+    recover_stranded_tasks_at_startup()
     yield
 
 
