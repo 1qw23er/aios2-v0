@@ -40,6 +40,8 @@ from aios.models import (
     Agent,
     AgentTrustLevel,
     DelegatedRun,
+    DelegatedRunStatus,
+    DelegationMode,
     Project,
     Task,
     TaskContext,
@@ -225,6 +227,67 @@ def test_budget_blocked_before_remote_execution(session: Session) -> None:
     assert "budget exceeded" in str(exc.value).lower()
     # No DelegatedRun was created (blocked before submit).
     runs = session.exec(select(DelegatedRun).where(DelegatedRun.task_id == task.id)).all()
+    assert runs == []
+
+
+def test_inflight_sibling_run_blocks_a_new_delegation(session: Session) -> None:
+    """GAP-2 end-to-end: an ALREADY in-flight run reserves its estimate, so a
+    concurrent second delegation in the same project is hard-blocked before
+    submit -- even though ``budget_used`` is still 0.0 (nothing has accrued
+    yet). This is the concurrent over-commit window, closed at the real gate
+    ``delegation.run`` uses, not just at the helper level."""
+    p, task_a = _seed(session, budget_limit=10.0, budget_used=0.0)
+    task_a.estimated_cost = 6.0
+    session.add(task_a)
+    session.commit()
+    session.refresh(task_a)
+    # A sibling run that is in flight right now (spend not yet accrued).
+    session.add(
+        DelegatedRun(
+            project_id=p.id,
+            task_id=task_a.id,
+            agent_id=None,
+            delegation_mode=DelegationMode.WORKSTATION,
+            status=DelegatedRunStatus.SUBMITTED,
+            idempotency_key="idem-gap2-inflight",
+            attempt=1,
+            cost=0.0,
+        )
+    )
+    session.commit()
+
+    task_b = Task(
+        project_id=p.id,
+        title="T2",
+        description="second concurrent delegation",
+        status=TaskStatus.READY,
+        output_schema=SCHEMA,
+        estimated_cost=5.0,
+    )
+    session.add(task_b)
+    session.commit()
+    session.refresh(task_b)
+
+    hermes = make_fake_hermes_agent("http://unused")
+    hermes.trust_level = AgentTrustLevel.VERIFIED_EXTERNAL
+    session.add(hermes)
+    session.commit()
+    session.refresh(hermes)
+
+    adapter = RemoteApiAdapter(agent=hermes, resolve_secret=lambda ref: "k")
+    with pytest.raises(BudgetExceededError) as exc:
+        adapter.run(
+            task_id=task_b.id,
+            task_context=_full_context(task_b, p),
+            output_schema=SCHEMA,
+            idempotency_key="idek-gap2-inflight",
+        )
+    # budget_used is still 0.0 -- the block came from the IN-FLIGHT projection.
+    session.refresh(p)
+    assert p.budget_used == 0.0
+    assert "budget exceeded" in str(exc.value).lower()
+    # No DelegatedRun was created for the blocked task (blocked before submit).
+    runs = session.exec(select(DelegatedRun).where(DelegatedRun.task_id == task_b.id)).all()
     assert runs == []
 
 

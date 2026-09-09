@@ -23,6 +23,8 @@ Security model (enforced here):
     delegated; ``experimental`` agents are hard-blocked.
   * Budget gate: a project over its ``budget_limit`` (positive limit) is
     hard-blocked before any remote call, failing safely with an explicit reason.
+    The projection covers accrued spend AND in-flight (not yet accrued) work,
+    so concurrent delegations cannot over-commit together (GAP-2 / ``check_budget``).
   * The agent may submit results but may NOT mutate Task / Approval /
     KnowledgeFact / downstream workflow state directly.
   * Idempotency key = H(task_id, agent_id, attempt); the remote honors it.
@@ -173,20 +175,74 @@ def assert_trust_delegable(agent: Agent) -> None:
         )
 
 
+# --- GAP-2: in-flight (concurrent) spend projection -------------------------
+# ``Project.budget_used`` holds ACCRUED spend only. A run that has been
+# submitted but has not terminalized yet has NOT been accrued, so a gate that
+# reads ``budget_used`` alone lets N concurrent delegations all pass inside the
+# same window and over-commit the project together. These are exactly the
+# statuses whose spend is still "in the air" -- the complement of
+# ``execution_run.TERMINAL_RUN_STATUSES`` (pinned by a test in
+# ``tests/test_unified_attempt_usage_budget.py``).
+INFLIGHT_RUN_STATUSES: tuple[DelegatedRunStatus, ...] = (
+    DelegatedRunStatus.SUBMITTED,
+    DelegatedRunStatus.RUNNING,
+)
+
+
+def projected_inflight_cost(session: Session, *, project_id: str) -> float:
+    """READ-TIME projection of this project's NOT-YET-ACCRUED spend (GAP-2).
+
+    Returns SUM(``Task.estimated_cost``) over the project's in-flight
+    ``DelegatedRun``s (``INFLIGHT_RUN_STATUSES``). Pure SELECT: it writes
+    nothing, so it can never become a second budget authority -- the single
+    ``Project.budget_used`` writer stays ``accrue_run_budget`` (W6 / BA-1).
+
+    Why the estimate and not a reservation ledger: a terminal run leaves this
+    projection at the same moment its REAL cost enters ``budget_used`` through
+    accrual, so the two never overlap and never leave a gap. A run is counted
+    at most once because at most one run per task can be in flight (the
+    at-most-once claim in ``task_run.claim_task_for_execution``).
+
+    Known bound (accepted): this is an estimate-based control. Two requests
+    admitted in a truly simultaneous race can still both read the same
+    in-flight set -- the residual TOCTOU window is bounded by the gap between
+    this SELECT and the run insert, not by the full run duration as before.
+    """
+    from sqlalchemy import func, select
+
+    total = session.execute(
+        select(func.coalesce(func.sum(Task.estimated_cost), 0.0))
+        .select_from(DelegatedRun)
+        .join(Task, Task.id == DelegatedRun.task_id)
+        .where(DelegatedRun.project_id == project_id)
+        .where(DelegatedRun.status.in_(INFLIGHT_RUN_STATUSES))
+    ).scalar_one()
+    return float(total or 0.0)
+
+
 def check_budget(session: Session, project: Project, estimated_cost: float) -> None:
     """HARD-block delegation when the project would exceed its budget limit.
 
     A ``budget_limit`` of 0.0 means *unenforced* (legacy / open projects). Any
-    positive limit is a hard ceiling on ``budget_used + estimated_cost``.
+    positive limit is a hard ceiling on::
+
+        projected = budget_used + in-flight estimates + this attempt's estimate
+
+    GAP-2: the middle term (``projected_inflight_cost``) reserves room for work
+    that is already running but has not been accrued yet, closing the
+    concurrent over-commit window where N delegations admitted together each
+    saw the same ``budget_used``. See that helper for the residual (bounded)
+    race this control accepts.
     """
     if project.budget_limit <= 0.0:
         return
-    projected = float(project.budget_used) + float(estimated_cost)
+    inflight = projected_inflight_cost(session, project_id=project.id)
+    projected = float(project.budget_used) + inflight + float(estimated_cost)
     if projected > float(project.budget_limit):
         raise BudgetExceededError(
             f"project {project.id} budget exceeded: limit={project.budget_limit:.4f}, "
-            f"used={project.budget_used:.4f}, estimated={estimated_cost:.4f} "
-            f"(projected={projected:.4f})"
+            f"used={project.budget_used:.4f}, in_flight={inflight:.4f}, "
+            f"estimated={estimated_cost:.4f} (projected={projected:.4f})"
         )
 
 
