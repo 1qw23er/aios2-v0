@@ -1,4 +1,4 @@
-"""T31 — zero-migration proof for the #110 feedback-loop implementation.
+﻿"""T31 — zero-migration proof for the #110 feedback-loop implementation.
 
 The feedback loop reuses existing primitives (Artifact / ArtifactType /
 AuditLog / Approval / ActorContext) and adds NO Alembic migration. This module
@@ -30,7 +30,7 @@ from aios.feedback import (
 )
 from aios.models import Artifact, ArtifactType, Event, Project, Task
 
-HEAD = "20260909_0002_task_run_lease"
+HEAD = "20260909_0003_unified_attempt_usage_budget"
 
 
 # Shared DB fixtures (mirror tests/test_feedback.py; pytest fixtures are

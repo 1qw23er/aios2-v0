@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from datetime import datetime
 from typing import Any, Protocol
 
 from sqlmodel import Session
@@ -179,6 +180,71 @@ def check_budget(session: Session, project: Project, estimated_cost: float) -> N
         )
 
 
+# Terminal states that may carry a (possibly positive) cost worth recording
+# against the project budget. ``CANCELLED`` is intentionally excluded: a
+# cancelled attempt did no billable work (cost is 0 in normal flows), so there
+# is nothing to accrue. ``SUCCEEDED`` / ``FAILED`` / ``EXPIRED`` are the
+# chargeable terminals -- crucially, a *failed-but-paid* attempt (the remote
+# provider billed before failing) is accrued here, fixing the P0 gap where paid
+# failures were never charged (C: Unified Attempt + Usage + Budget Accrual).
+ACCRUABLE_RUN_STATUSES: tuple[DelegatedRunStatus, ...] = (
+    DelegatedRunStatus.SUCCEEDED,
+    DelegatedRunStatus.FAILED,
+    DelegatedRunStatus.EXPIRED,
+)
+
+
+def accrue_run_budget(
+    session: Session,
+    *,
+    run_id: str,
+    now: datetime | None = None,
+) -> bool:
+    """Idempotently charge a terminal ``DelegatedRun`` to ``Project.budget_used``.
+
+    This is the SOLE writer of ``Project.budget_used`` (governance invariant
+    BA-1 / DR-D1-2: a single budget authority -- see
+    ``tests/test_workforce_w6_invariants.py::test_budget_used_has_exactly_one_writer``).
+
+    The gate UPDATE sets ``budget_accrued_at`` exactly once; the winning write
+    then adds ``cost`` to ``Project.budget_used`` (only when ``cost > 0``). The
+    gate makes this safe across retries, concurrent terminalizations, and
+    recovery re-runs: at most one caller ever charges the project. ``None`` /
+    zero cost is never fabricated into a charge.
+
+    Used by ``execution_run.complete_run`` (every remote terminal transition)
+    and recovery, so remote attempts, local LLM attempts, and reclaimed runs all
+    accrue through one path. Returns True if this call performed the accrual.
+    """
+    from sqlalchemy import select, update
+
+    now_naive = (now or now_utc()).replace(tzinfo=None)
+    claim = (
+        update(DelegatedRun)
+        .where(DelegatedRun.id == run_id)
+        .where(DelegatedRun.budget_accrued_at.is_(None))
+        .where(DelegatedRun.status.in_(ACCRUABLE_RUN_STATUSES))
+        .values(budget_accrued_at=now_naive)
+    )
+    if session.execute(claim).rowcount != 1:
+        # Already accrued, or not (yet) a terminal/chargeable state.
+        return False
+    # Fresh core SELECT: the in-memory run object may be detached/stale, so read
+    # the authoritative cost + project_id straight from the DB.
+    cost, project_id = session.execute(
+        select(DelegatedRun.cost, DelegatedRun.project_id).where(
+            DelegatedRun.id == run_id
+        )
+    ).one()
+    if cost > 0 and project_id:
+        project = session.get(Project, project_id)
+        if project is not None:
+            project.budget_used = float(project.budget_used) + cost
+            session.add(project)
+    session.commit()
+    return True
+
+
 class DelegatedExecutionAdapter:
     """Base for external-agent adapters.
 
@@ -274,11 +340,6 @@ class DelegatedExecutionAdapter:
         assert_trust_delegable(self.agent)
         # 2. Budget: hard-block over-budget projects with a safe, explicit failure.
         #    estimated_cost lives on the Task row (TaskContext has no such field),
-        #    so load it via task_context.task_id. Real delegation always carries a
-        #    full TaskContext; defensive getattr keeps self-tests / partial contexts
-        #    from crashing (the gate is simply skipped when identity is absent).
-        # 2. Budget: hard-block over-budget projects with a safe, explicit failure.
-        #    estimated_cost lives on the Task row (TaskContext has no such field),
         #    so load it via the context's project/task ids. Real delegation always
         #    carries a full TaskContext; defensive getattr keeps self-tests /
         #    partial contexts from crashing (the gate is simply skipped when the
@@ -286,16 +347,22 @@ class DelegatedExecutionAdapter:
         #    ``task_id`` run() parameter passed down to ``_create_run``.
         ctx_project_id = getattr(task_context, "project_id", None)
         ctx_task_id = getattr(task_context, "task_id", None)
-        if ctx_project_id is not None:
-            with _session() as s:
-                ctx_task = s.get(Task, ctx_task_id) if ctx_task_id is not None else None
-                project = s.get(Project, ctx_project_id)
-                est = float(getattr(ctx_task, "estimated_cost", 0.0) or 0.0)
-                check_budget(s, project, est)
 
         attempt = 1
         last_error: str | None = None
         while attempt <= self.max_retries:
+            # Per-attempt hard budget gate (C: Unified Attempt + Usage + Budget
+            # Accrual). Re-checked on EVERY attempt -- not once before the loop --
+            # so it observes ``Project.budget_used`` grow as prior (paid) attempts
+            # accrue. A costly retry sequence is therefore hard-blocked the moment
+            # the project goes over budget, closing the old "single pre-check is
+            # bypassed by retries" gap. ``est`` is this attempt's estimated cost.
+            if ctx_project_id is not None:
+                with _session() as s:
+                    ctx_task = s.get(Task, ctx_task_id) if ctx_task_id is not None else None
+                    project = s.get(Project, ctx_project_id)
+                    est = float(getattr(ctx_task, "estimated_cost", 0.0) or 0.0)
+                    check_budget(s, project, est)
             run = self._create_run(task_id, idempotency_key, attempt)
             try:
                 submit_info = self.submit(
@@ -344,10 +411,10 @@ class DelegatedExecutionAdapter:
                         idempotency_key=f"audit:validated:{run.id}:{new_id('k')}",
                     )
                     s.commit()
-                # Accrue budget from the actual run cost (0 if not reported).
-                self._accrue_budget(run)
                 # P0: the run reached a validated terminal outcome -- give up
-                # the lease so the record no longer looks in-flight.
+                # the lease so the record no longer looks in-flight. Budget
+                # accrual for this SUCCEEDED run is handled once, idempotently,
+                # inside ``complete_run`` (which calls ``accrue_run_budget``).
                 with _session() as s:
                     release_run_lease(s, run_id=run.id, owner=self._lease_owner)
                 return _to_execution_result(artifact_like, run)
@@ -525,25 +592,6 @@ class DelegatedExecutionAdapter:
                 error="delegation timeout",
             )
         return {"status": DelegatedRunStatus.EXPIRED, "error": "delegation timeout"}
-
-    def _accrue_budget(self, run: DelegatedRun) -> None:
-        """Add the run's reported cost to the project's running budget total.
-
-        Best-effort: a finished run's cost (persisted in the DB during polling)
-        is the source of truth for spend. We read it from the DB by id because
-        the in-memory ``run`` object may be detached/stale at this point. We do
-        NOT decrement on failure (no charge for an unsuccessful delegation).
-        """
-        with _session() as s:
-            persisted = s.get(DelegatedRun, run.id)
-            cost = float(getattr(persisted, "cost", 0.0) or 0.0)
-            if cost <= 0.0:
-                return
-            project = s.get(Project, persisted.project_id)
-            if project is not None:
-                project.budget_used = float(project.budget_used) + cost
-                s.add(project)
-                s.commit()
 
     def _record_failed(self, run: DelegatedRun, error: str) -> None:
         with _session() as s:

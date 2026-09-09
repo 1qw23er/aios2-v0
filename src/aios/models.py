@@ -73,6 +73,12 @@ class DelegationMode(StrEnum):
     A2A = "a2a"
     MCP = "mcp"
     WORKSTATION = "workstation"
+    # Local synchronous LLM execution (the department ``ExecutionAdapter`` path
+    # in ``aios.execution``). It is a *minimal compatible extension* of the enum
+    # -- the same ``DelegatedRun`` row type records both a remote delegation and
+    # a local LLM attempt, so execution evidence stays unified (C: Unified
+    # Attempt + Usage + Budget Accrual). No ``LocalRun`` / ``RemoteRun`` split.
+    LOCAL = "local"
 
 
 class DelegatedRunStatus(StrEnum):
@@ -494,7 +500,13 @@ class DelegatedRun(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("run"), primary_key=True)
     project_id: str = Field(foreign_key="project.id", index=True)
     task_id: str = Field(foreign_key="task.id", index=True)
-    agent_id: str = Field(foreign_key="agent.id", index=True)
+    # Agent that produced this attempt. Required for remote delegation (the
+    # delegated agent). Made NULLABLE so a LOCAL LLM attempt can still record
+    # evidence when no department agent id is resolvable (C: local path may run
+    # without a resolved ``assigned_agent_id``). FK nullability does not break
+    # any query -- every read filters by task_id / run id, never assumes
+    # agent_id is non-null.
+    agent_id: str | None = Field(default=None, foreign_key="agent.id", index=True)
     delegation_mode: DelegationMode
     # Opaque handle to the external secret store (e.g. "secret://hermes-api-key").
     secret_ref: str | None = Field(default=None, index=True)
@@ -511,7 +523,14 @@ class DelegatedRun(SQLModel, table=True):
     callback_url: str | None = None
     # Cost / usage captured from the agent's return (provenance). In currency units.
     cost: float = 0.0
-    usage: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Normalized usage evidence. ``None`` means *unknown / unavailable* (the
+    # provider did not report token counts) -- deliberately distinct from an
+    # empty dict so "no measurement" is never silently treated as "zero usage".
+    # Only written when real provider evidence exists; AIOS never fabricates
+    # token counts (C: Usage Normalization). Annotated ``dict[str, Any]`` so the
+    # explicit ``sa_column`` (JSON, nullable) is honored; ``default=None`` stores
+    # NULL when no measurement is available.
+    usage: dict[str, Any] = Field(default=None, sa_column=Column(JSON))
     error: str | None = None
     submitted_at: datetime = Field(default_factory=now_utc)
     finished_at: datetime | None = None
@@ -527,6 +546,13 @@ class DelegatedRun(SQLModel, table=True):
     # A stale owner can therefore never complete a run whose lease it lost.
     lease_owner: str | None = Field(default=None)
     lease_expires_at: datetime | None = Field(default=None)
+    # --- Unified Attempt + Budget Accrual (C) ---------------------------------
+    # Idempotency marker for budget accrual. Set exactly once, by the single
+    # conditional UPDATE that wins the accrual race, so a terminal run is
+    # charged to ``Project.budget_used`` AT MOST ONCE -- across retries,
+    # concurrent terminalizations, and recovery re-runs. ``None`` means not yet
+    # accrued (or nothing to accrue: cost <= 0 is never fabricated into a charge).
+    budget_accrued_at: datetime | None = Field(default=None)
 
 
 class Approval(SQLModel, table=True):

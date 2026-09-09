@@ -1,4 +1,4 @@
-"""V4 unified Agent platform — self-registration, capability discovery, Agent Relay (#99/#101).
+﻿"""V4 unified Agent platform — self-registration, capability discovery, Agent Relay (#99/#101).
 
 Covers the six gates (A–F) and the §8 TDD test checklist from
 ``docs/issue-99-v4-plan.md``:
@@ -1190,7 +1190,7 @@ def test_alembic_single_new_head() -> None:
     cfg = Config(root / "alembic.ini")
     cfg.set_main_option("script_location", str(root / "alembic"))
     head = ScriptDirectory.from_config(cfg).get_current_head()
-    assert head == "20260909_0002_task_run_lease"
+    assert head == "20260909_0003_unified_attempt_usage_budget"
 
 
 def test_migration_adds_bootstrap_token_ref_no_second_index(v4_session) -> None:

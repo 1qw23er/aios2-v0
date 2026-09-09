@@ -1,4 +1,4 @@
-"""Migration round-trip + DB-level unique constraints for review binding (0006, #69).
+﻿"""Migration round-trip + DB-level unique constraints for review binding (0006, #69).
 
 Verifies (req 6 / req 4):
   * 0005 -> 0006 -> 0005 -> 0006 round-trip; Alembic single head preserved.
@@ -35,7 +35,7 @@ from aios.models import (
 )
 from alembic import command
 
-HEAD = "20260909_0002_task_run_lease"
+HEAD = "20260909_0003_unified_attempt_usage_budget"
 BASE = "20260720_0005"
 # Lowest revision these ORM-seeding tests upgrade to. The migrations above it
 # form a chain of one-way doors:
