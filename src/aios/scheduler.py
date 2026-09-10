@@ -6,6 +6,12 @@ from typing import Any
 from sqlmodel import Session, select
 
 from aios.audit import AuditLog, append_audit
+from aios.capacity_routing import (
+    build_capacity_snapshot,
+    load_capacity_routing,
+    order_by_capacity,
+    project_in_flight_by_agent,
+)
 from aios.models import (
     Agent,
     AgentCapability,
@@ -165,6 +171,8 @@ def route_task(
     selected: Agent | None = None
     reason: str
     fallback_used = False
+    capacity_enabled = False
+    capacity_reason: str | None = None
 
     if task.routing_mode == RoutingMode.MANUAL:
         _record_blocked(
@@ -206,6 +214,22 @@ def route_task(
         agents = list(session.exec(select(Agent).order_by(Agent.id)))
         considered = [_candidate(session, agent, task.required_capabilities) for agent in agents]
         eligible = _rank(considered)
+        capacity_cfg = load_capacity_routing()
+        if capacity_cfg.enabled:
+            # Capacity-aware Routing V1 (PR-2): observe per-agent in-flight load
+            # and re-order the *already ranked* candidates. Soft ordering only --
+            # no hard cap, no reservation, no second authority (C-1, C-6). ``_rank``
+            # is untouched (R5/C-3); capability priority stays absolute. The
+            # capacity scan is a single GROUP BY SELECT; when disabled it is never
+            # issued, so production behaviour is byte-for-byte identical to main.
+            capacity_enabled = True
+            snapshot = build_capacity_snapshot(capacity_cfg, project_in_flight_by_agent(session))
+            for candidate in considered:
+                cid = candidate["agent_id"]
+                candidate["in_flight"] = snapshot.in_flight(cid)
+                candidate["saturated"] = snapshot.saturated(cid)
+                candidate["capacity_limit"] = snapshot.max_inflight(cid)
+            eligible = order_by_capacity(eligible, snapshot)
         if task.routing_mode == RoutingMode.PREFERRED_WITH_FALLBACK:
             preferred = next(
                 (
@@ -219,14 +243,34 @@ def route_task(
                 selected = session.get(Agent, preferred["agent_id"])
                 reason = "preferred_agent"
             elif eligible:
-                selected = session.get(Agent, eligible[0]["agent_id"])
-                reason = "fallback_static_priority"
+                top = eligible[0]
+                selected = session.get(Agent, top["agent_id"])
                 fallback_used = task.preferred_agent_id is not None
+                if capacity_enabled and top["saturated"]:
+                    reason = "best_available_capacity_saturated"
+                else:
+                    reason = "fallback_static_priority"
+                if capacity_enabled:
+                    capacity_reason = (
+                        "all_candidates_saturated_selected_least_loaded"
+                        if top["saturated"]
+                        else "ordered_by_capacity_within_capability_tier"
+                    )
             else:
                 reason = "no_available_capable_agent"
         elif eligible:
-            selected = session.get(Agent, eligible[0]["agent_id"])
-            reason = "best_available_static_priority"
+            top = eligible[0]
+            selected = session.get(Agent, top["agent_id"])
+            if capacity_enabled and top["saturated"]:
+                reason = "best_available_capacity_saturated"
+            else:
+                reason = "best_available_static_priority"
+            if capacity_enabled:
+                capacity_reason = (
+                    "all_candidates_saturated_selected_least_loaded"
+                    if top["saturated"]
+                    else "ordered_by_capacity_within_capability_tier"
+                )
         else:
             reason = "no_available_capable_agent"
         if selected is None:
@@ -254,6 +298,18 @@ def route_task(
             idempotency_key=f"routing:{idempotency_key}:assigned",
             payload={"assignment_id": assignment.id, "selected_agent_id": selected.id},
         )
+        audit_after: dict[str, Any] = {
+            "routing_mode": task.routing_mode.value,
+            "required_capabilities": task.required_capabilities,
+            "considered_candidates": considered,
+            "selected_agent_id": selected.id,
+            "routing_reason": reason,
+            "fallback_used": fallback_used,
+        }
+        if capacity_enabled:
+            audit_after["capacity_routing_enabled"] = True
+            if capacity_reason is not None:
+                audit_after["capacity_reason"] = capacity_reason
         append_audit(
             session,
             actor="scheduler",
@@ -263,14 +319,7 @@ def route_task(
             project_id=task.project_id,
             task_id=task.id,
             before={"assigned_agent_id": previous_agent_id},
-            after={
-                "routing_mode": task.routing_mode.value,
-                "required_capabilities": task.required_capabilities,
-                "considered_candidates": considered,
-                "selected_agent_id": selected.id,
-                "routing_reason": reason,
-                "fallback_used": fallback_used,
-            },
+            after=audit_after,
             idempotency_key=f"audit:{idempotency_key}",
         )
         if commit:

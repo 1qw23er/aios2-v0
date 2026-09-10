@@ -558,10 +558,20 @@ def test_module_has_no_scheduler_wiring_references() -> None:
         assert banned not in seen, f"capacity_routing must not reference {banned!r}"
 
 
-def test_scheduler_does_not_import_capacity_routing() -> None:
-    # PR-1 is unwired: scheduler.py must contain zero references to the new module.
+def test_scheduler_imports_capacity_routing_symbols() -> None:
+    # PR-2 wires capacity_routing into scheduler.py. The ONLY coupling must be the
+    # pure read/compute helpers -- never a write, scheduling or authority symbol.
+    # This is the inverse of the PR-1 guard (which asserted zero coupling while
+    # the module was unwired).
     source = _SCHEDULER_FILE.read_text(encoding="utf-8")
-    assert "capacity_routing" not in source
+    assert "capacity_routing" in source
+    for expected in (
+        "build_capacity_snapshot",
+        "load_capacity_routing",
+        "order_by_capacity",
+        "project_in_flight_by_agent",
+    ):
+        assert expected in source, f"scheduler must import {expected!r} from capacity_routing"
 
 
 def test_projection_leaves_no_pending_writes(db) -> None:
