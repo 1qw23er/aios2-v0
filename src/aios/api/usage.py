@@ -28,11 +28,12 @@ owner-only, so there is no cross-tenant probing concern), and the agent
 projection accepts an optional ``project_id`` boundary so an agent view can be
 confined to one project.
 
-Cost boundary (GAP-3 Stage 1): the budget figures served here govern
-DELEGATED runs with a measured currency cost. LOCAL runs
-(``DelegationMode.LOCAL``) are visible through ``run_count`` and
-``no_measured_cost_run_count`` but sit outside ``budget_used`` -- see
-``docs/Budget_Cost_Boundary.md``.
+Cost boundary (GAP-3): the budget figures served here govern runs with a
+measured currency cost -- DELEGATED runs from the provider, plus LOCAL runs
+(``DelegationMode.LOCAL``) once a model price table is configured (Stage 2,
+env ``AIOS_MODEL_PRICING``). A LOCAL run whose model has no price entry stays
+visible through ``run_count`` and ``no_measured_cost_run_count`` while sitting
+outside ``budget_used`` -- see ``docs/Budget_Cost_Boundary.md``.
 """
 
 from __future__ import annotations

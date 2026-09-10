@@ -729,6 +729,11 @@ class LLMExecutionAdapter:
     ) -> None:
         """Terminalize a local ``DelegatedRun`` (no-op when recording is off).
 
+        The adapter's configured model is always forwarded, so a priced model
+        can be turned into a cost from the reported usage (GAP-3 Stage 2);
+        with no price table configured this is a no-op and the run stays
+        cost-free.
+
         Best-effort: a recording failure must never fail the execution (the task
         result is already valid); we log and continue.
         """
@@ -737,7 +742,12 @@ class LLMExecutionAdapter:
         try:
             with make_session() as s:
                 complete_local_run(
-                    s, run_id=run.id, status=status, error=error, usage=usage
+                    s,
+                    run_id=run.id,
+                    status=status,
+                    error=error,
+                    usage=usage,
+                    model=self.model,
                 )
         except Exception:  # noqa: BLE001 - evidence is best-effort
             logger.warning(

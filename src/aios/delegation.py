@@ -234,12 +234,16 @@ def check_budget(session: Session, project: Project, estimated_cost: float) -> N
     saw the same ``budget_used``. See that helper for the residual (bounded)
     race this control accepts.
 
-    COST BOUNDARY (GAP-3 Stage 1): this gate governs *delegated* (remote)
-    execution that carries a MEASURED currency cost. LOCAL runs
-    (``DelegationMode.LOCAL``) record usage but no measured cost today, so
-    they are visible in Usage Metering (``no_measured_cost_run_count``) yet
-    OUTSIDE this budget scope: they neither move ``budget_used`` nor get
-    blocked here. See ``docs/Budget_Cost_Boundary.md``.
+    COST BOUNDARY (GAP-3): this gate governs execution that carries a
+    MEASURED currency cost -- remote runs always, LOCAL runs
+    (``DelegationMode.LOCAL``) once their model has an entry in the price
+    table (Stage 2). A LOCAL run without a price entry records usage but no
+    cost, so it is visible in Usage Metering (``no_measured_cost_run_count``)
+    yet OUTSIDE this budget scope: it neither moves ``budget_used`` nor gets
+    blocked here. Note the gate is only ever consulted by the *remote*
+    delegation path -- a LOCAL run never calls it, so a priced LOCAL run
+    accrues and is then seen by later remote delegations.
+    See ``docs/Budget_Cost_Boundary.md``.
     """
     if project.budget_limit <= 0.0:
         return
@@ -290,11 +294,12 @@ def accrue_run_budget(
     accrue through one path. Returns True if this call performed the accrual.
 
     Nothing here is mode-specific: a LOCAL run that terminalizes with
-    ``cost > 0`` is charged exactly like a remote one. Today
-    ``execution_run.complete_local_run`` never supplies a cost (there is no
-    price source yet), so LOCAL spend is *reported but not governed* -- it
-    stays outside ``budget_used`` scope by design (GAP-3 Stage 1, see
-    ``docs/Budget_Cost_Boundary.md``).
+    ``cost > 0`` is charged exactly like a remote one. Since GAP-3 Stage 2
+    ``execution_run.complete_local_run`` derives that cost from the reported
+    usage through the owner-configured price table (``aios.model_pricing``,
+    env ``AIOS_MODEL_PRICING``), so a priced LOCAL run IS governed. Without a
+    price entry for the model, LOCAL spend stays *reported but not governed*
+    (GAP-3 Stage 1, see ``docs/Budget_Cost_Boundary.md``).
     """
     from sqlalchemy import select, update
 

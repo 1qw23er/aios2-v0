@@ -364,6 +364,7 @@ def complete_local_run(
     error: str | None = None,
     usage: dict[str, Any] | None = None,
     cost: float = 0.0,
+    model: str | None = None,
     now: datetime | None = None,
 ) -> bool:
     """Terminalize a local ``DelegatedRun`` and accrue budget exactly once.
@@ -375,15 +376,19 @@ def complete_local_run(
     attempt is charged exactly like a remote one. ``cost`` is the real provider
     cost when known; a missing/zero cost is never fabricated into a charge.
 
-    COST BOUNDARY (GAP-3 Stage 1): today the only caller
-    (``execution.LLMExecutionAdapter._finish_local_run``) passes ``usage`` and
-    NO cost, so ``cost`` stays at its 0.0 default and this run is counted in
-    the metering ``no_measured_cost_run_count`` bucket -- LOCAL spend is
-    *visible but not governed*, i.e. outside ``Project.budget_used`` scope.
-    This is a missing price source, not a missing mechanism: as soon as a
-    price table exists (Stage 2) passing a derived ``cost`` here is enough,
-    because the accrual path is already shared. See
-    ``docs/Budget_Cost_Boundary.md``.
+    COST BOUNDARY (GAP-3): ``cost`` is authoritative when the caller has a
+    measured currency value. When it does not, ``model`` + ``usage`` may be
+    turned into a cost through the owner-configured price table
+    (``aios.model_pricing``, env ``AIOS_MODEL_PRICING``): tokens are converted
+    with the model's own per-1M-token rates and the result enters the SAME
+    accrual path, so a priced LOCAL run is governed by ``check_budget`` like
+    any other accrued cost.
+
+    Without a price table (or for a model absent from it) ``derive_run_cost``
+    returns ``None`` and this run stays in the Stage 1 state: usage recorded,
+    no cost, outside ``Project.budget_used`` -- and visible in the metering
+    ``no_measured_cost_run_count`` bucket. A price is never guessed and never
+    defaulted across models. See ``docs/Budget_Cost_Boundary.md``.
 
     Returns True if the run was terminalized by this call.
     """
@@ -396,8 +401,15 @@ def complete_local_run(
         values["error"] = error
     if usage is not None:
         values["usage"] = usage
-    if cost:
-        values["cost"] = cost
+    resolved_cost: float | None = float(cost) if cost else None
+    if resolved_cost is None and usage is not None:
+        # GAP-3 Stage 2: derive a cost from the usage the provider reported.
+        # Returns None (no charge) when there is no price for this model.
+        from aios.model_pricing import derive_run_cost
+
+        resolved_cost = derive_run_cost(usage, model=model)
+    if resolved_cost:
+        values["cost"] = resolved_cost
     stmt = (
         update(DelegatedRun)
         .where(DelegatedRun.id == run_id)
