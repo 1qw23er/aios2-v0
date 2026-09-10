@@ -18,6 +18,13 @@ Design contract (Usage Metering P1 design review, verdict GO WITH CONDITIONS):
   separately (``cancelled_with_cost_*``) and NEVER folded into the accrued
   spend -- so a naive ``SUM(DelegatedRun.cost)`` can never masquerade as
   budget reconciliation.
+* **Cost boundary (GAP-3 Stage 1).** ``Project.budget_used`` governs
+  *delegated* runs that carry a MEASURED currency cost. LOCAL runs
+  (``DelegationMode.LOCAL``) record usage but no cost, so they appear in
+  ``run_count`` / ``runs_by_status`` / ``no_measured_cost_run_count`` and
+  NEVER in ``measured_spend``: visible, but outside the budget scope. A
+  non-zero ``no_measured_cost_run_count`` is therefore the meter for that
+  scope boundary, not an anomaly. See ``docs/Budget_Cost_Boundary.md``.
 * **No token aggregation.** ``usage`` schemas are heterogeneous
   (OpenAI-style / Hermes-style / LOCAL verbatim); P1 aggregates currency
   cost + run counts only and never exposes a cross-provider token SUM.
@@ -209,6 +216,12 @@ def budget_reconciliation(
 
     A discrepancy is REPORTED, never corrected: this function performs no
     write of any kind.
+
+    Scope caveat (GAP-3 Stage 1): ``matches == True`` means accrual and
+    ``budget_used`` agree -- it does NOT mean every unit of real spend lies
+    inside the budget. LOCAL runs carry no measured cost and are outside the
+    budget scope by design; read ``no_measured_cost_run_count`` for the size
+    of that blind spot.
     """
     # READ-ONLY access to the budget SSoT. The W6 invariant requires that the
     # only writer of ``Project.budget_used`` lives in delegation.py; this

@@ -127,3 +127,10 @@ exports additionally write task_context.json as the structured source of truth, 
 context.md is rendered deterministically for human readability. Alpha-2 uses no LLM,
 embeddings, vector search, RAG, summarization, knowledge extraction, prompt templating,
 dynamic token optimization, or Context UI.
+
+## 成本与预算口径（Budget cost boundary）
+
+- `Project.budget_limit` / `Project.budget_used` 治理的是**远程委托（delegated）执行的已测量货币花费**。LOCAL（`DelegationMode.LOCAL`，进程内 LLM 执行）的花费**可见不控**：Usage Metering 报告其执行量与 `no_measured_cost_run_count`，但它不进 `budget_used`，也不受 `check_budget` 约束。
+- 原因：cost 必须是 provider 实测的货币值——token 数不是货币、估计值不是实测值。缺失的是价格源，不是机制（LOCAL run 一旦传入 `cost > 0`，走的是同一条 `accrue_run_budget` 入账路径）。
+- **对账通过不等于花费都在预算内**：`budget_reconciliation.matches = True` 只证明 accrual 与 `budget_used` 一致（单写者未被绕过）；`no_measured_cost_run_count > 0` 即表示存在预算口径之外的执行量。
+- 完整边界声明、实测证据，以及 Stage 2（模型价目表，挂在 Capacity-aware routing 设计启动前）门槛：见 `docs/Budget_Cost_Boundary.md`。
