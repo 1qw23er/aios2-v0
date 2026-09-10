@@ -195,6 +195,41 @@ def test_local_run_failure_terminalizes_failed(db) -> None:
     assert db.get(DelegatedRun, run.id).status == DelegatedRunStatus.FAILED
 
 
+# --- P3 hygiene ①: LOCAL terminalization must not move Project.budget_used ---
+
+def test_local_run_terminalization_does_not_change_budget_used(db, monkeypatch) -> None:
+    # GAP-3 Stage 1 boundary (docs/Budget_Cost_Boundary.md): a LOCAL run is
+    # recorded but NOT governed by budget. Even with real provider usage and a
+    # terminal SUCCEEDED/FAILED state, terminalization must leave Project.budget_used
+    # untouched (no price table -> Stage 1, outside accrue). Delegated paid behavior
+    # is asserted unchanged as the contrast.
+    monkeypatch.delenv("AIOS_MODEL_PRICING", raising=False)
+    project, agent, task = _seed_identity(db)
+    before = project.budget_used
+    run_s = create_local_run(
+        db, task_id=task.id, project_id=project.id, attempt=1, idempotency_key="k-h1"
+    )
+    run_f = create_local_run(
+        db, task_id=task.id, project_id=project.id, attempt=1, idempotency_key="k-h2"
+    )
+    ok_s = complete_local_run(
+        db, run_id=run_s.id, status=DelegatedRunStatus.SUCCEEDED,
+        usage={"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+    )
+    ok_f = complete_local_run(
+        db, run_id=run_f.id, status=DelegatedRunStatus.FAILED, error="boom",
+    )
+    db.refresh(project)
+    assert (ok_s, ok_f) == (True, True)
+    assert project.budget_used == before  # LOCAL: no delegated budget accrual
+    # Contrast: a delegated PAID run still accrues (delegated behavior unchanged).
+    delegated = _run(db, project_id=project.id, task_id=task.id, agent_id=agent.id, cost=2.5)
+    assert acquire_run_lease(db, run_id=delegated.id, owner="w1")
+    assert complete_run(db, run_id=delegated.id, owner="w1", status=DelegatedRunStatus.SUCCEEDED)
+    db.refresh(project)
+    assert project.budget_used == pytest.approx(before + 2.5)
+
+
 # --- Unified, idempotent budget accrual (every terminal) --------------------
 
 def test_succeeded_paid_run_accrues_once(db) -> None:
