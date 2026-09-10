@@ -195,7 +195,7 @@ def test_workforce_modules_never_reference_delegation_domain() -> None:
 def test_budget_used_has_exactly_one_writer() -> None:
     """BA-1 / DR-D1-2 (a): ``Project.budget_used`` has exactly one writer.
 
-    The single writer is ``delegation._accrue_budget``. A second assignment
+    The single writer is ``delegation.accrue_run_budget``. A second assignment
     anywhere in ``src/`` would be a second authoritative ledger, which the
     decision freeze forbids.
     """
