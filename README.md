@@ -133,11 +133,10 @@ dynamic token optimization, or Context UI.
 - `Project.budget_limit` / `Project.budget_used` 治理的是**已测量的货币花费**。远程委托（delegated）由 provider 实测值入账；LOCAL（`DelegationMode.LOCAL`，进程内 LLM 执行）**默认不控**——Usage Metering 报告其执行量与 `no_measured_cost_run_count`，但不进 `budget_used`，也不受 `check_budget` 约束。
 - **模型价目表（GAP-3 Stage 2）**：配置 env `AIOS_MODEL_PRICING`（JSON：`模型 -> {"input_per_1m", "output_per_1m"}`，货币/1M tokens）后，LOCAL run 由已记录 usage 推导出 cost 并走**同一条** `accrue_run_budget` 入账，从而**受控**。未配置、或模型不在表内 → 回到"可见不控"。**没有默认价、不跨模型推断**；token 数不是货币、估计值不是实测值，价格只能由 owner 提供。
 - **对账通过不等于花费都在预算内**：`budget_reconciliation.matches = True` 只证明 accrual 与 `budget_used` 一致（单写者未被绕过）；`no_measured_cost_run_count > 0` 即表示存在预算口径之外的执行量。
-- 完整边界声明、配置格式、fail-safe 规则与实测证据：见 `docs/Budget_Cost_Boundary.md`。
 
 ## Capacity-aware Routing V1（容量感知路由）
 
 - 在现有 capability routing 之上，**仅对同能力档候选做负载偏好排序**（soft ordering，不做 hard cap）。容量 = 该 agent 的**在途 `DelegatedRun` 数**（复用 `delegation.INFLIGHT_RUN_STATUSES`）。
 - 配置 env `AIOS_CAPACITY_ROUTING`（JSON：`{"default_max_inflight": N, "agents": {"agent_id": M}}`）。**未配置 = 关闭**，行为与今日逐字节一致；非法配置 → 警告并关闭，绝不抛异常。
-- 成本**不**参与路由（estimated / measured / budget 三语义严格分离，预算硬门仍在 `check_budget`）。设计、配置与边界：见 `docs/Capacity_Aware_Routing_V1.md`（即 `capacity_aware_routing_v1_design_2026-09-10.md`）。
-- 当前仅落地未接线模块（PR-1）；接入 `scheduler.py` 为 PR-2，默认仍关闭。
+- 成本**不**参与路由（estimated / measured / budget 三语义严格分离，预算硬门仍在 `check_budget`）。
+- 实施进度：**PR-1 已合**（新增 `src/aios/capacity_routing.py` 纯读模块 + 测试，`scheduler.py` 零改动）；**PR-2 已合并并接线**——`scheduler.py` 在 `AIOS_CAPACITY_ROUTING` 配置时调用独立排序层 `order_by_capacity` 对已完成 `_rank` 的候选做次级排序，`_rank` 一字未改（满足 R5/C-3 契约），并对选定结果审计 `capacity_routing_enabled`。env **默认关闭**（未配置 → 排序层从不执行，行为逐字节等同于今日 main，零迁移）。PR-3 只读观测端点经设计评审**建议不做**（audit 字段已足）。
