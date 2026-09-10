@@ -378,7 +378,7 @@ class Task(SQLModel, table=True):
     feeds delegation's ``check_budget`` projection. ``actual_cost`` is a DEAD
     COLUMN in V1 -- it has NO writer anywhere in the repo; measured cost truth
     lives in ``DelegatedRun.cost`` and the sole ``Project.budget_used`` accrual
-    (``delegation._accrue_budget``). Do not start writing it without a decision:
+    (``delegation.accrue_run_budget``). Do not start writing it without a decision:
     a second cost writer would break the single-budget-authority boundary.
     """
 
