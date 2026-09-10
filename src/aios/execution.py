@@ -628,6 +628,7 @@ class LLMExecutionAdapter:
         attempts = 0
         max_attempts = 1 + self.max_retries
         run: DelegatedRun | None = None
+        run_id: str | None = None
         for attempt in range(1, max_attempts + 1):
             attempts = attempt
             # Record this local attempt as a DelegatedRun (LOCAL, no lease) before
@@ -644,6 +645,7 @@ class LLMExecutionAdapter:
                             attempt=attempt,
                             idempotency_key=idempotency_key,
                         )
+                        run_id = run.id
                 except Exception:  # noqa: BLE001 - evidence is best-effort
                     logger.warning(
                         "failed to record local DelegatedRun for task %s attempt %d",
@@ -662,7 +664,7 @@ class LLMExecutionAdapter:
                 # Terminalize the local run as FAILED with normalized, redacted
                 # evidence; a failed-but-paid attempt accrues via the unified path.
                 self._finish_local_run(
-                    run, DelegatedRunStatus.FAILED, error=_redact_secrets(exc.detail)
+                    run_id, DelegatedRunStatus.FAILED, error=_redact_secrets(exc.detail)
                 )
                 if exc.category in _RETRYABLE_CATEGORIES and attempt < max_attempts:
                     # Bounded sleep: exponential backoff capped at 30s. No secret
@@ -681,7 +683,7 @@ class LLMExecutionAdapter:
                         category=AdapterErrorCategory.PROVIDER_STRUCTURE,
                     )
                     self._finish_local_run(
-                        run,
+                        run_id,
                         DelegatedRunStatus.FAILED,
                         error=_redact_secrets(err.detail),
                     )
@@ -703,7 +705,7 @@ class LLMExecutionAdapter:
                 )
                 # Terminalize as SUCCEEDED with real provider usage (None when the
                 # provider reports no token counts; never fabricated).
-                self._finish_local_run(run, DelegatedRunStatus.SUCCEEDED, usage=usage)
+                self._finish_local_run(run_id, DelegatedRunStatus.SUCCEEDED, usage=usage)
                 return result
         # All attempts exhausted (or a non-retryable category on the first try).
         assert last_exc is not None  # loop either raised or stored last_exc
@@ -721,13 +723,19 @@ class LLMExecutionAdapter:
 
     def _finish_local_run(
         self,
-        run: DelegatedRun | None,
+        run_id: str | None,
         status: DelegatedRunStatus,
         *,
         error: str | None = None,
         usage: dict[str, Any] | None = None,
     ) -> None:
         """Terminalize a local ``DelegatedRun`` (no-op when recording is off).
+
+        Accepts the captured ``run_id`` (str) rather than the ORM instance,
+        because by the time this is called the ``DelegatedRun`` has already been
+        detached from its recording session; accessing ``run.id`` on the
+        detached instance would raise ``DetachedInstanceError`` and defeat the
+        best-effort guarantee below.
 
         The adapter's configured model is always forwarded, so a priced model
         can be turned into a cost from the reported usage (GAP-3 Stage 2);
@@ -737,13 +745,13 @@ class LLMExecutionAdapter:
         Best-effort: a recording failure must never fail the execution (the task
         result is already valid); we log and continue.
         """
-        if run is None:
+        if run_id is None:
             return
         try:
             with make_session() as s:
                 complete_local_run(
                     s,
-                    run_id=run.id,
+                    run_id=run_id,
                     status=status,
                     error=error,
                     usage=usage,
@@ -751,7 +759,7 @@ class LLMExecutionAdapter:
                 )
         except Exception:  # noqa: BLE001 - evidence is best-effort
             logger.warning(
-                "failed to finalize local DelegatedRun %s", run.id, exc_info=True
+                "failed to finalize local DelegatedRun %s", run_id, exc_info=True
             )
 
     # Hint appended to the prompt on retry attempts. Deliberately contains NO

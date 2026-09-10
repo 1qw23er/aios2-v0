@@ -27,6 +27,8 @@ from aios.execution import (
 )
 from aios.models import (
     Artifact,
+    DelegatedRun,
+    DelegatedRunStatus,
     Event,
     ExecutionAssignment,
     Project,
@@ -888,3 +890,120 @@ def test_execute_persists_attempts_on_failure(client: TestClient) -> None:
         assert audit is not None
         assert audit.after_snapshot.get("attempts") == 2
         assert audit.after_snapshot.get("max_attempts") == 4
+
+
+# --- Regression: DetachedInstanceError on local run terminalization ---
+#
+# The production LLMExecutionAdapter.run() records each attempt as a DelegatedRun
+# (LOCAL, no lease) inside a `with make_session()` block, then the instance is
+# detached when that block exits. The original code passed the *detached* ORM
+# instance into _finish_local_run(run, ...) and accessed run.id there, which
+# raised DetachedInstanceError on every terminalization -- and because the
+# except-guard also touched run.id, the error swallowed even a *successful* run.
+#
+# These tests drive the REAL run() protocol (only the network boundary is
+# stubbed) with a real task/project context so create_local_run succeeds with
+# valid FKs and the path actually detaches. They pin the fixed behavior:
+# run_id is captured while attached and terminalization uses the string id.
+
+class _RealLocalRunAdapter(LLMExecutionAdapter):
+    """Production adapter with ONLY the network boundary stubbed.
+
+    Unlike ScriptedExecutionAdapter (which bypasses run()), this exercises the
+    genuine run() path: record DelegatedRun -> detach -> terminalize via
+    _finish_local_run. That is exactly the path that used to raise
+    DetachedInstanceError.
+    """
+
+    def __init__(self, *, fail: bool = False, max_retries: int = 0, backoff_seconds: float = 0.0):
+        super().__init__(max_retries=max_retries, backoff_seconds=backoff_seconds)
+        # Always configured so we pass the CONFIG_MISSING gate without real creds.
+        self.api_key = "test-key-not-real"
+        self.base_url = "https://example.invalid/v1"
+        self.model = "test-model"
+        self._fail = fail
+
+    def _chat(self, prompt, *, attempt=1, recovery_hint=None):
+        if self._fail:
+            raise ExecutionError(
+                502, "故意失败", category=AdapterErrorCategory.PROVIDER_HTTP
+            )
+        # Valid JSON object string expected by run()/_parse_json; no usage counts.
+        return '{"summary": "ok", "data": {}}', None
+
+
+def test_local_execution_success_terminalizes_delegated_run_no_detached_error(
+    client: TestClient,
+) -> None:
+    """A successful LOCAL run must NOT raise DetachedInstanceError; the Artifact
+    is produced, the DelegatedRun terminalizes SUCCEEDED, and budget is untouched."""
+    _launch(client)
+    with _session() as session:
+        t1 = _task_by_key(session, "T1")
+        # Permissive output schema: the scripted LLM output is not the target of
+        # this test -- we exercise the real DelegatedRun recording/terminalization
+        # path (project_id present), which is where DetachedInstanceError lived.
+        t1.output_schema = {"type": "object"}
+        session.add(t1)
+        session.commit()
+        project = session.exec(select(Project)).first()
+        budget_before = project.budget_used
+
+        # Drives the real run(): records a DelegatedRun, detaches it, then
+        # terminalizes via _finish_local_run. Pre-fix this raised
+        # DetachedInstanceError and swallowed the successful result.
+        artifact = execute_task(session, t1.id, "detached-fix-ok", adapter=_RealLocalRunAdapter())
+
+        # Happy path is no longer swallowed: Artifact produced, task DONE.
+        assert artifact is not None
+        assert artifact.task_id == t1.id
+        assert _status(session, t1) == TaskStatus.DONE
+
+        # The local DelegatedRun was recorded AND terminalized SUCCEEDED.
+        run = session.exec(
+            select(DelegatedRun).where(DelegatedRun.task_id == t1.id)
+        ).first()
+        assert run is not None
+        assert run.status == DelegatedRunStatus.SUCCEEDED
+
+        # Budget semantics unchanged: a LOCAL run must NOT accrue budget.
+        session.refresh(project)
+        assert project.budget_used == budget_before
+
+
+def test_local_execution_failure_terminalizes_delegated_run_no_detached_error(
+    client: TestClient,
+) -> None:
+    """The FAILED terminalization branch (and its except-guard) must also work
+    with the captured run_id -- the original code double-faulted here too."""
+    _launch(client)
+    with _session() as session:
+        t1 = _task_by_key(session, "T1")
+        # Permissive output schema: isolate the terminalization-path behavior.
+        t1.output_schema = {"type": "object"}
+        session.add(t1)
+        session.commit()
+        project = session.exec(select(Project)).first()
+        budget_before = project.budget_used
+
+        with pytest.raises(ExecutionError) as exc:
+            execute_task(
+                session,
+                t1.id,
+                "detached-fix-fail",
+                adapter=_RealLocalRunAdapter(fail=True),
+            )
+        # The ORIGINAL error propagated (not a DetachedInstanceError from the guard).
+        assert exc.value.category == AdapterErrorCategory.PROVIDER_HTTP
+
+        run = session.exec(
+            select(DelegatedRun).where(DelegatedRun.task_id == t1.id)
+        ).first()
+        assert run is not None
+        assert run.status == DelegatedRunStatus.FAILED
+
+        # Budget semantics unchanged on failure too.
+        session.refresh(project)
+        assert project.budget_used == budget_before
+        # Task marked FAILED (readable), no artifact produced.
+        assert _status(session, t1) == TaskStatus.FAILED

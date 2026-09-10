@@ -353,7 +353,9 @@ def test_adapter_terminalization_passes_its_model(db, monkeypatch) -> None:
     run = _local_run(db, project, task, key="k-adapter")
     adapter = LLMExecutionAdapter(model=MODEL, api_key="test-key")
     adapter._finish_local_run(
-        run,
+        # Contract: the captured run id (str), not the ORM instance -- by the
+        # time terminalization runs the instance may already be detached.
+        run.id,
         DelegatedRunStatus.SUCCEEDED,
         usage={"prompt_tokens": 1_000_000, "completion_tokens": 500_000},
     )
