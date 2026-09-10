@@ -46,7 +46,8 @@ AIOS 通过适配器把任务委托给外部 Agent。这引入了四类原生风
 - `check_budget(session, project, estimated_cost)`：当 `budget_limit > 0` 且 `used + estimated > limit`，抛 `BudgetExceededError`（属 `DelegatedExecutionError`），**在远端调用前**硬阻断，安全失败并带显式 reason（`"budget exceeded"`）。
 - 成功执行后 `_accrue_budget(run)` 从持久化 `DelegatedRun.cost` 累加进 `Project.budget_used`（重新查 DB 读取，避免内存对象 detached/stale）。
 - `budget_limit == 0.0` 时不强制，保持既有行为。
-- **口径边界（GAP-3 Stage 1，2026-09-10）**：`budget_limit` / `budget_used` 只治理**远程委托（delegated）执行的已测量货币花费**。LOCAL（`DelegationMode.LOCAL`，进程内 `LLMExecutionAdapter`）执行**可见不控**——Usage Metering 报告其执行量与 `no_measured_cost_run_count`，但 `complete_local_run` 从不带 cost 终态化、`accrue_run_budget` 见 `cost <= 0` 不扣费，因此既不进 `budget_used` 也不受 `check_budget` 约束。这是"绝不伪造成本"的口径选择，不是缺陷；价目表（Stage 2）挂在 Capacity-aware routing 设计启动前。完整声明见 `docs/Budget_Cost_Boundary.md`。
+- **口径边界（GAP-3，2026-09-10）**：`budget_limit` / `budget_used` 治理的是**已测量的货币花费**。远程委托（delegated）由 `complete_run` 传 provider 实测值入账。LOCAL（`DelegationMode.LOCAL`，进程内 `LLMExecutionAdapter`）**默认可见不控**——Usage Metering 报告其执行量与 `no_measured_cost_run_count`，不进 `budget_used`。
+- **Stage 2 价目表**：配置 env `AIOS_MODEL_PRICING`（JSON `模型 -> {"input_per_1m","output_per_1m"}`，货币/1M tokens，input/output 分开计价）后，`complete_local_run` 由已记录 usage **推导** cost → 走**同一条** `accrue_run_budget` 入账 → 受 `check_budget` 约束。模型不在表内、usage 缺 token 键、或表非法 → 无 cost（绝不猜价），回到"可见不控"。LOCAL **无前置门禁**（不做调用前拦截）。完整声明与 fail-safe 规则见 `docs/Budget_Cost_Boundary.md`。
 
 ### 5. Agent 信任等级（Agent trust level）
 

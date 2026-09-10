@@ -130,7 +130,7 @@ dynamic token optimization, or Context UI.
 
 ## 成本与预算口径（Budget cost boundary）
 
-- `Project.budget_limit` / `Project.budget_used` 治理的是**远程委托（delegated）执行的已测量货币花费**。LOCAL（`DelegationMode.LOCAL`，进程内 LLM 执行）的花费**可见不控**：Usage Metering 报告其执行量与 `no_measured_cost_run_count`，但它不进 `budget_used`，也不受 `check_budget` 约束。
-- 原因：cost 必须是 provider 实测的货币值——token 数不是货币、估计值不是实测值。缺失的是价格源，不是机制（LOCAL run 一旦传入 `cost > 0`，走的是同一条 `accrue_run_budget` 入账路径）。
+- `Project.budget_limit` / `Project.budget_used` 治理的是**已测量的货币花费**。远程委托（delegated）由 provider 实测值入账；LOCAL（`DelegationMode.LOCAL`，进程内 LLM 执行）**默认不控**——Usage Metering 报告其执行量与 `no_measured_cost_run_count`，但不进 `budget_used`，也不受 `check_budget` 约束。
+- **模型价目表（GAP-3 Stage 2）**：配置 env `AIOS_MODEL_PRICING`（JSON：`模型 -> {"input_per_1m", "output_per_1m"}`，货币/1M tokens）后，LOCAL run 由已记录 usage 推导出 cost 并走**同一条** `accrue_run_budget` 入账，从而**受控**。未配置、或模型不在表内 → 回到"可见不控"。**没有默认价、不跨模型推断**；token 数不是货币、估计值不是实测值，价格只能由 owner 提供。
 - **对账通过不等于花费都在预算内**：`budget_reconciliation.matches = True` 只证明 accrual 与 `budget_used` 一致（单写者未被绕过）；`no_measured_cost_run_count > 0` 即表示存在预算口径之外的执行量。
-- 完整边界声明、实测证据，以及 Stage 2（模型价目表，挂在 Capacity-aware routing 设计启动前）门槛：见 `docs/Budget_Cost_Boundary.md`。
+- 完整边界声明、配置格式、fail-safe 规则与实测证据：见 `docs/Budget_Cost_Boundary.md`。
