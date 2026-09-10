@@ -27,6 +27,12 @@ Isolation: an unknown project / agent / task is a plain 404 (this surface is
 owner-only, so there is no cross-tenant probing concern), and the agent
 projection accepts an optional ``project_id`` boundary so an agent view can be
 confined to one project.
+
+Cost boundary (GAP-3 Stage 1): the budget figures served here govern
+DELEGATED runs with a measured currency cost. LOCAL runs
+(``DelegationMode.LOCAL``) are visible through ``run_count`` and
+``no_measured_cost_run_count`` but sit outside ``budget_used`` -- see
+``docs/Budget_Cost_Boundary.md``.
 """
 
 from __future__ import annotations

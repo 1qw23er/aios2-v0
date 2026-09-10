@@ -375,6 +375,16 @@ def complete_local_run(
     attempt is charged exactly like a remote one. ``cost`` is the real provider
     cost when known; a missing/zero cost is never fabricated into a charge.
 
+    COST BOUNDARY (GAP-3 Stage 1): today the only caller
+    (``execution.LLMExecutionAdapter._finish_local_run``) passes ``usage`` and
+    NO cost, so ``cost`` stays at its 0.0 default and this run is counted in
+    the metering ``no_measured_cost_run_count`` bucket -- LOCAL spend is
+    *visible but not governed*, i.e. outside ``Project.budget_used`` scope.
+    This is a missing price source, not a missing mechanism: as soon as a
+    price table exists (Stage 2) passing a derived ``cost`` here is enough,
+    because the accrual path is already shared. See
+    ``docs/Budget_Cost_Boundary.md``.
+
     Returns True if the run was terminalized by this call.
     """
     now_naive = _naive_utc(now or now_utc())
