@@ -30,11 +30,14 @@ from sqlmodel import Session
 
 from aios.db import get_database_url, get_engine
 from aios.delegation import (
+    INFLIGHT_RUN_STATUSES,
     BudgetExceededError,
     accrue_run_budget,
     check_budget,
+    projected_inflight_cost,
 )
 from aios.execution_run import (
+    TERMINAL_RUN_STATUSES,
     acquire_run_lease,
     complete_local_run,
     complete_run,
@@ -324,3 +327,198 @@ def test_budget_gate_rechecks_remaining_budget_per_attempt(db) -> None:
         check_budget(db, project, 1.0)
     # A within-budget estimate passes.
     check_budget(db, project, 0.4)  # 9.5 + 0.4 <= 10.0
+
+
+# --- GAP-2: in-flight (concurrent) spend projection ------------------------
+#
+# The gate above only sees ACCRUED spend (``Project.budget_used``). Two
+# delegations admitted in the same window therefore both read the same
+# ``budget_used`` and each conclude it fits -- the concurrent over-commit
+# window. GAP-2 closes it by adding a READ-TIME projection of the spend that is
+# already in flight but not yet accrued: SUM of ``Task.estimated_cost`` over
+# this project's non-terminal ``DelegatedRun``s. No reservation ledger, no
+# migration, no second budget writer.
+
+
+def _seed_budget_project(
+    session: Session,
+    *,
+    budget_limit: float = 10.0,
+    budget_used: float = 0.0,
+    estimated_cost: float = 0.0,
+    name: str = "gap2",
+) -> tuple[Project, Task]:
+    project = Project(
+        name=name, objective="o", budget_limit=budget_limit, budget_used=budget_used
+    )
+    session.add(project)
+    session.commit()
+    session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        title="t",
+        description="d",
+        status=TaskStatus.BACKLOG,
+        output_schema={"type": "object"},
+        estimated_cost=estimated_cost,
+    )
+    session.add(task)
+    session.commit()
+    session.refresh(task)
+    return project, task
+
+
+def test_inflight_run_reserves_its_estimate_in_the_budget_gate(db) -> None:
+    """An in-flight run's estimate is reserved, so a concurrent second
+    delegation can no longer pass the gate on stale ``budget_used`` alone."""
+    project, task = _seed_budget_project(db, budget_limit=10.0, estimated_cost=6.0)
+    _run(
+        db,
+        project_id=project.id,
+        task_id=task.id,
+        status=DelegatedRunStatus.SUBMITTED,
+    )
+    # 0 used + 6 in flight + 5 requested = 11 > 10 -> hard blocked.
+    with pytest.raises(BudgetExceededError):
+        check_budget(db, project, 5.0)
+    # 0 + 6 + 4 = 10 <= 10 -> admitted.
+    check_budget(db, project, 4.0)
+
+
+def test_running_status_also_counts_as_inflight(db) -> None:
+    project, task = _seed_budget_project(db, budget_limit=10.0, estimated_cost=6.0)
+    _run(
+        db,
+        project_id=project.id,
+        task_id=task.id,
+        status=DelegatedRunStatus.RUNNING,
+    )
+    with pytest.raises(BudgetExceededError):
+        check_budget(db, project, 5.0)
+    check_budget(db, project, 4.0)
+
+
+def test_concurrent_inflight_runs_sum_before_the_gate(db) -> None:
+    """The projection is a SUM, not a single-run peek: N concurrent
+    delegations each reserve their own estimate."""
+    project, task_a = _seed_budget_project(db, budget_limit=10.0, estimated_cost=3.0)
+    task_b = Task(
+        project_id=project.id,
+        title="t2",
+        description="d",
+        status=TaskStatus.BACKLOG,
+        output_schema={"type": "object"},
+        estimated_cost=3.0,
+    )
+    db.add(task_b)
+    db.commit()
+    db.refresh(task_b)
+    _run(db, project_id=project.id, task_id=task_a.id, status=DelegatedRunStatus.SUBMITTED)
+    _run(db, project_id=project.id, task_id=task_b.id, status=DelegatedRunStatus.RUNNING)
+    with pytest.raises(BudgetExceededError):
+        check_budget(db, project, 5.0)  # 0 + 3 + 3 + 5 = 11 > 10
+    check_budget(db, project, 4.0)  # 0 + 3 + 3 + 4 = 10
+
+
+def test_terminal_run_hands_over_from_estimate_to_accrual(db) -> None:
+    """No gap, no overlap: while the run is in flight its ESTIMATE is reserved;
+    once it terminalizes the reservation is released and the REAL cost arrives
+    through the single accrual writer. The projection is continuous."""
+    project, task = _seed_budget_project(db, budget_limit=10.0, estimated_cost=6.0)
+    run = _run(db, project_id=project.id, task_id=task.id, status=DelegatedRunStatus.SUBMITTED)
+    # In flight: 6 reserved.
+    assert projected_inflight_cost(db, project_id=project.id) == 6.0
+    with pytest.raises(BudgetExceededError):
+        check_budget(db, project, 5.0)
+
+    # Terminalize + accrue (the real hand-off, via the single budget writer).
+    run.status = DelegatedRunStatus.SUCCEEDED
+    run.finished_at = _naive_now()
+    run.cost = 6.0
+    db.add(run)
+    db.commit()
+    assert accrue_run_budget(db, run_id=run.id) is True
+    db.refresh(project)
+
+    # The run left the projection and its cost entered budget_used: the SAME
+    # 6.0 is counted exactly once, never twice.
+    assert projected_inflight_cost(db, project_id=project.id) == 0.0
+    assert project.budget_used == 6.0
+    check_budget(db, project, 4.0)  # 6 + 0 + 4 = 10 <= 10
+    with pytest.raises(BudgetExceededError):
+        check_budget(db, project, 4.5)
+
+
+def test_inflight_runs_of_other_projects_are_not_reserved(db) -> None:
+    """Budget is project-scoped: another project's in-flight work must never
+    consume this project's head-room."""
+    other_project, other_task = _seed_budget_project(
+        db, budget_limit=10.0, estimated_cost=9.0, name="other"
+    )
+    _run(
+        db,
+        project_id=other_project.id,
+        task_id=other_task.id,
+        status=DelegatedRunStatus.SUBMITTED,
+    )
+    project, _task = _seed_budget_project(db, budget_limit=10.0, estimated_cost=0.0)
+    assert projected_inflight_cost(db, project_id=project.id) == 0.0
+    check_budget(db, project, 9.0)  # unaffected
+
+
+def test_zero_estimate_inflight_matches_legacy_behaviour(db) -> None:
+    """An in-flight run whose task carries no estimate changes nothing -- the
+    gate behaves exactly as it did before GAP-2."""
+    project, task = _seed_budget_project(
+        db, budget_limit=10.0, budget_used=9.5, estimated_cost=0.0
+    )
+    _run(db, project_id=project.id, task_id=task.id, status=DelegatedRunStatus.SUBMITTED)
+    with pytest.raises(BudgetExceededError):
+        check_budget(db, project, 1.0)
+    check_budget(db, project, 0.4)
+
+
+def test_unenforced_project_skips_the_projection(db) -> None:
+    """``budget_limit <= 0`` stays an unconditional shortcut (legacy / open
+    projects): no projection, no block."""
+    project, task = _seed_budget_project(
+        db, budget_limit=0.0, budget_used=999.0, estimated_cost=999.0
+    )
+    _run(db, project_id=project.id, task_id=task.id, status=DelegatedRunStatus.SUBMITTED)
+    check_budget(db, project, 999.0)
+
+
+def test_inflight_statuses_are_the_complement_of_terminal_statuses() -> None:
+    """Guard the status partition: every run status is either in flight (spend
+    not yet accrued) or terminal (spend already handed to accrual)."""
+    assert set(INFLIGHT_RUN_STATUSES).isdisjoint(set(TERMINAL_RUN_STATUSES))
+    assert set(INFLIGHT_RUN_STATUSES) | set(TERMINAL_RUN_STATUSES) == set(
+        DelegatedRunStatus
+    )
+
+
+def test_projection_is_read_only(db) -> None:
+    """The projection must not mutate anything: it is a SELECT, never a
+    reservation, so it can never become a second budget writer."""
+    project, task = _seed_budget_project(db, budget_limit=10.0, estimated_cost=6.0)
+    run = _run(db, project_id=project.id, task_id=task.id, status=DelegatedRunStatus.SUBMITTED)
+    before_used = project.budget_used
+    before_status, before_cost = run.status, run.cost
+    check_budget(db, project, 4.0)
+    db.refresh(project)
+    db.refresh(run)
+    assert project.budget_used == before_used
+    assert run.status == before_status
+    assert run.cost == before_cost
+    assert run.budget_accrued_at is None
+
+
+def test_budget_error_reports_the_inflight_component(db) -> None:
+    """The block reason must be owner-debuggable: it names the reserved
+    in-flight amount, not just used + estimate."""
+    project, task = _seed_budget_project(db, budget_limit=10.0, estimated_cost=6.0)
+    _run(db, project_id=project.id, task_id=task.id, status=DelegatedRunStatus.SUBMITTED)
+    with pytest.raises(BudgetExceededError) as exc:
+        check_budget(db, project, 5.0)
+    message = str(exc.value)
+    assert "in_flight=6.0000" in message
