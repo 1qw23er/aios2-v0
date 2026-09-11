@@ -511,8 +511,12 @@ class DelegatedRun(SQLModel, table=True):
     # Opaque handle to the external secret store (e.g. "secret://hermes-api-key").
     secret_ref: str | None = Field(default=None, index=True)
     status: DelegatedRunStatus = Field(default=DelegatedRunStatus.SUBMITTED, index=True)
-    # Idempotency key: H(task_id, agent_id, attempt). The remote agent honors it so
-    # a retried submit never double-executes. Unique per attempt.
+    # Idempotency key: H(task_id, agent_id, attempt[, execution_key]). The remote
+    # agent honors it so a retried submit never double-executes. Unique per
+    # attempt. ``attempt`` restarts at 1 on each ``run()`` entry, so the caller's
+    # execution key is part of the hash: without it, re-running a FAILED task
+    # with the same agent recomputed the previous execution's key and hit this
+    # UNIQUE constraint, which made the documented recovery path impossible.
     idempotency_key: str = Field(unique=True, index=True)
     attempt: int = Field(default=1, ge=1)
     remote_run_id: str | None = Field(default=None, index=True)

@@ -67,8 +67,28 @@ from aios.models import (
 )
 
 
-def make_idempotency_key(task_id: str, agent_id: str, attempt: int) -> str:
+def make_idempotency_key(
+    task_id: str, agent_id: str, attempt: int, execution_key: str | None = None
+) -> str:
+    """Identity hash for one delegated attempt.
+
+    ``attempt`` is scoped to a single execution (it restarts at 1 every time
+    ``run()`` is entered), so ``H(task, agent, attempt)`` alone cannot tell two
+    *different* executions apart: re-running a FAILED task with the same agent
+    recomputed the first execution's key and hit the UNIQUE constraint on
+    ``delegated_run.idempotency_key`` -- which made the recovery path documented
+    in ``execute_task`` ("a FAILED task can be retried with a (new) idempotency
+    key") impossible for delegated execution.
+
+    ``execution_key`` is the caller-supplied idempotency key that identifies one
+    ``execute_task`` invocation, so the run identity becomes
+    "this attempt, of this execution". Omitting it keeps the historical
+    ``H(task, agent, attempt)`` shape (used by callers that have no execution
+    scope), which stays deterministic for a single execution.
+    """
     raw = f"{task_id}|{agent_id}|{attempt}"
+    if execution_key:
+        raw = f"{raw}|{execution_key}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -590,7 +610,12 @@ class DelegatedExecutionAdapter:
                 agent_id=self.agent.id,
                 delegation_mode=self.mode,
                 secret_ref=self.agent.secret_ref,  # opaque handle ONLY
-                idempotency_key=make_idempotency_key(task_id, self.agent.id, attempt),
+                # Scoped to THIS execution: `attempt` restarts at 1 on every
+                # run() entry, so without the execution key a retried execution
+                # would collide with the first execution's attempt 1.
+                idempotency_key=make_idempotency_key(
+                    task_id, self.agent.id, attempt, idempotency_key
+                ),
                 attempt=attempt,
                 callback_url=self.agent.callback_url,
                 context_ref=f"ctx://{idempotency_key}:{attempt}",
