@@ -23,6 +23,7 @@ a "wrong adapter" fallback.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -32,9 +33,13 @@ from aios.adapters.deepseek_harness import (
     DeepSeekHarnessWorkerClient,
     HarnessTransportError,
 )
+from aios.adapters.external import WorkstationAdapter
+from aios.adapters.hermes_remote import RemoteApiAdapter
 from aios.adapters.worker_delegated import WorkerDelegatedAdapter
 from aios.execution import ExecutionAdapter, LLMExecutionAdapter
-from aios.models import Agent, Task
+from aios.models import Agent, DelegationMode, Task
+
+logger = logging.getLogger(__name__)
 
 _HARNESS_CONFIG_PREFIX = "deepseek-harness+file://"
 
@@ -77,18 +82,64 @@ def _resolve_harness_delegated_adapter(
 def build_execution_adapter(session: Any, task_id: str) -> ExecutionAdapter:
     """Resolve the execution adapter for a task's assigned agent.
 
-    Deterministic, fail-closed selection (Runtime P1, C6): a harness-configured
-    agent resolves to ``WorkerDelegatedAdapter``; every other agent resolves to
-    the in-process ``LLMExecutionAdapter`` (the legitimate local substrate). The
-    selection key is the explicit feature flag + ``config_ref`` prefix, never
-    ``AdapterType``.
+    Deterministic, fail-closed selection (Runtime P1, C6):
+
+    * a harness-configured agent resolves to ``WorkerDelegatedAdapter``;
+    * an agent declaring ``delegation_mode`` (REMOTE_API / WORKSTATION) resolves to
+      the matching external-agent adapter (Agent Interoperability Gateway #57);
+      both implement the same ``DelegatedExecutionAdapter.run()`` surface as
+      ``LLMExecutionAdapter``, so the existing ``execute_task`` path works unchanged;
+    * every other agent resolves to the in-process ``LLMExecutionAdapter`` (the
+      legitimate local substrate).
+
+    The selection key is the explicit feature flag + ``config_ref`` prefix for the
+    harness, and ``agent.delegation_mode`` for external delegation -- never
+    ``AdapterType``. Misconfigured external agents fall back to the local LLM
+    adapter rather than breaking execution.
     """
     task = session.get(Task, task_id) if session is not None else None
     agent = session.get(Agent, task.assigned_agent_id) if task and task.assigned_agent_id else None
     harness = _resolve_harness_delegated_adapter(session, task, agent)
     if harness is not None:
         return harness
+    if agent is not None and agent.delegation_mode is not None:
+        routed = _resolve_delegated_adapter(agent)
+        if routed is not None:
+            return routed
     return LLMExecutionAdapter()
+
+
+def _resolve_delegated_adapter(agent: Agent) -> ExecutionAdapter | None:
+    """Resolve an external-agent adapter from ``agent.delegation_mode``.
+
+    Returns ``None`` when the mode is unsupported or misconfigured, so the caller
+    falls back to the in-process ``LLMExecutionAdapter``. Fail-closed by design --
+    a misconfigured external agent must never crash or silently reroute execution.
+    """
+    mode = agent.delegation_mode
+    if mode == DelegationMode.REMOTE_API:
+        return RemoteApiAdapter(agent=agent, resolve_secret=_resolve_environment_secret)
+    if mode == DelegationMode.WORKSTATION:
+        outbox = os.getenv("AIOS_WORKSTATION_OUTBOX")
+        inbox = os.getenv("AIOS_WORKSTATION_INBOX")
+        if not outbox or not inbox:
+            logger.warning(
+                "agent %s is WORKSTATION but AIOS_WORKSTATION_OUTBOX/INBOX is unset; "
+                "falling back to local LLM adapter",
+                agent.id,
+            )
+            return None
+        try:
+            return WorkstationAdapter(agent=agent, outbox=Path(outbox), inbox=Path(inbox))
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "agent %s WORKSTATION outbox/inbox invalid (%s); falling back to local LLM",
+                agent.id,
+                exc,
+            )
+            return None
+    # LOCAL is the LLM path; A2A/MCP are not implemented (delegation.py:4).
+    return None
 
 
 def _resolve_environment_secret(secret_ref: str | None) -> str:
