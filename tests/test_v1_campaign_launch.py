@@ -223,9 +223,11 @@ def test_concurrent_seed_is_safe(tmp_path, monkeypatch) -> None:
         assert len(agents) == 6, "department agents duplicated or missing"
 
 
-def test_fixed_routing_is_deterministic_for_department_tasks(client) -> None:
-    # After T1 completes and T2 becomes READY, FIXED routing must deterministically
-    # assign T2 to the Positioning agent (not best-available / fallback).
+def test_department_routing_is_deterministic_for_department_tasks(client) -> None:
+    # After T1 completes and T2 becomes READY, routing must deterministically assign
+    # T2 to the Positioning agent -- now because T2 declares the `positioning`
+    # capability and (on a seed-only DB) only that agent holds it, not because the
+    # launch froze an agent id on the task.
     resp = _launch(client, "routing test", "objective", idem="route-1")
     assert resp.status_code == 201
     data = resp.json()
@@ -243,7 +245,7 @@ def test_fixed_routing_is_deterministic_for_department_tasks(client) -> None:
         assignment = route_task(session, t2_id, "route-t2", commit=True)
         assert assignment is not None
         assert assignment.selected_agent_id == positioning.id
-        assert assignment.routing_reason == "fixed_agent"
+        assert assignment.routing_reason == "best_available_static_priority"
         assert session.get(Task, t2_id).assigned_agent_id == positioning.id
 
 

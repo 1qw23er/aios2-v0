@@ -440,8 +440,9 @@ def launch_campaign(
     """Create a V1 campaign Project + the T1-T9 task graph and kick off the first task.
 
     Reuses existing Project/Task/depends_on, capability routing (scheduler.route_task in
-    FIXED mode), AuditLog, the Event outbox and idempotency (request_fingerprint/_replay via
-    create_project/create_task). No new production models or migrations are introduced.
+    BEST_AVAILABLE mode), AuditLog, the Event outbox and idempotency
+    (request_fingerprint/_replay via create_project/create_task). No new production models
+    or migrations are introduced.
     """
     if not request.name or not request.name.strip():
         raise ServiceError(
@@ -486,7 +487,11 @@ def launch_campaign(
                 required_capabilities=[
                     capability_by_name[name] for name in task_def.get("required_capabilities", [])
                 ],
-                routing_mode=RoutingMode.FIXED if dept else RoutingMode.MANUAL,
+                # Department tasks route by CAPABILITY (BEST_AVAILABLE), not by a frozen
+                # agent id. ``assigned_agent_id`` below stays the department *hint* for
+                # readability/audit; the scheduler picks whoever actually holds the
+                # required capabilities, so an external / real agent can win on priority.
+                routing_mode=RoutingMode.BEST_AVAILABLE if dept else RoutingMode.MANUAL,
                 acceptance_criteria=list(task_def.get("acceptance_criteria", [])),
                 output_schema=dict(task_def.get("output_schema", {})),
                 depends_on=depends_on,
