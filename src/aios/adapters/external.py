@@ -7,6 +7,7 @@ from typing import Any
 from jsonschema import ValidationError, validate
 from pydantic import BaseModel, Field
 
+from aios.audit import redact_secrets
 from aios.context_render import render_task_context_markdown, task_context_payload
 from aios.delegation import DelegatedExecutionAdapter as _DelegatedExecutionAdapter
 from aios.models import Agent as _Agent
@@ -152,6 +153,15 @@ class WorkstationAdapter(_DelegatedExecutionAdapter):
         schema_path.write_text(
             json.dumps(output_schema, ensure_ascii=False), encoding="utf-8"
         )
+        # Propagate the selected agent's platform so the workstation runner routes
+        # THIS task to the agent's own LLM endpoint instead of the global default.
+        # Without it, every WORKSTATION task is executed against
+        # AIOS_WS_DEFAULT_PLATFORM and multi-platform delegation all collapse onto
+        # one endpoint. (Surfaced by Pilot #6 external-agent capability routing.)
+        if self.agent.platform:
+            (exported.packet_path.parent / ".platform").write_text(
+                self.agent.platform, encoding="utf-8"
+            )
         return {
             "remote_run_id": f"ws:{delegated_run.task_id}",
             "remote_status": "waiting_external",
@@ -159,10 +169,35 @@ class WorkstationAdapter(_DelegatedExecutionAdapter):
         }
 
     def status(self, *, delegated_run):
+        # Fail-fast: the workstation runner records a terminal execution failure by
+        # dropping an ``.error`` sentinel beside the task packet (see
+        # ``workstation_runner.process_task``). Surface it as finished/failed so the
+        # delegation wait loop terminalizes immediately instead of polling until the
+        # per-agent timeout expires. If a result and an error marker coexist the
+        # state is ambiguous, so we fail closed -- the error wins and a genuine
+        # failure is never masked by a stale artifact.
+        error_file = self._ws.outbox / delegated_run.task_id / ".error"
+        if error_file.exists():
+            return {
+                "remote_status": "failed",
+                "finished": True,
+                "result": None,
+                "error": self._read_error(error_file),
+            }
         result_file = self._ws.inbox / f"{delegated_run.task_id}.result.json"
         if result_file.exists():
             return {"remote_status": "succeeded", "finished": True, "result": None}
         return {"remote_status": "waiting_external", "finished": False, "result": None}
+
+    @staticmethod
+    def _read_error(error_file: Path) -> str:
+        """Read the runner's failure marker, sanitized, with a non-empty fallback."""
+        try:
+            text = error_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            text = ""
+        # Never let a credential ride out on an error string.
+        return str(redact_secrets(text or "workstation runner reported a failure"))
 
     def cancel(self, *, delegated_run):
         pass  # workstation runs are operator-driven; nothing to cancel remotely
