@@ -14,6 +14,11 @@ without changing behaviour or introducing a new abstraction:
   falling back to a different adapter (no silent fallback, C6).
 * Only statically-imported adapters are ever instantiated -- there is no dynamic
   module loading / arbitrary code execution (R6).
+* External agent delegation (``agent.delegation_mode`` -> ``RemoteApiAdapter`` /
+  ``WorkstationAdapter``, Gateway #57) is a SEPARATE opt-in behind
+  ``AIOS_EXTERNAL_DELEGATION_ENABLED`` (default off, fail-closed). It is distinct
+  from the DeepSeek Harness worker; when unset, ``delegation_mode`` is ignored and
+  the agent resolves to the in-process ``LLMExecutionAdapter``.
 
 The in-process ``LLMExecutionAdapter`` remains the legitimate local substrate for
 every agent that is not explicitly harness-configured; it is the default path, not
@@ -79,6 +84,19 @@ def _resolve_harness_delegated_adapter(
     return WorkerDelegatedAdapter(agent=agent, client=client).as_execution_adapter()
 
 
+def _external_delegation_enabled() -> bool:
+    """Opt-in gate for ``agent.delegation_mode`` routing (Agent Interoperability
+    Gateway #57).
+
+    External delegation (REMOTE_API / WORKSTATION) is fail-closed: unless
+    ``AIOS_EXTERNAL_DELEGATION_ENABLED`` is explicitly ``true``, ``delegation_mode``
+    is ignored and the agent resolves to the in-process ``LLMExecutionAdapter``.
+    This preserves the established invariant that non-LLM execution is opt-in and
+    that a disabled external-execution surface never silently reroutes a task.
+    """
+    return os.getenv("AIOS_EXTERNAL_DELEGATION_ENABLED", "").lower() == "true"
+
+
 def build_execution_adapter(session: Any, task_id: str) -> ExecutionAdapter:
     """Resolve the execution adapter for a task's assigned agent.
 
@@ -94,15 +112,18 @@ def build_execution_adapter(session: Any, task_id: str) -> ExecutionAdapter:
 
     The selection key is the explicit feature flag + ``config_ref`` prefix for the
     harness, and ``agent.delegation_mode`` for external delegation -- never
-    ``AdapterType``. Misconfigured external agents fall back to the local LLM
-    adapter rather than breaking execution.
+    ``AdapterType``. External delegation is itself opt-in behind
+    ``AIOS_EXTERNAL_DELEGATION_ENABLED`` (default off, fail-closed): when unset,
+    ``delegation_mode`` is ignored and the agent resolves to the local LLM adapter,
+    preserving the "harness disabled -> local LLM" invariant. Misconfigured external
+    agents also fall back to the local LLM adapter rather than breaking execution.
     """
     task = session.get(Task, task_id) if session is not None else None
     agent = session.get(Agent, task.assigned_agent_id) if task and task.assigned_agent_id else None
     harness = _resolve_harness_delegated_adapter(session, task, agent)
     if harness is not None:
         return harness
-    if agent is not None and agent.delegation_mode is not None:
+    if _external_delegation_enabled() and agent is not None and agent.delegation_mode is not None:
         routed = _resolve_delegated_adapter(agent)
         if routed is not None:
             return routed

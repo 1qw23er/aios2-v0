@@ -65,7 +65,7 @@ def test_local_model_agent_returns_llm_execution_adapter(session: Session) -> No
 
 
 def test_remote_api_agent_returns_remote_adapter(session: Session, monkeypatch) -> None:
-    monkeypatch.setenv("AIOS_DEEPSEEK_HARNESS_ENABLED", "false")
+    monkeypatch.setenv("AIOS_EXTERNAL_DELEGATION_ENABLED", "true")
     agent = Agent(
         id="agt-remote",
         name="R",
@@ -84,6 +84,7 @@ def test_workstation_agent_returns_workstation_adapter(
 ) -> None:
     outbox = tmp_path / "outbox"
     inbox = tmp_path / "inbox"
+    monkeypatch.setenv("AIOS_EXTERNAL_DELEGATION_ENABLED", "true")
     monkeypatch.setenv("AIOS_WORKSTATION_OUTBOX", str(outbox))
     monkeypatch.setenv("AIOS_WORKSTATION_INBOX", str(inbox))
     agent = Agent(
@@ -113,6 +114,26 @@ def test_workstation_without_env_falls_back_to_llm(
         adapter_type=AdapterType.EXTERNAL,
         delegation_mode=DelegationMode.WORKSTATION,
         platform="workbuddy",
+    )
+    task = _make_task(session, agent)
+    adapter = build_execution_adapter(session, task.id)
+    assert isinstance(adapter, LLMExecutionAdapter)
+
+
+def test_delegation_disabled_by_default_resolves_to_local_llm(
+    session: Session, monkeypatch
+) -> None:
+    """Fail-closed invariant: ``delegation_mode`` is opt-in. When
+    ``AIOS_EXTERNAL_DELEGATION_ENABLED`` is unset, even a REMOTE_API agent must
+    resolve to the in-process LLM adapter (mirrors the harness-disabled contract)."""
+    monkeypatch.delenv("AIOS_EXTERNAL_DELEGATION_ENABLED", raising=False)
+    agent = Agent(
+        id="agt-off",
+        name="O",
+        role="r",
+        adapter_type=AdapterType.API,
+        delegation_mode=DelegationMode.REMOTE_API,
+        endpoint="http://127.0.0.1:1",
     )
     task = _make_task(session, agent)
     adapter = build_execution_adapter(session, task.id)
