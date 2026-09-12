@@ -242,7 +242,7 @@ def test_per_agent_max_retries(session: Session) -> None:
 def test_cancel_run_emits_cancelled(session: Session) -> None:
     _, agent, task = _seed(session)
     adapter = FakeAdapter(agent=agent)
-    run = adapter._create_run(task.id, "ide-4", 1)
+    run = adapter._create_run(task.id, "ide-4")
     adapter._record_submitted(run, {"remote_run_id": "x", "remote_status": "running"})
 
     status = cancel_run(run)

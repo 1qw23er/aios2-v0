@@ -513,10 +513,11 @@ class DelegatedRun(SQLModel, table=True):
     status: DelegatedRunStatus = Field(default=DelegatedRunStatus.SUBMITTED, index=True)
     # Idempotency key: H(task_id, agent_id, attempt[, execution_key]). The remote
     # agent honors it so a retried submit never double-executes. Unique per
-    # attempt. ``attempt`` restarts at 1 on each ``run()`` entry, so the caller's
-    # execution key is part of the hash: without it, re-running a FAILED task
-    # with the same agent recomputed the previous execution's key and hit this
-    # UNIQUE constraint, which made the documented recovery path impossible.
+    # attempt. ``attempt`` is a globally-monotonic per-task counter (1, 2, 3, ...)
+    # derived from the persisted DelegatedRun rows at run-creation time (GAP-A fix):
+    # re-running a FAILED task continues the sequence instead of restarting at 1,
+    # so the UNIQUE constraint is never hit. ``execution_key`` (the caller's
+    # execute_task idempotency key) is retained as defense-in-depth.
     idempotency_key: str = Field(unique=True, index=True)
     attempt: int = Field(default=1, ge=1)
     remote_run_id: str | None = Field(default=None, index=True)
