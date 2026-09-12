@@ -1,0 +1,11 @@
+{
+  "_comment": "DeepSeek Harness worker launch config TEMPLATE (PLACEHOLDER). The real deepseek-harness-sdk-runtime worker binary is NOT present in this environment, so AIOS_DEEPSEEK_HARNESS_ENABLED must stay false until a worker exists. To activate: (1) obtain the harness SDK runtime that speaks aios.worker/v1 (serverInfo.name == 'deepseek-harness-sdk-runtime'); (2) fill command/cwd/manifest/manifest_sha256/active_plugins below; (3) export AIOS_DEEPSEEK_HARNESS_ENABLED=true and AIOS_AGENT_API_KEY; (4) register an agent with config_ref='deepseek-harness+file://<this file>' and secret_ref='env://AIOS_AGENT_API_KEY'. The harness path is fail-closed: any malformed config raises HarnessTransportError instead of silently falling back.",
+  "command": ["node", "harness_worker.js"],
+  "cwd": "/abs/path/to/harness/runtime",
+  "manifest": "cordis.yaml",
+  "manifest_sha256": "REPLACE_WITH_PINNED_SHA256",
+  "active_plugins": [
+    "@deepseek-ai/dsh-fs-sandbox",
+    "@deepseek-ai/dsh-sandbox-policy"
+  ]
+}

@@ -575,6 +575,11 @@ class LLMExecutionAdapter:
         ).rstrip("/")
         self.api_key = api_key if api_key is not None else os.getenv("AIOS_AGENT_API_KEY")
         self.model = model or os.getenv("AIOS_AGENT_MODEL", "deepseek-ai/deepseek-v4-pro")
+        logger.info(
+            "LLMExecutionAdapter initialized model=%s base_url=%s",
+            self.model,
+            self.base_url,
+        )
         # Retry is ON by default (owner cost approval captured in Issue #55) and
         # tunable: AIOS_AGENT_MAX_RETRIES (0 disables) and AIOS_AGENT_BACKOFF
         # (base seconds; exponential growth capped). Values are clamped so a bad

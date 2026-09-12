@@ -127,7 +127,10 @@ def build_execution_adapter(session: Any, task_id: str) -> ExecutionAdapter:
         routed = _resolve_delegated_adapter(agent)
         if routed is not None:
             return routed
-    return LLMExecutionAdapter()
+    return LLMExecutionAdapter(
+        base_url=agent.endpoint if agent is not None else None,
+        model=agent.model if agent is not None else None,
+    )
 
 
 def _resolve_delegated_adapter(agent: Agent) -> ExecutionAdapter | None:

@@ -401,6 +401,13 @@ def complete_local_run(
         values["error"] = error
     if usage is not None:
         values["usage"] = usage
+    # Heterogeneous-backend attribution (additive): record which model actually
+    # executed this run. ``model`` is threaded from the adapter
+    # (LLMExecutionAdapter.model) through run()/_finish_local_run; persisting it
+    # here is what makes "which model produced which artifact" queryable instead
+    # of being silently dropped. A NULL means pre-attribution / non-LLM run.
+    if model is not None:
+        values["model"] = model
     resolved_cost: float | None = float(cost) if cost else None
     if resolved_cost is None and usage is not None:
         # GAP-3 Stage 2: derive a cost from the usage the provider reported.
