@@ -35,7 +35,6 @@ from aios.execution_run import complete_local_run, create_local_run
 from aios.models import (
     Artifact,
     ArtifactType,
-    DelegatedRun,
     DelegatedRunStatus,
     Task,
     TaskContext,
@@ -157,6 +156,55 @@ def _redact_secrets(text: str) -> str:
     if api_key and api_key in text:
         text = text.replace(api_key, "***REDACTED***")
     return _SECRET_PATTERN.sub("***REDACTED***", text)
+
+
+def _format_run_error(
+    detail: str,
+    *,
+    phase: str | None = None,
+    error_type: str | None = None,
+) -> str:
+    """Pack a failure's phase + error type into the ``DelegatedRun.error`` column.
+
+    The ``error`` column is a single free-text field (no migration was introduced
+    for P0). To still persist *which phase failed* and *what error category* --
+    both required by the cost/attribution post-mortem -- we fold them into the
+    existing string in a parseable ``[type=X phase=Y] detail`` form. Consumers
+    recover the parts via :func:`_parse_run_error`. A plain (legacy) error string
+    round-trips unchanged.
+    """
+    tags: list[str] = []
+    if error_type is not None:
+        tags.append(f"type={error_type}")
+    if phase is not None:
+        tags.append(f"phase={phase}")
+    if not tags:
+        return detail
+    return f"[{' '.join(tags)}] {detail}"
+
+
+def _parse_run_error(
+    error: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Inverse of :func:`_format_run_error`. Returns ``(phase, error_type, detail)``.
+
+    Never raises; an unrecognized/legacy format returns ``(None, None, error)``.
+    """
+    if not error or not error.startswith("["):
+        return (None, None, error)
+    end = error.find("]")
+    if end == -1:
+        return (None, None, error)
+    body = error[1:end]
+    phase: str | None = None
+    error_type: str | None = None
+    for tok in body.split():
+        if tok.startswith("phase="):
+            phase = tok[len("phase=") :]
+        elif tok.startswith("type="):
+            error_type = tok[len("type=") :]
+    detail = error[end + 1 :].lstrip()
+    return (phase, error_type, detail)
 
 
 class ExecutionError(ServiceError):
@@ -633,7 +681,6 @@ class LLMExecutionAdapter:
         last_exc: ExecutionError | None = None
         attempts = 0
         max_attempts = 1 + self.max_retries
-        run: DelegatedRun | None = None
         run_id: str | None = None
         for attempt in range(1, max_attempts + 1):
             attempts = attempt
@@ -641,25 +688,16 @@ class LLMExecutionAdapter:
             # the call, so evidence/accounting is captured even when it fails.
             # Best-effort: a recording failure must never fail the execution
             # itself (the task result is still valid) -- we log and continue.
-            if project_id is not None:
-                try:
-                    with make_session() as s:
-                        run = create_local_run(
-                            s,
-                            task_id=task_id,
-                            project_id=project_id,
-                            attempt=attempt,
-                            idempotency_key=idempotency_key,
-                        )
-                        run_id = run.id
-                except Exception:  # noqa: BLE001 - evidence is best-effort
-                    logger.warning(
-                        "failed to record local DelegatedRun for task %s attempt %d",
-                        task_id,
-                        attempt,
-                        exc_info=True,
-                    )
-                    run = None
+            run_id = (
+                self._record_local_run(
+                    task_id=task_id,
+                    project_id=project_id,
+                    attempt=attempt,
+                    idempotency_key=idempotency_key,
+                )
+                if project_id is not None
+                else None
+            )
             try:
                 recovery = None if attempt == 1 else self._RETRY_RECOVERY_HINT
                 content, usage = self._chat(
@@ -669,8 +707,14 @@ class LLMExecutionAdapter:
                 last_exc = exc
                 # Terminalize the local run as FAILED with normalized, redacted
                 # evidence; a failed-but-paid attempt accrues via the unified path.
+                # model is always forwarded so the attempted model is attributable
+                # even on failure (P0: cost/attribution must not be lost).
                 self._finish_local_run(
-                    run_id, DelegatedRunStatus.FAILED, error=_redact_secrets(exc.detail)
+                    run_id,
+                    DelegatedRunStatus.FAILED,
+                    error=_redact_secrets(exc.detail),
+                    phase="chat",
+                    error_type=exc.category.value,
                 )
                 if exc.category in _RETRYABLE_CATEGORIES and attempt < max_attempts:
                     # Bounded sleep: exponential backoff capped at 30s. No secret
@@ -680,20 +724,57 @@ class LLMExecutionAdapter:
                         time.sleep(delay)
                     continue
                 break  # non-retryable, or out of attempts
+            except Exception as exc:  # noqa: BLE001 - non-ExecutionError from _chat
+                # P0 safety net: any unexpected error from the model call is still
+                # captured as a terminalized, attributable FAILED run (it must never
+                # be left dangling in SUBMITTED).
+                last_exc = ExecutionError(
+                    502,
+                    _redact_secrets(f"模型调用失败：{exc}"),
+                    category=AdapterErrorCategory.UNKNOWN,
+                )
+                self._finish_local_run(
+                    run_id,
+                    DelegatedRunStatus.FAILED,
+                    error=_redact_secrets(str(exc)),
+                    phase="chat",
+                    error_type=AdapterErrorCategory.UNKNOWN.value,
+                )
+                break
             else:
-                data = self._parse_json(content)
+                # Parse + validate the model output. These steps run AFTER a
+                # successful _chat() call, so `usage` is already known and must be
+                # persisted even when parsing fails (P0: a paid attempt's usage is
+                # never lost). Previously a failure here escaped run() and left the
+                # DelegatedRun stuck in SUBMITTED -- now it is terminalized.
+                try:
+                    data = self._parse_json(content)
+                except ExecutionError as exc:
+                    last_exc = exc
+                    self._finish_local_run(
+                        run_id,
+                        DelegatedRunStatus.FAILED,
+                        error=_redact_secrets(exc.detail),
+                        usage=usage,
+                        phase="parse",
+                        error_type=exc.category.value,
+                    )
+                    break
                 if not isinstance(data, dict):
                     err = ExecutionError(
                         502,
                         "模型返回的不是 JSON 对象",
                         category=AdapterErrorCategory.PROVIDER_STRUCTURE,
                     )
+                    last_exc = err
                     self._finish_local_run(
                         run_id,
                         DelegatedRunStatus.FAILED,
                         error=_redact_secrets(err.detail),
+                        usage=usage,
+                        phase="parse_shape",
+                        error_type=AdapterErrorCategory.PROVIDER_STRUCTURE.value,
                     )
-                    last_exc = err
                     break
                 artifacts = [
                     {
@@ -711,7 +792,9 @@ class LLMExecutionAdapter:
                 )
                 # Terminalize as SUCCEEDED with real provider usage (None when the
                 # provider reports no token counts; never fabricated).
-                self._finish_local_run(run_id, DelegatedRunStatus.SUCCEEDED, usage=usage)
+                self._finish_local_run(
+                    run_id, DelegatedRunStatus.SUCCEEDED, usage=usage
+                )
                 return result
         # All attempts exhausted (or a non-retryable category on the first try).
         assert last_exc is not None  # loop either raised or stored last_exc
@@ -727,6 +810,39 @@ class LLMExecutionAdapter:
         err.max_attempts = max_attempts
         raise err from last_exc
 
+    def _record_local_run(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        attempt: int,
+        idempotency_key: str,
+    ) -> str | None:
+        """Persist one local LLM attempt as a ``DelegatedRun`` (LOCAL, no lease).
+
+        Best-effort: a recording failure must never fail the execution itself --
+        we log and return ``None`` so the call still proceeds (the task result,
+        if produced, remains valid even without this evidence row).
+        """
+        try:
+            with make_session() as s:
+                run = create_local_run(
+                    s,
+                    task_id=task_id,
+                    project_id=project_id,
+                    attempt=attempt,
+                    idempotency_key=idempotency_key,
+                )
+                return run.id
+        except Exception:  # noqa: BLE001 - evidence is best-effort
+            logger.warning(
+                "failed to record local DelegatedRun for task %s attempt %d",
+                task_id,
+                attempt,
+                exc_info=True,
+            )
+            return None
+
     def _finish_local_run(
         self,
         run_id: str | None,
@@ -734,6 +850,8 @@ class LLMExecutionAdapter:
         *,
         error: str | None = None,
         usage: dict[str, Any] | None = None,
+        phase: str | None = None,
+        error_type: str | None = None,
     ) -> None:
         """Terminalize a local ``DelegatedRun`` (no-op when recording is off).
 
@@ -746,20 +864,27 @@ class LLMExecutionAdapter:
         The adapter's configured model is always forwarded, so a priced model
         can be turned into a cost from the reported usage (GAP-3 Stage 2);
         with no price table configured this is a no-op and the run stays
-        cost-free.
+        cost-free. ``phase`` / ``error_type`` are folded into the ``error``
+        column via :func:`_format_run_error` so failure attribution (which step
+        failed, with what category) survives without a schema migration.
 
         Best-effort: a recording failure must never fail the execution (the task
         result is already valid); we log and continue.
         """
         if run_id is None:
             return
+        structured_error = (
+            _format_run_error(error, phase=phase, error_type=error_type)
+            if error is not None
+            else None
+        )
         try:
             with make_session() as s:
                 complete_local_run(
                     s,
                     run_id=run_id,
                     status=status,
-                    error=error,
+                    error=structured_error,
                     usage=usage,
                     model=self.model,
                 )
