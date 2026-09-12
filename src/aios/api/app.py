@@ -603,6 +603,18 @@ def _to_feedback_detail(fb: Artifact) -> FeedbackDetail:
 def create_app() -> FastAPI:
     application = FastAPI(title="AIOS V0", version="0.1.0", lifespan=lifespan)
 
+    # Encoding hardening: Starlette emits `application/json` WITHOUT a charset.
+    # PowerShell 5.1 Invoke-RestMethod then decodes the body as Latin-1,
+    # turning every CJK char into mojibake (æ¼å¤å¤). Stamp an explicit
+    # charset=utf-8 so every client (PowerShell / curl / browser) decodes right.
+    @application.middleware("http")
+    async def _ensure_json_utf8(request: Request, call_next):
+        response = await call_next(request)
+        ct = response.headers.get("content-type", "")
+        if ct.startswith("application/json") and "charset" not in ct:
+            response.headers["content-type"] = "application/json; charset=utf-8"
+        return response
+
     # DR-W7-6: uncaught DB integrity violations become 409, not 500.
     application.add_exception_handler(IntegrityError, integrity_error_handler)
 
