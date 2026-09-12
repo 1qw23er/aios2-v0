@@ -37,7 +37,7 @@ from aios.db import get_engine, run_migrations
 from alembic import command
 
 # Current single leaf of the whole tree (what #124 owns + advances).
-HEAD = "20260909_0004_callback_ingest"
+HEAD = "20260912_0002_run_model"
 SERIES_REVISION = "20260820_0001_series_id"
 SERIES_FILE = "20260820_0001_series_id.py"
 # Previous leaf: the SalesPlaybook V0 follow-up slice. #124 chains directly after it.
