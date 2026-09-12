@@ -1190,7 +1190,7 @@ def test_alembic_single_new_head() -> None:
     cfg = Config(root / "alembic.ini")
     cfg.set_main_option("script_location", str(root / "alembic"))
     head = ScriptDirectory.from_config(cfg).get_current_head()
-    assert head == "20260912_0002_run_model"
+    assert head == "20260913_0001_skill_required_output_contract"
 
 
 def test_migration_adds_bootstrap_token_ref_no_second_index(v4_session) -> None:

@@ -176,8 +176,8 @@ def test_alpha3_migration_upgrade_downgrade_round_trip(tmp_path: Path) -> None:
     # 20260906_0001_recommendation_trust_advisory, the W8-v2 Workforce
     # Execution Bridge slice 20260906_0002, and finally the Skill System V1
     # slice (skill_candidate / skill_review_decision / skill +
-    # task_context.applicable_skills): 20260912_0002_run_model.
-    assert revision() == "20260912_0002_run_model"
+    # task_context.applicable_skills): 20260913_0001_skill_required_output_contract.
+    assert revision() == "20260913_0001_skill_required_output_contract"
 
 
 def test_scope_unique_migration_round_trip(tmp_path: Path) -> None:

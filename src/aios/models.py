@@ -2550,6 +2550,16 @@ class Skill(SQLModel, table=True):
     steps: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     tool_bindings: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     execution_strategy: str
+    # Plan A (contract merge): the structured output a skill REQUIRES the agent
+    # to produce, expressed as a JSON-schema fragment (same shape as
+    # Task.output_schema: {"type": "object", "properties": {...}, "required": [...]}).
+    # Empty {} means the skill imposes no output contract (backward-compatible;
+    # existing skills carry {} and contribute nothing to the merged contract).
+    # The merged contract = task.output_schema UNION (each applicable skill's
+    # required_output_contract); task fields stay authoritative on conflict.
+    required_output_contract: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON)
+    )
     project_id: str | None = Field(default=None, foreign_key="project.id", index=True)
     source_project_id: str = Field(foreign_key="project.id", index=True)
     source_artifact_id: str | None = Field(

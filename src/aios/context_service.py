@@ -687,6 +687,7 @@ class ContextService:
                 "execution_strategy": skill.execution_strategy.value
                 if hasattr(skill.execution_strategy, "value")
                 else skill.execution_strategy,
+                "required_output_contract": skill.required_output_contract,
                 "content_hash": skill.content_hash,
                 "source_candidate_id": skill.source_candidate_id,
                 "review_decision_id": skill.review_decision_id,
