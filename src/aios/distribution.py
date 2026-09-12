@@ -52,11 +52,11 @@ def _package_result_id(package_task_id: str) -> str:
 
 
 def resolve_publish_gate_task(session: Session, project_id: str) -> Task | None:
-    """The publish-gate task = the MANUAL task that depends on exactly one FIXED task.
+    """The publish-gate task = the MANUAL task that depends on exactly one non-MANUAL (routed) task.
 
     In the V1 graph two tasks are MANUAL: the human review (T6, depends on T3/T4/T5 ->
     3 deps) and the publish gate (T8, depends on the packaging task T7 -> 1 FIXED dep).
-    That single-FIXED-dependency shape uniquely identifies the publish gate without
+    That single-routed-dependency shape uniquely identifies the publish gate without
     relying on the (non-persisted) T-key or the Chinese title.
     """
     tasks = list(session.exec(select(Task).where(Task.project_id == project_id)))
