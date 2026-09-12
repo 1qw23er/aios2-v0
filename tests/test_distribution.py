@@ -167,7 +167,9 @@ def test_graph_resolution_identifies_package_and_gate(client: TestClient) -> Non
         assert gate is not None and gate.title == _task_by_key(session, "T8").title
         assert gate.routing_mode == RoutingMode.MANUAL
         assert package is not None and package.title == _task_by_key(session, "T7").title
-        assert package.routing_mode == RoutingMode.FIXED
+        # T7 is a department task, so it routes by capability, not a frozen agent id.
+        # Resolution above keys off "not MANUAL", so this stays correct either way.
+        assert package.routing_mode == RoutingMode.BEST_AVAILABLE
         source_titles = {t.title for t in sources}
         assert source_titles == {
             _task_by_key(session, "T3").title,
