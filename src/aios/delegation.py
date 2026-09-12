@@ -27,7 +27,11 @@ Security model (enforced here):
     so concurrent delegations cannot over-commit together (GAP-2 / ``check_budget``).
   * The agent may submit results but may NOT mutate Task / Approval /
     KnowledgeFact / downstream workflow state directly.
-  * Idempotency key = H(task_id, agent_id, attempt); the remote honors it.
+  * Idempotency key = H(task_id, agent_id, attempt[, execution_key]); the remote
+    honors it. ``attempt`` is a globally-monotonic per-task counter (derived from
+    the persisted DelegatedRun rows at run-creation time), so re-executing a
+    FAILED task continues 1, 2, 3, ... instead of restarting at 1 and colliding
+    on the UNIQUE key (GAP-A).
 """
 
 from __future__ import annotations
@@ -37,7 +41,8 @@ import time
 from datetime import datetime
 from typing import Any, Protocol
 
-from sqlmodel import Session
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import Session, select
 
 from aios.audit import AuditEvent, append_audit, redact_secrets
 from aios.callback_ingest import (
@@ -72,24 +77,56 @@ def make_idempotency_key(
 ) -> str:
     """Identity hash for one delegated attempt.
 
-    ``attempt`` is scoped to a single execution (it restarts at 1 every time
-    ``run()`` is entered), so ``H(task, agent, attempt)`` alone cannot tell two
-    *different* executions apart: re-running a FAILED task with the same agent
-    recomputed the first execution's key and hit the UNIQUE constraint on
-    ``delegated_run.idempotency_key`` -- which made the recovery path documented
-    in ``execute_task`` ("a FAILED task can be retried with a (new) idempotency
-    key") impossible for delegated execution.
+    ``attempt`` is a globally-monotonic per-task counter (1, 2, 3, ...), derived
+    from the persisted ``DelegatedRun`` rows for the task at run-creation time
+    (see ``_next_attempt``). Re-running a FAILED task therefore continues the
+    sequence instead of restarting at 1, so the recovery path documented in
+    ``execute_task`` ("a FAILED task can be retried with a (new) idempotency
+    key") now works for delegated execution (GAP-A).
 
     ``execution_key`` is the caller-supplied idempotency key that identifies one
-    ``execute_task`` invocation, so the run identity becomes
-    "this attempt, of this execution". Omitting it keeps the historical
-    ``H(task, agent, attempt)`` shape (used by callers that have no execution
-    scope), which stays deterministic for a single execution.
+    ``execute_task`` invocation. It is retained as defense-in-depth: even if two
+    executions were ever assigned the same ``attempt`` (they are not), the key
+    still differs, so the UNIQUE constraint on ``delegated_run.idempotency_key``
+    is never hit. Omitting it keeps the historical ``H(task, agent, attempt)``
+    shape (used by callers that have no execution scope).
     """
     raw = f"{task_id}|{agent_id}|{attempt}"
     if execution_key:
         raw = f"{raw}|{execution_key}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+# Bounded re-derivation attempts when a concurrent writer wins the UNIQUE race
+# on delegated_run.idempotency_key (see _create_run). We never swallow the
+# IntegrityError silently -- we re-read MAX(attempt) and re-insert, then surface.
+_ATTEMPT_ALLOC_RETRIES = 5
+
+
+def _next_attempt(session: Session, task_id: str) -> int:
+    """Next attempt number for ``task_id``, derived from persisted runs.
+
+    Reads ``MAX(attempt)`` over the task's existing ``DelegatedRun`` rows and
+    adds 1. The attempt counter is NEVER an in-memory value, so a re-execution
+    of a FAILED task continues the sequence (GAP-A).
+
+    Concurrency: on engines that honour row locks (Postgres) the parent ``Task``
+    is locked with ``FOR UPDATE`` so two concurrent executions of the same task
+    serialize their attempt assignment. On SQLite that lock is a no-op, and the
+    UNIQUE constraint on ``delegated_run.idempotency_key`` is the authoritative
+    guard: if a concurrent writer slipped in, ``_create_run``'s commit raises
+    ``IntegrityError`` and the caller re-derives + re-inserts (bounded, never
+    swallowed -- see ``_create_run``).
+    """
+    # Lock the parent row so concurrent executions of the same task serialize
+    # their attempt allocation (no-op on SQLite, real row lock on Postgres).
+    session.exec(
+        select(Task).where(Task.id == task_id).with_for_update()
+    ).first()
+    rows = session.exec(
+        select(DelegatedRun.attempt).where(DelegatedRun.task_id == task_id)
+    ).all()
+    return (max(rows) if rows else 0) + 1
 
 
 def cancel_run(run: DelegatedRun) -> DelegatedRunStatus:
@@ -453,9 +490,9 @@ class DelegatedExecutionAdapter:
         ctx_project_id = getattr(task_context, "project_id", None)
         ctx_task_id = getattr(task_context, "task_id", None)
 
-        attempt = 1
         last_error: str | None = None
-        while attempt <= self.max_retries:
+        tries = 0
+        while tries < self.max_retries:
             # Per-attempt hard budget gate (C: Unified Attempt + Usage + Budget
             # Accrual). Re-checked on EVERY attempt -- not once before the loop --
             # so it observes ``Project.budget_used`` grow as prior (paid) attempts
@@ -468,7 +505,7 @@ class DelegatedExecutionAdapter:
                     project = s.get(Project, ctx_project_id)
                     est = float(getattr(ctx_task, "estimated_cost", 0.0) or 0.0)
                     check_budget(s, project, est)
-            run = self._create_run(task_id, idempotency_key, attempt)
+            run = self._create_run(task_id, idempotency_key)
             # Callback / Webhook Ingest P1: mint a run-scoped token + the
             # AIOS-hosted callback URL for THIS run/attempt. Best-effort by
             # design -- if the owner signing key is not configured we simply
@@ -481,7 +518,7 @@ class DelegatedExecutionAdapter:
                 callback_url = build_callback_url(run.id)
                 callback_token = mint_callback_token(
                     run_id=run.id,
-                    attempt=attempt,
+                    attempt=run.attempt,
                     agent_id=self.agent.id,
                     ttl_seconds=self.timeout_s + CALLBACK_TTL_GRACE_SECONDS,
                 )
@@ -546,9 +583,9 @@ class DelegatedExecutionAdapter:
             except DelegatedExecutionError as exc:
                 last_error = str(exc)
                 self._record_failed(run, last_error)
-                if attempt < self.max_retries:
-                    time.sleep(self.backoff_base * (2 ** (attempt - 1)))
-                    attempt += 1
+                tries += 1
+                if tries < self.max_retries:
+                    time.sleep(self.backoff_base * (2 ** (tries - 1)))
                     continue
                 raise
             finally:
@@ -601,36 +638,56 @@ class DelegatedExecutionAdapter:
         raise NotImplementedError
 
     # --- run lifecycle helpers ---
-    def _create_run(self, task_id: str, idempotency_key: str, attempt: int) -> DelegatedRun:
-        with _session() as s:
-            task = s.get(Task, task_id)
-            run = DelegatedRun(
-                project_id=task.project_id,
-                task_id=task_id,
-                agent_id=self.agent.id,
-                delegation_mode=self.mode,
-                secret_ref=self.agent.secret_ref,  # opaque handle ONLY
-                # Scoped to THIS execution: `attempt` restarts at 1 on every
-                # run() entry, so without the execution key a retried execution
-                # would collide with the first execution's attempt 1.
-                idempotency_key=make_idempotency_key(
-                    task_id, self.agent.id, attempt, idempotency_key
-                ),
-                attempt=attempt,
-                callback_url=self.agent.callback_url,
-                context_ref=f"ctx://{idempotency_key}:{attempt}",
-            )
-            s.add(run)
-            s.commit()
-            s.refresh(run)
-            # Execution Run Lifecycle P0: take the durable lease immediately. A
-            # freshly inserted row has a NULL lease, so this always succeeds --
-            # but it goes through the same conditional UPDATE as any other
-            # acquirer, so the run is protected from the recovery scan from the
-            # moment it exists.
-            acquire_run_lease(s, run_id=run.id, owner=self._lease_owner)
-            s.refresh(run)
-            return run
+    def _create_run(self, task_id: str, idempotency_key: str) -> DelegatedRun:
+        """Create one ``DelegatedRun`` for the next attempt of ``task_id``.
+
+        The attempt number is derived from the *persisted* ``DelegatedRun`` rows
+        for this task (see ``_next_attempt``) -- never an in-memory counter -- so
+        a re-execution of a FAILED task continues 1, 2, 3, ... instead of
+        restarting at 1 and colliding on the UNIQUE ``idempotency_key`` (GAP-A).
+
+        Concurrency: if a concurrent writer commits the same derived attempt
+        first, the UNIQUE constraint raises ``IntegrityError`` on commit. We do
+        NOT swallow it -- we re-read ``MAX(attempt)`` and re-insert, up to
+        ``_ATTEMPT_ALLOC_RETRIES`` times, then surface the error honestly.
+        """
+        last_exc: IntegrityError | None = None
+        for _ in range(_ATTEMPT_ALLOC_RETRIES):
+            try:
+                with _session() as s:
+                    task = s.get(Task, task_id)
+                    attempt = _next_attempt(s, task_id)
+                    run = DelegatedRun(
+                        project_id=task.project_id,
+                        task_id=task_id,
+                        agent_id=self.agent.id,
+                        delegation_mode=self.mode,
+                        secret_ref=self.agent.secret_ref,  # opaque handle ONLY
+                        idempotency_key=make_idempotency_key(
+                            task_id, self.agent.id, attempt, idempotency_key
+                        ),
+                        attempt=attempt,
+                        callback_url=self.agent.callback_url,
+                        context_ref=f"ctx://{idempotency_key}:{attempt}",
+                    )
+                    s.add(run)
+                    s.commit()
+                    s.refresh(run)
+                    # Execution Run Lifecycle P0: take the durable lease
+                    # immediately. A freshly inserted row has a NULL lease, so
+                    # this always succeeds -- but it goes through the same
+                    # conditional UPDATE as any other acquirer, so the run is
+                    # protected from the recovery scan from the moment it exists.
+                    acquire_run_lease(s, run_id=run.id, owner=self._lease_owner)
+                    s.refresh(run)
+                    return run
+            except IntegrityError as exc:
+                last_exc = exc
+                continue
+        raise DelegatedExecutionError(
+            f"attempt allocation collided after {_ATTEMPT_ALLOC_RETRIES} "
+            f"retries (last: {last_exc})"
+        )
 
     def _record_submitted(self, run: DelegatedRun, info: dict[str, Any]) -> None:
         # Sync back to the in-memory object so later steps (status polling) see it.

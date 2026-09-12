@@ -238,6 +238,26 @@ def test_token_cannot_cross_attempt(db) -> None:
     assert run.status == DelegatedRunStatus.SUBMITTED
 
 
+def test_duplicate_callback_does_not_create_new_run(db) -> None:
+    """Re-delivering the same callback must not mint a new attempt/run (GAP-A #7).
+
+    ``ingest_callback`` operates on the addressed ``DelegatedRun`` by ``run_id``;
+    it never creates a new run, so a duplicate / late delivery cannot allocate a
+    fresh attempt or spawn a second row.
+    """
+    project, agent, task = _seed(db)
+    run = _run(db, project_id=project.id, task_id=task.id, agent_id=agent.id)
+    claims = _claims(run_id=run.id, agent_id=agent.id)
+    first = ingest_callback(db, run_id=run.id, claims=claims, payload=_payload(), now=_naive_now())
+    second = ingest_callback(db, run_id=run.id, claims=claims, payload=_payload(), now=_naive_now())
+
+    runs = db.exec(select(DelegatedRun).where(DelegatedRun.task_id == task.id)).all()
+    assert len(runs) == 1, "duplicate callback must not create a new run"
+    assert runs[0].attempt == run.attempt, "attempt must not change on duplicate callback"
+    assert first.outcome in ("received", "late", "duplicate")
+    assert second.outcome in ("received", "late", "duplicate")
+
+
 def test_token_cannot_cross_agent(db) -> None:
     project, agent, task = _seed(db)
     run = _run(db, project_id=project.id, task_id=task.id, agent_id=agent.id)
