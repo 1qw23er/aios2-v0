@@ -267,7 +267,8 @@ def execute_task(
     if task.status != TaskStatus.READY:
         raise ServiceError(409, "仅 READY（或可恢复的 FAILED）任务可被部门执行")
 
-    # (c) Claim: route_task requires READY and assigns the FIXED department agent.
+    # (c) Claim: route_task requires READY and assigns the department agent per
+    # task.routing_mode (FIXED or BEST_AVAILABLE).
     assignment = route_task(session, task_id, f"exec:{idempotency_key}:route", commit=False)
     if assignment is None:
         raise ServiceError(409, "任务无法认领（可能不是部门任务，或 agent 不可用）")

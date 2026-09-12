@@ -222,6 +222,9 @@ V1_TASKS: list[dict[str, Any]] = [
         "title": "T3 核心微信文章",
         "description": "基于定位产出一篇微信官方号长文（核心资产）及多平台改编简报。",
         "department": "Content Strategy Agent",
+        # NOTE: T3「核心微信文章」的 required_capabilities 为 [xhs_adaptation, packaging]，
+        # 而非语义能力 wechat_writing（后者已在 V1 能力目录定义，却无 V1 任务引用）。
+        # FIXED 路由不校验能力，故当前无害；若对 T3 启用能力校验需先对齐此错配。
         "required_capabilities": ["xhs_adaptation", "packaging"],
         "depends_on": ["T2"],
         "acceptance_criteria": ["产出一篇可直接发布的微信长文", "紧扣定位与用户问题"],
