@@ -286,7 +286,7 @@ class Agent(SQLModel, table=True):
     # use a DIFFERENT model than the global AIOS_AGENT_MODEL (heterogeneous
     # backends). None => fall back to the global env default, so existing agents
     # (which leave this unset) keep today's behavior unchanged.
-    model: str | None = None
+    model: str | None = Field(default=None)
     # Secret reference handle ONLY (e.g. "secret://hermes-api-key"). The actual
     # secret lives in an external secret store and is NEVER persisted on any
     # TaskContext / Artifact / AuditLog payload. config_ref is reused for the same
@@ -521,7 +521,12 @@ class DelegatedRun(SQLModel, table=True):
     # existed. The DB column is added by the 20260912_0002_run_model migration; this
     # field is what makes that column writable from the ORM layer (the migration
     # alone only touches the table, not the mapped class).
-    model: str | None = Field(default=None, index=True)
+    #
+    # Deliberately NOT indexed: the migration adds a plain nullable column (no
+    # CREATE INDEX), so declaring ``index=True`` here would make the mapped class
+    # disagree with the migrated schema. Attribution reads filter by task_id /
+    # run id, never by model, so no index is warranted.
+    model: str | None = Field(default=None)
     # Opaque handle to the external secret store (e.g. "secret://hermes-api-key").
     secret_ref: str | None = Field(default=None, index=True)
     status: DelegatedRunStatus = Field(default=DelegatedRunStatus.SUBMITTED, index=True)

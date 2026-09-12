@@ -21,10 +21,16 @@ depends_on = None
 
 
 def upgrade() -> None:
-    with op.batch_alter_table("agent") as batch_op:
-        batch_op.add_column(sa.Column("model", sa.String(), nullable=True))
+    # Plain ADD/DROP COLUMN, NOT ``batch_alter_table`` -- same choice as
+    # 20260908_0001_runtime_heartbeat for this exact table. Batch mode recreates
+    # the table on SQLite (CREATE new / copy / DROP old / RENAME), and the
+    # ``DROP TABLE agent`` step fails with a FOREIGN KEY constraint error as soon
+    # as any child row exists (agent_capability.agent_id, task.assigned_agent_id,
+    # employee_agent_binding.agent_id all reference ``agent``). A non-indexed
+    # nullable column needs no recreate, so the plain DDL is both sufficient and
+    # the only reversible form here.
+    op.add_column("agent", sa.Column("model", sa.String(), nullable=True))
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("agent") as batch_op:
-        batch_op.drop_column("model")
+    op.drop_column("agent", "model")

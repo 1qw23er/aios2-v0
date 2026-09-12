@@ -24,10 +24,11 @@ depends_on = None
 
 
 def upgrade() -> None:
-    with op.batch_alter_table("delegated_run") as batch_op:
-        batch_op.add_column(sa.Column("model", sa.String(), nullable=True))
+    # Plain ADD/DROP COLUMN -- the column is non-indexed and nullable, so no
+    # table recreate is needed. See 20260912_0001_agent_model for why batch mode
+    # is deliberately avoided (SQLite recreate + FK constraints).
+    op.add_column("delegated_run", sa.Column("model", sa.String(), nullable=True))
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("delegated_run") as batch_op:
-        batch_op.drop_column("model")
+    op.drop_column("delegated_run", "model")

@@ -30,7 +30,7 @@ from aios.feedback import (
 )
 from aios.models import Artifact, ArtifactType, Event, Project, Task
 
-HEAD = "20260909_0004_callback_ingest"
+HEAD = "20260912_0002_run_model"
 
 
 # Shared DB fixtures (mirror tests/test_feedback.py; pytest fixtures are

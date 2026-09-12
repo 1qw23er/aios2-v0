@@ -688,7 +688,7 @@ def test_single_alembic_head() -> None:
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20260909_0004_callback_ingest"]
+    assert script.get_heads() == ["20260912_0002_run_model"]
 
 
 def test_trial_table_shape_and_zero_explicit_indexes(tmp_path: Path) -> None:
