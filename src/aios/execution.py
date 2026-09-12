@@ -44,6 +44,12 @@ from aios.models import (
 from aios.orchestrator import Orchestrator, complete_task
 from aios.scheduler import route_task
 from aios.services import ServiceError, append_event
+from aios.skill_adherence import (
+    ADHERENCE_FIX_ENV,
+    ADHERENCE_VALIDATOR_VERSION,
+    compute_adherence,
+    merge_contracts,
+)
 from aios.task_run import (
     claim_task_for_execution,
     new_task_lease_owner,
@@ -244,6 +250,84 @@ def _artifact_checksum(result: ExecutionResult) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _apply_skill_adherence(
+    result: ExecutionResult,
+    task_schema: dict[str, Any],
+    merged_contract: dict[str, Any],
+    skill_contracts: list[dict[str, Any]],
+    skills_meta: list[dict[str, Any]],
+    conflicts: list[str],
+    adapter: ExecutionAdapter,
+) -> dict[str, Any]:
+    """Compute the Plan A adherence report and (optionally) attempt one directed fix.
+
+    Record-only by default: a skill-field violation does NOT change the run
+    outcome. The hard ``task.output_schema`` validation in ``execute_task`` is
+    the only thing that can fail a run. When ``AIOS_SKILL_ADHERENCE_FIX_ENABLED``
+    is "1" AND the adapter exposes ``fix_output`` AND adherence is invalid, we
+    make exactly ONE directed completion attempt (fill only the missing/invalid
+    required skill fields, never regenerate the whole output). On any failure we
+    preserve the original artifact and record ``fix_status="failed"`` -- the fix
+    path may never bypass budget/retry/callback/audit because it runs AFTER the
+    adapter returned and only mutates the in-memory artifact data.
+    """
+    primary_data = (result.artifacts[0].get("data") if result.artifacts else {}) or {}
+    report = compute_adherence(
+        primary_data,
+        task_schema,
+        merged_contract,
+        skill_contracts,
+        skills_meta,
+        conflicts=conflicts,
+        validator_version=ADHERENCE_VALIDATOR_VERSION,
+    )
+
+    fix_enabled = os.environ.get(ADHERENCE_FIX_ENV, "") == "1"
+    if not fix_enabled or report["skill_adherence_valid"]:
+        return report
+
+    fix_output = getattr(adapter, "fix_output", None)
+    if fix_output is None or not callable(fix_output):
+        report["fix_status"] = "unsupported"
+        return report
+
+    report["fix_attempted"] = True
+    try:
+        partial = fix_output(
+            partial_data=primary_data,
+            missing_fields=report["missing_fields"],
+            invalid_fields=report["invalid_fields"],
+            contract=merged_contract,
+        )
+        if not isinstance(partial, dict):
+            raise ValueError("fix_output returned a non-dict")
+        fixed = dict(primary_data)
+        fixed.update(partial)
+        revalidated = compute_adherence(
+            fixed,
+            task_schema,
+            merged_contract,
+            skill_contracts,
+            skills_meta,
+            conflicts=conflicts,
+            validator_version=ADHERENCE_VALIDATOR_VERSION,
+        )
+        if revalidated["skill_adherence_valid"]:
+            # Apply: overlay the directed completion onto the in-memory artifact.
+            for artifact in result.artifacts:
+                artifact["data"] = fixed
+            report = revalidated
+            report["fix_attempted"] = True
+            report["fix_applied"] = True
+            report["fix_status"] = "applied"
+        else:
+            report["fix_status"] = "failed"
+    except Exception:
+        # Preserve the original artifact; never let the fix path fail the run.
+        report["fix_status"] = "failed"
+    return report
+
+
 def execute_task(
     session: Session,
     task_id: str,
@@ -361,12 +445,33 @@ def execute_task(
     # AND the RUNNING state together).
     context = ContextService(session).build_context(task_id, assignment.id)
 
+    # Plan A: merge task.output_schema with every applicable skill's
+    # required_output_contract. The merged contract is rendered into the prompt
+    # (so the agent SEES the skill's required fields -- the P0 root cause) and is
+    # the basis for adherence checking. With no skill contract the merge equals
+    # task.output_schema, so non-skill tasks are behaviorally unchanged.
+    applicable_skills = [
+        s for s in (context.applicable_skills or []) if isinstance(s, dict)
+    ]
+    skill_contracts: list[dict[str, Any]] = []
+    for s in applicable_skills:
+        c = s.get("required_output_contract") or {}
+        if c:
+            skill_contracts.append(c)
+    skills_meta = [
+        {"skill_id": s.get("skill_id"), "name": s.get("name"), "version": s.get("version")}
+        for s in applicable_skills
+    ]
+    merged_contract, _skill_fields, _conflicts = merge_contracts(
+        task.output_schema, skill_contracts
+    )
+
     # Run the adapter (the only part a test substitutes).
     try:
         result = adapter.run(
             task_id=task.id,
             task_context=context,
-            output_schema=task.output_schema,
+            output_schema=merged_contract,
             idempotency_key=idempotency_key,
         )
     except ExecutionError as exc:
@@ -402,6 +507,20 @@ def execute_task(
     except JsonSchemaValidationError as exc:
         _mark_failed(session, task, idempotency_key, f"validation:{exc.message}", actor)
         raise ResultValidationError(422, f"执行结果未通过输出校验：{exc.message}") from exc
+
+    # Plan A adherence: record-only check (never fails the run) + optional 1x
+    # directed fix. Runs after the hard task-schema validation above, so the
+    # original artifact is preserved on any fix failure and the run outcome is
+    # unchanged by skill non-compliance.
+    adherence_report = _apply_skill_adherence(
+        result,
+        task.output_schema,
+        merged_contract,
+        skill_contracts,
+        skills_meta,
+        _conflicts,
+        adapter,
+    )
 
     checksum = _artifact_checksum(result)
     primary = result.artifacts[0] if result.artifacts else {}
@@ -448,6 +567,7 @@ def execute_task(
         "context_hash": context.context_hash,
         "artifacts": result.artifacts,
         "claims": result.claims,
+        "adherence": adherence_report,
     }
     if persisted_attempts is not None:
         artifact_metadata["attempts"] = persisted_attempts
@@ -809,6 +929,49 @@ class LLMExecutionAdapter:
         err.attempts = attempts_made
         err.max_attempts = max_attempts
         raise err from last_exc
+
+    def fix_output(
+        self,
+        *,
+        partial_data: dict[str, Any],
+        missing_fields: list[str],
+        invalid_fields: list[str],
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Plan A optional directed fix: complete ONLY the missing/invalid required skill fields.
+
+        A single targeted model call (never a full regeneration). Raises on any
+        failure so the caller preserves the original artifact. The returned dict
+        is overlaid onto the original by ``_apply_skill_adherence``.
+        """
+        prompt = self._build_fix_prompt(
+            partial_data, missing_fields, invalid_fields, contract
+        )
+        content, _usage = self._chat(prompt, attempt=1)
+        data = self._parse_json(content)
+        if not isinstance(data, dict):
+            raise ExecutionError(
+                502,
+                "修复返回的不是 JSON 对象",
+                category=AdapterErrorCategory.PROVIDER_STRUCTURE,
+            )
+        return data
+
+    def _build_fix_prompt(
+        self,
+        partial_data: dict[str, Any],
+        missing_fields: list[str],
+        invalid_fields: list[str],
+        contract: dict[str, Any],
+    ) -> str:
+        target = sorted(set(missing_fields) | set(invalid_fields))
+        return (
+            "你此前产出的结果缺少或不符合以下必填字段，请仅针对这些字段产出补全的 JSON 对象"
+            f"（不要重写其他字段）：{json.dumps(target, ensure_ascii=False)}\n\n"
+            f"合并输出契约（仅参考这些字段的定义）：\n"
+            f"{json.dumps(contract, ensure_ascii=False, indent=2)}\n\n"
+            f"已有部分结果：\n{json.dumps(partial_data, ensure_ascii=False, indent=2)}"
+        )
 
     def _record_local_run(
         self,

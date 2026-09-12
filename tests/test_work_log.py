@@ -52,7 +52,7 @@ from aios.work_log import (
 )
 from alembic import command
 
-HEAD = "20260912_0002_run_model"
+HEAD = "20260913_0001_skill_required_output_contract"
 PREV = "20260727_0008"
 # Lowest revision these ORM-seeding tests upgrade to. The migrations above it
 # form a chain of one-way doors:
