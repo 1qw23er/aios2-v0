@@ -1,27 +1,26 @@
 """P2-c: GAP-1/2/3 -- recursive (nested) skill-adherence detection.
 
-``_type_ok`` only inspects the TOP level, and ``compute_adherence`` only walked
-the top-level ``required`` fields of each skill contract. A skill-required
-object / array whose SUBTREE was structurally wrong therefore stayed invisible:
-the report claimed ``skill_adherence_valid=True`` while
+Nested defects inside a skill-required object / array used to stay invisible: a
+top-level-only check claimed ``skill_adherence_valid=True`` while
 ``overall_contract_valid`` (jsonschema, fully recursive) was ``False`` -- a
 self-contradictory 3-state report -- and the fix trigger
 (``not skill_adherence_valid``) never fired.
 
-P2-c descends the subtree of a top-level skill ``required`` field that is
-present and type-correct, reporting each defect as a full PATH STRING in the
-canonical grammar (``metadata.author`` / ``sections[1].heading``) appended to
-the EXISTING ``missing_fields`` / ``invalid_fields`` -- so the P2-a whitelist
-consumes it with zero rework (the D4 commitment recorded in
-``test_skill_fix_boundary.py``).
+Recursion now comes from the ONE jsonschema authority (P2-e): every
+skill-declared field that is present has its whole subtree checked, and each
+defect -- including ``required`` names nested at any depth -- is reported as a
+full PATH STRING in the canonical grammar (``metadata.author`` /
+``sections[1].heading``) inside the EXISTING ``missing_fields`` /
+``invalid_fields``, so the P2-a whitelist consumes it with zero rework (the D4
+commitment recorded in ``test_skill_fix_boundary.py``).
 
-Frozen scope (C1/C2/C3):
+Scope:
 
-* C2 -- only ``required`` names are inspected at every level;
-  ``additionalProperties`` is NOT consulted; ``_type_ok`` is untouched.
-* C3 -- a top-level field that is task-authoritative (``conflicts``) is never
-  descended into: its subtree is blacklisted from the fix path, so a path found
-  there could never be repaired.
+* a task-authoritative field (``conflicts``) is excluded from the skill domain
+  entirely: the fix blacklist covers its whole subtree, so a path found there
+  could never be repaired (D3a/D3b);
+* ``additionalProperties`` is never a defect (C4: the fix path only adds /
+  changes, never deletes);
 * ``apply_fix_patch`` / the triple gate (P2-a) and the ``fix`` sub-structure
   (P2-b) are NOT modified.
 """
@@ -33,7 +32,6 @@ from typing import Any
 from aios.execution import ExecutionResult, _apply_skill_adherence
 from aios.skill_adherence import (
     ADHERENCE_VALIDATOR_VERSION,
-    _collect_nested_defects,
     compute_adherence,
     merge_contracts,
 )
@@ -117,7 +115,11 @@ def test_nested_required_missing_reports_full_path() -> None:
 
 
 def test_nested_required_missing_does_not_replace_top_level_entry() -> None:
-    """The top-level defect record is preserved; the nested path is ADDED."""
+    """The top-level defect record is preserved; the nested path is ADDED.
+
+    The order is the engine's NATURAL error order -- ``properties`` depth-first,
+    then ``required`` (P2-e D5). Consumers match on the path SET, never on index.
+    """
     task = _task()
     skill = _contract(
         {
@@ -130,7 +132,7 @@ def test_nested_required_missing_does_not_replace_top_level_entry() -> None:
 
     rep = compute_adherence({"summary": "x", "metadata": {}}, task, merged, [skill], [])
 
-    assert rep["missing_fields"] == ["outline", "metadata.author"]
+    assert rep["missing_fields"] == ["metadata.author", "outline"]
 
 
 # ---------------------------------------------------------------------------
@@ -360,12 +362,16 @@ def test_conflict_top_level_field_skips_recursion() -> None:
     assert rep["missing_fields"] == []
     assert rep["invalid_fields"] == []
 
-    # counterfactual: without the C3 skip the nested path WOULD be reported --
-    # that is exactly the pseudo-defect C3 exists to suppress.
+    # counterfactual: without the C3 exclusion a path WOULD be reported -- and
+    # (P2-e D2: the projection takes its definitions from MERGED) it is the
+    # merged/task-owned ``metadata.author``, not the contract's
+    # ``metadata.title``. That makes it an even clearer pseudo-defect: the fix
+    # blacklist covers the whole ``metadata`` subtree, so it could never be
+    # repaired.
     unguarded = compute_adherence(
         {"summary": "x", "metadata": {}}, task, merged, [skill], [], conflicts=[]
     )
-    assert unguarded["missing_fields"] == ["metadata.title"]
+    assert unguarded["missing_fields"] == ["metadata.author"]
 
 
 # ---------------------------------------------------------------------------
@@ -498,15 +504,15 @@ def test_p2b_trace_structure_intact_for_nested_defect(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# C1 -- validator version is "4" (P2-d R-1 authority convergence)
+# C1 -- validator version is "5" (P2-e single-authority convergence)
 # ---------------------------------------------------------------------------
 
 
-def test_validator_version_is_four() -> None:
-    assert ADHERENCE_VALIDATOR_VERSION == "4"
+def test_validator_version_is_five() -> None:
+    assert ADHERENCE_VALIDATOR_VERSION == "5"
 
 
-def test_report_validator_version_is_four() -> None:
+def test_report_validator_version_is_five() -> None:
     task = _task()
     skill = _contract({"outline": {"type": "string"}}, ["outline"])
     merged, _, _ = merge_contracts(task, [skill])
@@ -517,15 +523,8 @@ def test_report_validator_version_is_four() -> None:
 # ---------------------------------------------------------------------------
 # the pure helper itself -- defensive, never raises
 # ---------------------------------------------------------------------------
-
-
-def test_collect_nested_defects_is_defensive_on_odd_inputs() -> None:
-    # fdef not a dict / no "type" / value mismatch: no defects, no exception.
-    assert _collect_nested_defects({}, "not-a-dict", ("f",)) == ([], [])
-    assert _collect_nested_defects(None, {}, ("f",)) == ([], [])
-    assert _collect_nested_defects([], {"type": "object"}, ("f",)) == ([], [])
-    assert _collect_nested_defects({}, {"type": "array"}, ("f",)) == ([], [])
-    # array with non-dict "items" (tuple validation / malformed) -> skipped
-    assert _collect_nested_defects([1, 2], {"type": "array", "items": ["x"]}, ("f",)) == ([], [])
-    # malformed required entry (non str) is ignored rather than crashing
-    assert _collect_nested_defects({}, {"type": "object", "required": [1]}, ("f",)) == ([], [])
+#
+# The old hand-written recursion helper is gone (P2-e D1). Its "never raises"
+# duty is now carried by ``_iter_skill_schema_defects`` and is covered in
+# ``tests/test_skill_single_authority.py`` (classification / de-duplication /
+# malformed projection).

@@ -1,19 +1,18 @@
-"""P2-d (R-1): skill / overall one-way consistency via jsonschema convergence.
+"""P2-e (RR-1 closure): single-authority skill / overall consistency.
 
-Before P2-d, ``compute_adherence``'s skill-side check was a HAND-WRITTEN subset
-(type + required names) of the FULL ``jsonschema`` authority that produces
-``overall_contract_valid``. Any skill-declared constraint the hand-written check
-did not model (enum / const / non-required fields / nested constraints) produced
-a self-contradictory report: ``skill_adherence_valid=True`` while
-``overall_contract_valid=False`` -- and never triggered the fix.
+Before P2-e the skill-side check had TWO defect-producing paths: a hand-written
+type/required walk and a jsonschema slice check (P2-d). Any constraint the
+hand-written path did not model produced a self-contradictory report
+(``skill_adherence_valid=True`` while ``overall_contract_valid=False``), and a
+required-only contract (no ``properties``) was skipped entirely -- a live R-1
+hole.
 
-P2-d keeps the frozen P2-c hand check verbatim and additionally runs
-``jsonschema`` ``iter_errors`` over each skill's declared field set (excluding
-task-authoritative conflicts), appending any defect the hand check could not see.
-This is AUTHORITY CONVERGENCE (same engine, same merged-field semantics, scoped
-to the skill domain), not a second validator.
+P2-e deletes the hand-written path and derives the skill defect set from the SAME
+``jsonschema`` authority that produces ``overall_contract_valid``, evaluated over
+the skill-domain projection of the merged contract. The structural gate lives in
+``tests/test_skill_single_authority.py``.
 
-Scope boundaries (per the signed-off design):
+Scope boundaries:
 
 * IN: type, required, enum, const, non-required-field violations, any other
   constraint the merged schema actually delegates to jsonschema with a locatable
@@ -23,6 +22,8 @@ Scope boundaries (per the signed-off design):
   drops it, so merged never fails on it); nested ``additionalProperties`` (C4:
   unrepairable -- the fix path only adds/changes, never deletes unknown keys);
   anything merge_contracts does not carry; any merge_contracts key-set expansion.
+* A task-authoritative conflict is excluded from the skill domain entirely
+  (D3a/D3b) -- the task schema / overall path keeps its authority over it.
 * The triple gate (P2-a), the fix path (P2-a) and the trace sub-structure (P2-b)
   are NOT modified. The validator is record-only; ``skill_adherence_valid`` is
   consumed only by the (default-off) fix path.
@@ -415,7 +416,7 @@ def test_flat_required_schema_zero_flip() -> None:
 
 
 def test_validator_version_is_constant() -> None:
-    assert ADHERENCE_VALIDATOR_VERSION == "4"
+    assert ADHERENCE_VALIDATOR_VERSION == "5"
     task = _task()
     skill = _contract({"outline": {"type": "string"}}, ["outline"])
     merged, _, _ = merge_contracts(task, [skill])
