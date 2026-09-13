@@ -24,6 +24,18 @@ Design (per the agreed Plan A boundaries):
   ``invalid_fields`` lists the fix whitelist already consumes. A
   task-authoritative (conflicting) field is never descended into, and
   ``additionalProperties`` / ``enum`` / ``format`` stay out of scope.
+* **P2-d (R-1)**: ``compute_adherence`` additionally runs ``jsonschema``
+  ``iter_errors`` over each skill's declared field set (excluding
+  task-authoritative conflicts) and appends any defect the frozen P2-c hand check
+  could NOT see -- enum / const / non-required-field / nested-constraint
+  violations -- to the SAME ``missing_fields`` / ``invalid_fields`` lists. The
+  hand-written check is retained verbatim as a report-format adapter; the
+  UNIFIED defect set (hand-written UNION jsonschema diff) is what drives
+  ``skill_adherence_valid``. ``format`` is excluded (jsonschema does not check it
+  by default), and ``additionalProperties`` is filtered (unrepairable: the fix
+  path only adds/changes, never deletes unknown keys). This is AUTHORITY
+  CONVERGENCE, not a second validator -- the same jsonschema engine, the same
+  merged-field semantics, only scoped to the skill domain.
 * The optional 1x directed fix lives in ``execute_task`` (it needs the adapter);
   this module only supplies the merge + the pure checker.
 """
@@ -36,13 +48,15 @@ from typing import Any
 
 # Bump when the semantics of the report change in a way consumers must detect.
 # "2" encodes the P2-b fix traceability sub-structure (fix.before/attempt/after
-# + lineage hashes). "3" encodes P2-c recursive nested-defect detection: the
-# reported ``skill_adherence_valid`` and the ``missing_fields`` /
-# ``invalid_fields`` lists now also reflect structural defects found in the
-# SUBTREE of a skill-required top-level field (previously such a report claimed
-# valid=True while the fully-recursive ``overall_contract_valid`` was False).
-# The report SHAPE is unchanged in both bumps.
-ADHERENCE_VALIDATOR_VERSION = "3"
+# + lineage hashes). "3" encodes P2-c recursive nested-defect detection. "4"
+# encodes P2-d (R-1): the skill-side defect set is converged onto the SAME
+# jsonschema authority that produces ``overall_contract_valid`` -- so enum /
+# const / non-required-field / nested-constraint violations (anything the merged
+# schema actually delegates to jsonschema, except ``format`` and
+# ``additionalProperties``) are now reported as skill defects too. This removes
+# the "skill True / overall False" self-contradiction. The report SHAPE is
+# unchanged across all four bumps.
+ADHERENCE_VALIDATOR_VERSION = "4"
 
 # Opt-in env flag (default OFF). When "1", execute_task may attempt ONE directed
 # completion of missing required skill fields via the adapter.
@@ -187,6 +201,60 @@ def _collect_nested_defects(
     return missing, invalid
 
 
+def _iter_skill_schema_defects(
+    data: Any,
+    local_schema: dict[str, Any],
+) -> list[tuple[str, str]]:
+    """P2-d (R-1): collect skill-domain defects from the SAME jsonschema authority.
+
+    ``compute_adherence`` runs ``jsonschema`` on the full ``merged_schema`` to
+    produce ``overall_contract_valid``. Here we run the identical engine over a
+    single skill contract's declared field set (the caller has already excluded
+    task-authoritative conflicts), so only SKILL-domain defects surface -- this
+    is the same authority re-evaluated on a field-scoped slice, NOT a second
+    validator.
+
+    Returns a list of ``(kind, path)`` where ``kind`` is ``"missing"`` (a
+    ``required`` field is absent) or ``"invalid"`` (a type / enum / const /
+    minLength / pattern / ... violation). Source semantics are preserved -- we
+    never blanket-convert every error into ``invalid_fields``:
+
+    * ``required``             -> missing_fields (path = parent + missing name)
+    * ``additionalProperties`` -> filtered out (C4: unrepairable, would create a
+                                  permanently-red pseudo-defect in the fix
+                                  whitelist, since the fix path only adds/changes)
+    * everything else          -> invalid_fields
+    * root-level / unparseable path with no name -> dropped (record-only; it can
+                                  never enter the fix whitelist)
+
+    Defensive: any malformed schema or validator failure yields ``[]``; this
+    function NEVER raises (``compute_adherence`` must stay total).
+    """
+    from jsonschema.validators import Draft202012Validator as _Validator
+
+    out: list[tuple[str, str]] = []
+    try:
+        for error in _Validator(local_schema).iter_errors(data):
+            validator = error.validator
+            if validator == "additionalProperties":
+                continue
+            ap = tuple(error.absolute_path)
+            if validator == "required":
+                instance = error.instance
+                if not isinstance(instance, dict):
+                    continue
+                for name in error.validator_value or []:
+                    if name not in instance:
+                        out.append(("missing", _format_path(ap + (name,))))
+            elif ap:
+                # type / enum / const / minLength / pattern / minimum / ...
+                out.append(("invalid", _format_path(ap)))
+            # ap empty and not required -> record-only, never enters a list
+    except Exception:
+        return []
+    return out
+
+
 def compute_adherence(
     data: dict[str, Any],
     task_schema: dict[str, Any],
@@ -251,6 +319,48 @@ def compute_adherence(
                 for path in nested_invalid:
                     if path not in invalid_fields:
                         invalid_fields.append(path)
+    # P2-d (R-1): converge the frozen P2-c hand check onto the SAME jsonschema
+    # authority that produces ``overall_contract_valid``. The hand-written pass
+    # above stays byte-for-byte frozen; here we append any skill-domain defect it
+    # could not see (enum / const / non-required-field / nested-constraint) so
+    # ``skill_adherence_valid`` can no longer contradict ``overall_contract_valid``.
+    # additionalProperties errors are filtered (C4); the hand-written check is the
+    # report-format adapter, the UNIFIED set drives the final boolean. RR-1 (the
+    # two-logic residual) is recorded in the design review, not消除 here -- this
+    # round only eliminates the MISSED-DEFECT surface, not the structural duality.
+    reported: set[str] = set(missing_fields) | set(invalid_fields)
+    extra_missing: list[str] = []
+    extra_invalid: list[str] = []
+    for sc in skill_contracts:
+        if not sc:
+            continue
+        local_schema = {
+            "type": "object",
+            "properties": {
+                k: copy.deepcopy(v)
+                for k, v in (sc.get("properties") or {}).items()
+                if k not in authoritative
+            },
+            "required": [
+                r for r in (sc.get("required") or []) if r not in authoritative
+            ],
+        }
+        if not local_schema["properties"]:
+            continue
+        for kind, path in _iter_skill_schema_defects(data, local_schema):
+            if path in reported or path in extra_missing or path in extra_invalid:
+                continue
+            if kind == "missing":
+                extra_missing.append(path)
+            else:
+                extra_invalid.append(path)
+    # stable, backward-compatible order: hand-written defects first, then the
+    # jsonschema diff appended in canonical-path order.
+    extra_missing.sort()
+    extra_invalid.sort()
+    missing_fields.extend(extra_missing)
+    invalid_fields.extend(extra_invalid)
+
     skill_valid = not missing_fields and not invalid_fields
 
     # 3) overall -- merged contract validity (task + skill fields).

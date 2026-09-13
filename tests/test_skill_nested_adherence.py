@@ -369,11 +369,13 @@ def test_conflict_top_level_field_skips_recursion() -> None:
 
 
 # ---------------------------------------------------------------------------
-# C2 -- non-required top-level fields do not trigger recursion
+# P2-d (R-1) -- a NON-required field that IS present but whose nested contract
+# is violated must now enter the skill defect report (explicit reversal of the
+# old "non-required is never checked" rule; closes skill-True/overall-False).
 # ---------------------------------------------------------------------------
 
 
-def test_non_required_top_level_field_not_recursed() -> None:
+def test_non_required_present_violation_is_reported() -> None:
     task = _task()
     skill = _contract(
         {
@@ -388,9 +390,10 @@ def test_non_required_top_level_field_not_recursed() -> None:
         {"summary": "x", "outline": "y", "metadata": {}}, task, merged, [skill], []
     )
 
-    assert rep["missing_fields"] == []
+    # metadata is present but its nested required 'author' is missing -> reported
+    assert rep["missing_fields"] == ["metadata.author"]
     assert rep["invalid_fields"] == []
-    assert rep["skill_adherence_valid"] is True
+    assert rep["skill_adherence_valid"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -495,20 +498,19 @@ def test_p2b_trace_structure_intact_for_nested_defect(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# C1 -- validator version is "3" (P2-c semantics change)
+# C1 -- validator version is "4" (P2-d R-1 authority convergence)
 # ---------------------------------------------------------------------------
 
 
-def test_validator_version_is_three() -> None:
-    assert ADHERENCE_VALIDATOR_VERSION == "3"
+def test_validator_version_is_four() -> None:
+    assert ADHERENCE_VALIDATOR_VERSION == "4"
 
 
-def test_report_validator_version_is_three() -> None:
+def test_report_validator_version_is_four() -> None:
     task = _task()
     skill = _contract({"outline": {"type": "string"}}, ["outline"])
     merged, _, _ = merge_contracts(task, [skill])
     rep = compute_adherence({"summary": "x"}, task, merged, [skill], [])
-    assert rep["validator_version"] == "3"
     assert rep["validator_version"] == ADHERENCE_VALIDATOR_VERSION
 
 
