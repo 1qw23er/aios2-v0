@@ -47,8 +47,14 @@ from aios.services import ServiceError, append_event
 from aios.skill_adherence import (
     ADHERENCE_FIX_ENV,
     ADHERENCE_VALIDATOR_VERSION,
+    FIX_STATUS_APPLIED,
+    FIX_STATUS_FAILED,
+    FIX_STATUS_SKIPPED,
+    FIX_STATUS_UNSUPPORTED,
+    apply_fix_patch,
     compute_adherence,
     merge_contracts,
+    task_owned_paths,
 )
 from aios.task_run import (
     claim_task_for_execution,
@@ -270,6 +276,20 @@ def _apply_skill_adherence(
     preserve the original artifact and record ``fix_status="failed"`` -- the fix
     path may never bypass budget/retry/callback/audit because it runs AFTER the
     adapter returned and only mutates the in-memory artifact data.
+
+    P2-a fix boundary (GAP-5 + GAP-6):
+
+    * The adapter's result is treated as a **patch**, filtered through
+      :func:`aios.skill_adherence.apply_fix_patch` -- path-level whitelist
+      (the union of ``missing_fields`` and ``invalid_fields``) with the
+      task-declared fields (and their whole subtrees) as a priority blacklist. A skill fix may
+      therefore only fill skill defects; it can never rewrite ``summary``,
+      ``body`` or any other task-owned field.
+    * The patched result is admitted only if it clears the **triple gate**:
+      ``task_schema_valid`` AND ``skill_adherence_valid`` AND
+      ``overall_contract_valid``. Anything less keeps the original artifact.
+    * Only the PRIMARY artifact is ever overwritten (other artifacts are left
+      byte-identical).
     """
     primary_data = (result.artifacts[0].get("data") if result.artifacts else {}) or {}
     report = compute_adherence(
@@ -286,11 +306,26 @@ def _apply_skill_adherence(
     if not fix_enabled or report["skill_adherence_valid"]:
         return report
 
-    fix_output = getattr(adapter, "fix_output", None)
-    if fix_output is None or not callable(fix_output):
-        report["fix_status"] = "unsupported"
+    # INV-6 (defence in depth): if the ORIGINAL artifact already violates the
+    # hard task contract, the skill-fix path must not expand its scope -- that
+    # belongs to the existing task-schema failure path, not to Skill repair.
+    if not report["task_schema_valid"]:
+        report["fix_status"] = FIX_STATUS_SKIPPED
+        report["fix_reason"] = "task_schema_invalid"
         return report
 
+    allowed_paths = [*report["missing_fields"], *report["invalid_fields"]]
+    if not allowed_paths:
+        report["fix_status"] = FIX_STATUS_SKIPPED
+        report["fix_reason"] = "no_defect_paths"
+        return report
+
+    fix_output = getattr(adapter, "fix_output", None)
+    if fix_output is None or not callable(fix_output):
+        report["fix_status"] = FIX_STATUS_UNSUPPORTED
+        return report
+
+    protected_paths = task_owned_paths(task_schema)
     report["fix_attempted"] = True
     try:
         partial = fix_output(
@@ -301,8 +336,14 @@ def _apply_skill_adherence(
         )
         if not isinstance(partial, dict):
             raise ValueError("fix_output returned a non-dict")
-        fixed = dict(primary_data)
-        fixed.update(partial)
+        patched = apply_fix_patch(
+            primary_data,
+            partial,
+            allowed_paths=allowed_paths,
+            protected_paths=protected_paths,
+        )
+        fixed = patched["data"]
+        rejected = patched["rejected"]
         revalidated = compute_adherence(
             fixed,
             task_schema,
@@ -312,19 +353,31 @@ def _apply_skill_adherence(
             conflicts=conflicts,
             validator_version=ADHERENCE_VALIDATOR_VERSION,
         )
-        if revalidated["skill_adherence_valid"]:
-            # Apply: overlay the directed completion onto the in-memory artifact.
-            for artifact in result.artifacts:
-                artifact["data"] = fixed
+        # GAP-6: the triple gate. A fix that satisfies skill adherence but
+        # breaks the task contract is WORSE than no fix at all.
+        gate_ok = (
+            revalidated["task_schema_valid"]
+            and revalidated["skill_adherence_valid"]
+            and revalidated["overall_contract_valid"]
+        )
+        report["fix_rejected_paths"] = rejected
+        report["fix_applied_paths"] = patched["applied_paths"] if gate_ok else []
+        if gate_ok:
+            # D3: primary artifact only -- never clobber sibling artifacts.
+            result.artifacts[0]["data"] = fixed
             report = revalidated
             report["fix_attempted"] = True
             report["fix_applied"] = True
-            report["fix_status"] = "applied"
+            report["fix_status"] = FIX_STATUS_APPLIED
+            report["fix_rejected_paths"] = rejected
+            report["fix_applied_paths"] = patched["applied_paths"]
         else:
-            report["fix_status"] = "failed"
+            report["fix_status"] = FIX_STATUS_FAILED
+            report["fix_reason"] = "post_fix_contract_invalid"
     except Exception:
         # Preserve the original artifact; never let the fix path fail the run.
-        report["fix_status"] = "failed"
+        report["fix_status"] = FIX_STATUS_FAILED
+        report["fix_reason"] = "fix_output_error"
     return report
 
 
