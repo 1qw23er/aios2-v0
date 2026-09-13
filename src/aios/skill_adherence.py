@@ -28,7 +28,9 @@ import re
 from typing import Any
 
 # Bump when the semantics of the report change in a way consumers must detect.
-ADHERENCE_VALIDATOR_VERSION = "1"
+# "2" encodes the P2-b fix traceability sub-structure (fix.before/attempt/after
+# + lineage hashes); top-level semantics are unchanged so consumers are compat.
+ADHERENCE_VALIDATOR_VERSION = "2"
 
 # Opt-in env flag (default OFF). When "1", execute_task may attempt ONE directed
 # completion of missing required skill fields via the adapter.

@@ -11,6 +11,7 @@ shortcut that inserts artifacts directly).
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -48,6 +49,7 @@ from aios.skill_adherence import (
     ADHERENCE_FIX_ENV,
     ADHERENCE_VALIDATOR_VERSION,
     FIX_STATUS_APPLIED,
+    FIX_STATUS_DISABLED,
     FIX_STATUS_FAILED,
     FIX_STATUS_SKIPPED,
     FIX_STATUS_UNSUPPORTED,
@@ -256,6 +258,16 @@ def _artifact_checksum(result: ExecutionResult) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _adherence_data_sha256(data: Any) -> str:
+    """SHA-256 of an artifact's primary data -- traceability WITHOUT persisting
+    the value (P2-b C2). Falls back to repr on non-serialisable input."""
+    try:
+        payload = json.dumps(data, sort_keys=True, default=str).encode("utf-8")
+    except Exception:
+        payload = repr(data).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _apply_skill_adherence(
     result: ExecutionResult,
     task_schema: dict[str, Any],
@@ -277,22 +289,31 @@ def _apply_skill_adherence(
     path may never bypass budget/retry/callback/audit because it runs AFTER the
     adapter returned and only mutates the in-memory artifact data.
 
-    P2-a fix boundary (GAP-5 + GAP-6):
+    P2-a fix boundary (GAP-5 + GAP-6) -- UNCHANGED by P2-b:
 
     * The adapter's result is treated as a **patch**, filtered through
       :func:`aios.skill_adherence.apply_fix_patch` -- path-level whitelist
       (the union of ``missing_fields`` and ``invalid_fields``) with the
-      task-declared fields (and their whole subtrees) as a priority blacklist. A skill fix may
-      therefore only fill skill defects; it can never rewrite ``summary``,
-      ``body`` or any other task-owned field.
+      task-declared fields (and their whole subtrees) as a priority blacklist.
+      A skill fix may therefore only fill skill defects; it can never rewrite
+      ``summary``, ``body`` or any other task-owned field.
     * The patched result is admitted only if it clears the **triple gate**:
       ``task_schema_valid`` AND ``skill_adherence_valid`` AND
       ``overall_contract_valid``. Anything less keeps the original artifact.
     * Only the PRIMARY artifact is ever overwritten (other artifacts are left
       byte-identical).
+
+    P2-b traceability (GAP-4): the report carries a ``fix`` sub-structure --
+    ``before`` (deep copy of the pre-fix report), ``attempt`` (structured, no
+    candidate value), ``after`` (the post-fix revalidation, or an explicit
+    reason when the fix was skipped / raised), ``status`` / ``reason`` and a
+    ``lineage`` of SHA-256 hashes. The TOP-LEVEL report keeps the FINAL semantics
+    so existing consumers / P1 / P2-a tests are unaffected. Zero migration.
     """
     primary_data = (result.artifacts[0].get("data") if result.artifacts else {}) or {}
-    report = compute_adherence(
+
+    # pre-fix report -- the ORIGINAL adherence before any fix attempt.
+    pre = compute_adherence(
         primary_data,
         task_schema,
         merged_contract,
@@ -301,84 +322,136 @@ def _apply_skill_adherence(
         conflicts=conflicts,
         validator_version=ADHERENCE_VALIDATOR_VERSION,
     )
+    # GAP-4: fix.before is a DEEP COPY -- it must never share a mutable reference
+    # with the final top-level report or with fix.after.
+    before = copy.deepcopy(pre)
+
+    # default outcomes (no fix attempted)
+    status = pre["fix_status"]  # "disabled" unless an attempt later changes it
+    reason = pre["fix_reason"]
+    attempt: dict[str, Any] | None = None
+    after: dict[str, Any] | None = None
+    final_data: dict[str, Any] = primary_data
 
     fix_enabled = os.environ.get(ADHERENCE_FIX_ENV, "") == "1"
-    if not fix_enabled or report["skill_adherence_valid"]:
-        return report
-
-    # INV-6 (defence in depth): if the ORIGINAL artifact already violates the
-    # hard task contract, the skill-fix path must not expand its scope -- that
-    # belongs to the existing task-schema failure path, not to Skill repair.
-    if not report["task_schema_valid"]:
-        report["fix_status"] = FIX_STATUS_SKIPPED
-        report["fix_reason"] = "task_schema_invalid"
-        return report
-
-    allowed_paths = [*report["missing_fields"], *report["invalid_fields"]]
-    if not allowed_paths:
-        report["fix_status"] = FIX_STATUS_SKIPPED
-        report["fix_reason"] = "no_defect_paths"
-        return report
-
-    fix_output = getattr(adapter, "fix_output", None)
-    if fix_output is None or not callable(fix_output):
-        report["fix_status"] = FIX_STATUS_UNSUPPORTED
-        return report
-
-    protected_paths = task_owned_paths(task_schema)
-    report["fix_attempted"] = True
-    try:
-        partial = fix_output(
-            partial_data=primary_data,
-            missing_fields=report["missing_fields"],
-            invalid_fields=report["invalid_fields"],
-            contract=merged_contract,
-        )
-        if not isinstance(partial, dict):
-            raise ValueError("fix_output returned a non-dict")
-        patched = apply_fix_patch(
-            primary_data,
-            partial,
-            allowed_paths=allowed_paths,
-            protected_paths=protected_paths,
-        )
-        fixed = patched["data"]
-        rejected = patched["rejected"]
-        revalidated = compute_adherence(
-            fixed,
-            task_schema,
-            merged_contract,
-            skill_contracts,
-            skills_meta,
-            conflicts=conflicts,
-            validator_version=ADHERENCE_VALIDATOR_VERSION,
-        )
-        # GAP-6: the triple gate. A fix that satisfies skill adherence but
-        # breaks the task contract is WORSE than no fix at all.
-        gate_ok = (
-            revalidated["task_schema_valid"]
-            and revalidated["skill_adherence_valid"]
-            and revalidated["overall_contract_valid"]
-        )
-        report["fix_rejected_paths"] = rejected
-        report["fix_applied_paths"] = patched["applied_paths"] if gate_ok else []
-        if gate_ok:
-            # D3: primary artifact only -- never clobber sibling artifacts.
-            result.artifacts[0]["data"] = fixed
-            report = revalidated
-            report["fix_attempted"] = True
-            report["fix_applied"] = True
-            report["fix_status"] = FIX_STATUS_APPLIED
-            report["fix_rejected_paths"] = rejected
-            report["fix_applied_paths"] = patched["applied_paths"]
+    if fix_enabled and not pre["skill_adherence_valid"]:
+        # INV-6 (defence in depth): do not expand scope onto an already-illegal
+        # artifact -- that belongs to the task-schema failure path.
+        if not pre["task_schema_valid"]:
+            status = FIX_STATUS_SKIPPED
+            reason = "task_schema_invalid"
         else:
-            report["fix_status"] = FIX_STATUS_FAILED
-            report["fix_reason"] = "post_fix_contract_invalid"
-    except Exception:
-        # Preserve the original artifact; never let the fix path fail the run.
-        report["fix_status"] = FIX_STATUS_FAILED
-        report["fix_reason"] = "fix_output_error"
-    return report
+            allowed_paths = [*pre["missing_fields"], *pre["invalid_fields"]]
+            if not allowed_paths:
+                status = FIX_STATUS_SKIPPED
+                reason = "no_defect_paths"
+            else:
+                fix_output = getattr(adapter, "fix_output", None)
+                if fix_output is None or not callable(fix_output):
+                    status = FIX_STATUS_UNSUPPORTED
+                else:
+                    protected_paths = task_owned_paths(task_schema)
+                    partial: Any = None
+                    patched: dict[str, Any] | None = None
+                    try:
+                        partial = fix_output(
+                            partial_data=primary_data,
+                            missing_fields=pre["missing_fields"],
+                            invalid_fields=pre["invalid_fields"],
+                            contract=merged_contract,
+                        )
+                        if not isinstance(partial, dict):
+                            raise ValueError("fix_output returned a non-dict")
+                        patched = apply_fix_patch(
+                            primary_data,
+                            partial,
+                            allowed_paths=allowed_paths,
+                            protected_paths=protected_paths,
+                        )
+                        fixed = patched["data"]
+                        revalidated = compute_adherence(
+                            fixed,
+                            task_schema,
+                            merged_contract,
+                            skill_contracts,
+                            skills_meta,
+                            conflicts=conflicts,
+                            validator_version=ADHERENCE_VALIDATOR_VERSION,
+                        )
+                        # GAP-6 triple gate.
+                        gate_ok = (
+                            revalidated["task_schema_valid"]
+                            and revalidated["skill_adherence_valid"]
+                            and revalidated["overall_contract_valid"]
+                        )
+                        attempt = {
+                            "allowed_paths": allowed_paths,
+                            "protected_paths": protected_paths,
+                            # structured only -- the candidate PAYLOAD is never stored
+                            "candidate_type": type(partial).__name__,
+                            "applied_paths": patched["applied_paths"],
+                            "rejected_paths": patched["rejected"],
+                        }
+                        # GAP-4: fix.after is the REAL revalidation of the candidate.
+                        after = copy.deepcopy(revalidated)
+                        if gate_ok:
+                            # D3: primary artifact only -- never clobber siblings.
+                            result.artifacts[0]["data"] = fixed
+                            final_data = fixed
+                            pre = revalidated  # top-level = final state
+                            status = FIX_STATUS_APPLIED
+                        else:
+                            status = FIX_STATUS_FAILED
+                            reason = "post_fix_contract_invalid"
+                    except Exception:
+                        attempt = {
+                            "allowed_paths": allowed_paths,
+                            "protected_paths": task_owned_paths(task_schema),
+                            "candidate_type": (
+                                type(partial).__name__ if partial is not None else None
+                            ),
+                            "applied_paths": patched["applied_paths"] if patched else [],
+                            "rejected_paths": patched["rejected"] if patched else [],
+                        }
+                        # GAP-4: no revalidation was performed -> record the reason,
+                        # never fabricate a result.
+                        after = {"revalidated": False, "reason": "fix_output_error"}
+                        status = FIX_STATUS_FAILED
+                        reason = "fix_output_error"
+
+    # GAP-4: build the traceability sub-structure.
+    if after is None:
+        if status == FIX_STATUS_DISABLED:
+            after = {"revalidated": False, "reason": "fix_disabled"}
+        elif status == FIX_STATUS_UNSUPPORTED:
+            after = {"revalidated": False, "reason": "fix_unsupported"}
+        else:  # skipped variants
+            after = {"revalidated": False, "reason": reason or "skipped"}
+    fix = {
+        "before": before,
+        "attempt": attempt,
+        "after": after,
+        "status": status,
+        "reason": reason,
+        "lineage": {
+            "original_data_sha256": _adherence_data_sha256(primary_data),
+            "final_data_sha256": _adherence_data_sha256(final_data),
+            "refs": {
+                "original": "fix.before",
+                "final": "top-level adherence (artifact[0].data)",
+                "candidate": "not persisted (P2-b C2)",
+            },
+        },
+    }
+    # Top-level keeps the FINAL semantics (compat with P1 / consumers / P2-a).
+    pre["fix"] = fix
+    pre["fix_attempted"] = attempt is not None
+    pre["fix_applied"] = status == FIX_STATUS_APPLIED
+    pre["fix_status"] = status
+    pre["fix_reason"] = reason
+    pre["fix_rejected_paths"] = attempt["rejected_paths"] if attempt else []
+    pre["fix_applied_paths"] = attempt["applied_paths"] if status == FIX_STATUS_APPLIED else []
+    return pre
 
 
 def execute_task(
