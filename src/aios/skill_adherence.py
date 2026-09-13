@@ -17,6 +17,13 @@ Design (per the agreed Plan A boundaries):
   ``execute_task`` remains the only thing that can fail a run. The three states
   (``task_schema_valid`` / ``skill_adherence_valid`` / ``overall_contract_valid``)
   are reported into ``Artifact.metadata_json["adherence"]``.
+* **P2-c**: the skill-adherence check is RECURSIVE. The subtree of a
+  skill-required top-level field is walked at ``required`` paths only, and every
+  nested defect is reported as a canonical PATH STRING (``metadata.author``,
+  ``sections[1].heading``) inside the SAME ``missing_fields`` /
+  ``invalid_fields`` lists the fix whitelist already consumes. A
+  task-authoritative (conflicting) field is never descended into, and
+  ``additionalProperties`` / ``enum`` / ``format`` stay out of scope.
 * The optional 1x directed fix lives in ``execute_task`` (it needs the adapter);
   this module only supplies the merge + the pure checker.
 """
@@ -29,8 +36,13 @@ from typing import Any
 
 # Bump when the semantics of the report change in a way consumers must detect.
 # "2" encodes the P2-b fix traceability sub-structure (fix.before/attempt/after
-# + lineage hashes); top-level semantics are unchanged so consumers are compat.
-ADHERENCE_VALIDATOR_VERSION = "2"
+# + lineage hashes). "3" encodes P2-c recursive nested-defect detection: the
+# reported ``skill_adherence_valid`` and the ``missing_fields`` /
+# ``invalid_fields`` lists now also reflect structural defects found in the
+# SUBTREE of a skill-required top-level field (previously such a report claimed
+# valid=True while the fully-recursive ``overall_contract_valid`` was False).
+# The report SHAPE is unchanged in both bumps.
+ADHERENCE_VALIDATOR_VERSION = "3"
 
 # Opt-in env flag (default OFF). When "1", execute_task may attempt ONE directed
 # completion of missing required skill fields via the adapter.
@@ -111,6 +123,70 @@ def _type_ok(value: Any, fdef: dict[str, Any]) -> bool:
     return True
 
 
+def _collect_nested_defects(
+    value: Any,
+    fdef: dict[str, Any],
+    prefix: tuple[Any, ...],
+) -> tuple[list[str], list[str]]:
+    """P2-c (GAP-1/2/3): recursively collect nested skill-contract defects.
+
+    :func:`_type_ok` only inspects the TOP level, so a skill-required object or
+    array whose *subtree* was structurally wrong used to be invisible: the
+    report claimed ``skill_adherence_valid=True`` while the fully-recursive
+    ``overall_contract_valid`` was ``False``, and the fix trigger
+    (``not skill_adherence_valid``) never fired. This walks the subtree of a
+    top-level skill ``required`` field that is present AND type-correct, and
+    returns each defect as a full PATH STRING in the canonical grammar
+    (``metadata.author`` / ``sections[1].heading``) -- so the existing
+    :func:`apply_fix_patch` whitelist consumes it with zero rework.
+
+    Frozen scope:
+
+    * only ``required`` names are inspected, at every level (a non-required
+      nested property never produces a defect);
+    * ``additionalProperties`` is NOT consulted (P2-d scope);
+    * :func:`_type_ok` semantics are reused verbatim -- never modified.
+
+    Pure and total: no side effects, never raises. Returns
+    ``(missing_paths, invalid_paths)``.
+    """
+    missing: list[str] = []
+    invalid: list[str] = []
+    if not isinstance(fdef, dict):
+        return missing, invalid
+    ftype = fdef.get("type")
+    if ftype == "object" and isinstance(value, dict):
+        props = fdef.get("properties") or {}
+        for name in fdef.get("required") or []:
+            if not isinstance(name, str):
+                continue
+            sub = props.get(name)
+            if not isinstance(sub, dict):
+                continue
+            child = prefix + (name,)
+            if name not in value:
+                missing.append(_format_path(child))
+                continue
+            if not _type_ok(value[name], sub):
+                invalid.append(_format_path(child))
+                continue
+            nested_missing, nested_invalid = _collect_nested_defects(value[name], sub, child)
+            missing.extend(nested_missing)
+            invalid.extend(nested_invalid)
+    elif ftype == "array" and isinstance(value, list):
+        items = fdef.get("items")
+        if isinstance(items, dict):
+            for idx, elem in enumerate(value):
+                child = prefix + (idx,)
+                if not _type_ok(elem, items):
+                    invalid.append(_format_path(child))
+                    continue
+                nested_missing, nested_invalid = _collect_nested_defects(elem, items, child)
+                missing.extend(nested_missing)
+                invalid.extend(nested_invalid)
+    return missing, invalid
+
+
 def compute_adherence(
     data: dict[str, Any],
     task_schema: dict[str, Any],
@@ -137,7 +213,8 @@ def compute_adherence(
     except _JSValidationError:
         task_valid = False
 
-    # 2) skill adherence -- every skill-required field present AND type-correct.
+    # 2) skill adherence -- every skill-required field present AND type-correct;
+    #    P2-c additionally walks the subtree of each such top-level field.
     required_fields: list[str] = []
     for sc in skill_contracts:
         for r in sc.get("required") or []:
@@ -145,6 +222,10 @@ def compute_adherence(
                 required_fields.append(r)
     missing_fields: list[str] = []
     invalid_fields: list[str] = []
+    # P2-c (C3): a task-authoritative top-level field (a merge conflict) is not
+    # descended into -- its subtree is blacklisted from the fix path, so any
+    # path found there would be a permanently unrepairable pseudo-defect.
+    authoritative = set(conflicts or [])
     for sc in skill_contracts:
         props = sc.get("properties") or {}
         for fname, fdef in props.items():
@@ -153,8 +234,23 @@ def compute_adherence(
             if fname not in data:
                 if fname not in missing_fields:
                     missing_fields.append(fname)
-            elif not _type_ok(data.get(fname), fdef) and fname not in invalid_fields:
-                invalid_fields.append(fname)
+            elif not _type_ok(data.get(fname), fdef):
+                if fname not in invalid_fields:
+                    invalid_fields.append(fname)
+            elif fname not in authoritative:
+                # P2-c (GAP-1/2/3): present AND type-correct -> recurse. Nested
+                # defects were previously invisible here, leaving
+                # ``skill_adherence_valid=True`` against a False
+                # ``overall_contract_valid`` and never triggering the fix.
+                nested_missing, nested_invalid = _collect_nested_defects(
+                    data.get(fname), fdef, (fname,)
+                )
+                for path in nested_missing:
+                    if path not in missing_fields:
+                        missing_fields.append(path)
+                for path in nested_invalid:
+                    if path not in invalid_fields:
+                        invalid_fields.append(path)
     skill_valid = not missing_fields and not invalid_fields
 
     # 3) overall -- merged contract validity (task + skill fields).

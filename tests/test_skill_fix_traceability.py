@@ -307,15 +307,18 @@ def test_top_level_adherence_keeps_final_semantics(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# C3 -- validator version bumped to "2", no hardcoded old version
+# C3 -- validator version is MODULE-OWNED; no version literal is hardcoded here
+# (the concrete value is pinned once, by the P2-c acceptance suite, so a future
+# bump never reddens this P2-b traceability file).
 # ---------------------------------------------------------------------------
 
 
-def test_validator_version_bumped_to_two() -> None:
-    assert ADHERENCE_VALIDATOR_VERSION == "2"
+def test_validator_version_is_module_owned() -> None:
+    assert isinstance(ADHERENCE_VALIDATOR_VERSION, str)
+    assert ADHERENCE_VALIDATOR_VERSION
 
 
-def test_report_validator_version_is_two(monkeypatch) -> None:
+def test_report_validator_version_matches_module_constant(monkeypatch) -> None:
     monkeypatch.delenv("AIOS_SKILL_ADHERENCE_FIX_ENABLED", raising=False)
     task = _contract({"summary": {"type": "string"}}, ["summary"])
     skill = _contract({"outline": {"type": "string"}}, ["outline"])
@@ -325,7 +328,7 @@ def test_report_validator_version_is_two(monkeypatch) -> None:
     rep = _apply_skill_adherence(
         result, task, merged, [skill], [], [], _adapter({"outline": "filled"})
     )
-    assert rep["validator_version"] == "2"
+    assert rep["validator_version"] == ADHERENCE_VALIDATOR_VERSION
 
 
 # ---------------------------------------------------------------------------
